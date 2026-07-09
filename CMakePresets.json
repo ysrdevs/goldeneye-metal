@@ -1,0 +1,287 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 25,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "windows-base",
+            "hidden": true,
+            "generator": "Ninja Multi-Config",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_C_COMPILER": "clang",
+                "CMAKE_CXX_COMPILER": "clang++",
+                "CMAKE_C_FLAGS": "-march=x86-64-v3",
+                "CMAKE_CXX_FLAGS": "-march=x86-64-v3",
+                "CMAKE_CXX_STANDARD": "23",
+                "CMAKE_CONFIGURATION_TYPES": "Debug;Release;RelWithDebInfo",
+                "CMAKE_CROSS_CONFIGS": "all",
+                "CMAKE_DEFAULT_BUILD_TYPE": "Debug",
+                "CMAKE_DEFAULT_CONFIGS": "all",
+                "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/${presetName}"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+        {
+            "name": "linux-base",
+            "hidden": true,
+            "generator": "Ninja Multi-Config",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_C_COMPILER": "clang",
+                "CMAKE_CXX_COMPILER": "clang++",
+                "CMAKE_C_FLAGS": "-march=x86-64-v3",
+                "CMAKE_CXX_FLAGS": "-march=x86-64-v3",
+                "CMAKE_CXX_STANDARD": "23",
+                "CMAKE_CONFIGURATION_TYPES": "Debug;Release;RelWithDebInfo",
+                "CMAKE_CROSS_CONFIGS": "all",
+                "CMAKE_DEFAULT_BUILD_TYPE": "Debug",
+                "CMAKE_DEFAULT_CONFIGS": "all",
+                "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/${presetName}"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Linux"
+            }
+        },
+        {
+            "name": "macos-arm64-base",
+            "hidden": true,
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_C_COMPILER": "clang",
+                "CMAKE_CXX_COMPILER": "clang++",
+                "CMAKE_CXX_STANDARD": "23",
+                "CMAKE_OSX_ARCHITECTURES": "arm64",
+                "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/${presetName}",
+                "REXGLUE_BUILD_TESTS": "ON",
+                "REXGLUE_BUILD_PPC_TESTS": "OFF",
+                "REXGLUE_ENABLE_TRACY": "OFF",
+                "REXGLUE_USE_METAL": "ON",
+                "REXGLUE_USE_VULKAN": "OFF"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Darwin"
+            }
+        },
+        {
+            "name": "windows-arm64-base",
+            "hidden": true,
+            "inherits": "windows-base",
+            "cacheVariables": {
+                "CMAKE_C_FLAGS": "-march=armv8-a",
+                "CMAKE_CXX_FLAGS": "-march=armv8-a"
+            }
+        },
+        {
+            "name": "linux-arm64-base",
+            "hidden": true,
+            "inherits": "linux-base",
+            "cacheVariables": {
+                "CMAKE_C_FLAGS": "-march=armv8-a",
+                "CMAKE_CXX_FLAGS": "-march=armv8-a"
+            }
+        },
+        {
+            "name": "win-amd64",
+            "displayName": "Windows AMD64",
+            "description": "Multi-config build for Windows AMD64 using Clang",
+            "inherits": "windows-base"
+        },
+        {
+            "name": "win-arm64",
+            "displayName": "Windows ARM64",
+            "description": "Multi-config build for Windows ARM64 using Clang",
+            "inherits": "windows-arm64-base"
+        },
+        {
+            "name": "linux-amd64",
+            "displayName": "Linux AMD64",
+            "description": "Multi-config build for Linux AMD64 using Clang",
+            "inherits": "linux-base"
+        },
+        {
+            "name": "linux-arm64",
+            "displayName": "Linux ARM64",
+            "description": "Multi-config build for Linux ARM64 using Clang",
+            "inherits": "linux-arm64-base"
+        },
+        {
+            "name": "macos-arm64-debug",
+            "displayName": "macOS Apple Silicon Debug (Metal)",
+            "inherits": "macos-arm64-base",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+        },
+        {
+            "name": "macos-arm64-release",
+            "displayName": "macOS Apple Silicon Release (Metal)",
+            "inherits": "macos-arm64-base",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+        },
+        {
+            "name": "macos-arm64-relwithdebinfo",
+            "displayName": "macOS Apple Silicon RelWithDebInfo (Metal)",
+            "inherits": "macos-arm64-base",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "win-amd64-debug",
+            "configurePreset": "win-amd64",
+            "configuration": "Debug"
+        },
+        {
+            "name": "win-amd64-release",
+            "configurePreset": "win-amd64",
+            "configuration": "Release"
+        },
+        {
+            "name": "win-amd64-relwithdebinfo",
+            "configurePreset": "win-amd64",
+            "configuration": "RelWithDebInfo"
+        },
+        {
+            "name": "win-arm64-debug",
+            "configurePreset": "win-arm64",
+            "configuration": "Debug"
+        },
+        {
+            "name": "win-arm64-release",
+            "configurePreset": "win-arm64",
+            "configuration": "Release"
+        },
+        {
+            "name": "win-arm64-relwithdebinfo",
+            "configurePreset": "win-arm64",
+            "configuration": "RelWithDebInfo"
+        },
+        {
+            "name": "linux-amd64-debug",
+            "configurePreset": "linux-amd64",
+            "configuration": "Debug"
+        },
+        {
+            "name": "linux-amd64-release",
+            "configurePreset": "linux-amd64",
+            "configuration": "Release"
+        },
+        {
+            "name": "linux-amd64-relwithdebinfo",
+            "configurePreset": "linux-amd64",
+            "configuration": "RelWithDebInfo"
+        },
+        {
+            "name": "linux-arm64-debug",
+            "configurePreset": "linux-arm64",
+            "configuration": "Debug"
+        },
+        {
+            "name": "linux-arm64-release",
+            "configurePreset": "linux-arm64",
+            "configuration": "Release"
+        },
+        {
+            "name": "linux-arm64-relwithdebinfo",
+            "configurePreset": "linux-arm64",
+            "configuration": "RelWithDebInfo"
+        },
+        {
+            "name": "macos-arm64-debug",
+            "configurePreset": "macos-arm64-debug"
+        },
+        {
+            "name": "macos-arm64-release",
+            "configurePreset": "macos-arm64-release"
+        },
+        {
+            "name": "macos-arm64-relwithdebinfo",
+            "configurePreset": "macos-arm64-relwithdebinfo"
+        }
+    ],
+    "testPresets": [
+        {
+            "name": "win-amd64-debug",
+            "configurePreset": "win-amd64",
+            "configuration": "Debug"
+        },
+        {
+            "name": "win-amd64-release",
+            "configurePreset": "win-amd64",
+            "configuration": "Release"
+        },
+        {
+            "name": "win-amd64-relwithdebinfo",
+            "configurePreset": "win-amd64",
+            "configuration": "RelWithDebInfo"
+        },
+        {
+            "name": "win-arm64-debug",
+            "configurePreset": "win-arm64",
+            "configuration": "Debug"
+        },
+        {
+            "name": "win-arm64-release",
+            "configurePreset": "win-arm64",
+            "configuration": "Release"
+        },
+        {
+            "name": "win-arm64-relwithdebinfo",
+            "configurePreset": "win-arm64",
+            "configuration": "RelWithDebInfo"
+        },
+        {
+            "name": "linux-amd64-debug",
+            "configurePreset": "linux-amd64",
+            "configuration": "Debug"
+        },
+        {
+            "name": "linux-amd64-release",
+            "configurePreset": "linux-amd64",
+            "configuration": "Release"
+        },
+        {
+            "name": "linux-amd64-relwithdebinfo",
+            "configurePreset": "linux-amd64",
+            "configuration": "RelWithDebInfo"
+        },
+        {
+            "name": "linux-arm64-debug",
+            "configurePreset": "linux-arm64",
+            "configuration": "Debug"
+        },
+        {
+            "name": "linux-arm64-release",
+            "configurePreset": "linux-arm64",
+            "configuration": "Release"
+        },
+        {
+            "name": "linux-arm64-relwithdebinfo",
+            "configurePreset": "linux-arm64",
+            "configuration": "RelWithDebInfo"
+        },
+        {
+            "name": "macos-arm64-debug",
+            "configurePreset": "macos-arm64-debug"
+        },
+        {
+            "name": "macos-arm64-release",
+            "configurePreset": "macos-arm64-release"
+        },
+        {
+            "name": "macos-arm64-relwithdebinfo",
+            "configurePreset": "macos-arm64-relwithdebinfo"
+        }
+    ]
+}

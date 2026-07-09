@@ -1,0 +1,20 @@
+# Enforce LF line endings for all text files
+* text=auto eol=lf
+
+# Explicitly mark binary files
+*.png binary
+*.jpg binary
+*.ico binary
+*.zip binary
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.a binary
+*.lib binary
+*.obj binary
+*.o binary
+*.pdb binary
+
+# Licensed data tables are source inputs, but exclude them from language stats.
+vendor/GoldenEye-Recomp/src/ce_patches/*.h linguist-generated=true

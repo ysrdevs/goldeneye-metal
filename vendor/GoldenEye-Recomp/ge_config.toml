@@ -1,0 +1,388 @@
+[functions]
+0x823751B8 = { size = 8 }
+0x830E0200 = { name = "sub_830E0200" }
+0x830E0460 = { name = "sub_830E0460" }
+0x830E04D0 = { name = "sub_830E04D0" }
+0x830E0560 = { name = "sub_830E0560" }
+0x830E0630 = { name = "sub_830E0630" }
+0x830E0670 = { name = "sub_830E0670" }
+0x830E06B0 = { name = "sub_830E06B0" }
+0x830E0750 = { name = "sub_830E0750" }
+0x82367EF0 = { size = 0x14 }
+0x82173860 = { size = 8 }
+0x82177F88 = { size = 8 }
+0x821A6310 = { size = 8 }
+0x821E5C58 = { size = 16 }
+0x821E5E28 = { size = 40 }
+0x821E5E50 = { size = 40 }
+0x821E5E78 = { size = 40 }
+0x821E5EA0 = { size = 40 }
+0x821E62C8 = { size = 32 }
+0x821E62E8 = { size = 4 }
+0x8223C0A0 = { size = 120 }
+0x82313B00 = { size = 80 }
+0x8236D700 = { size = 16 }
+0x8236DA00 = { size = 24 }
+0x82371058 = { size = 72 }
+0x823710A0 = { size = 56 }
+0x82375B08 = { size = 8 }
+0x82375B10 = { size = 8 }
+0x82375B20 = { size = 8 }
+0x82375B60 = { size = 8 }
+0x82375B68 = { size = 8 }
+0x82376AB8 = { size = 8 }
+0x82377C20 = { size = 8 }
+0x82377C28 = { size = 8 }
+0x82377C38 = { size = 8 }
+0x823BEF08 = { size = 28 }
+0x8209F5F4 = { name = "ge_cont_8209F5F4" }  # F3 continuation (sub_8209F5D8)
+# F1 (0x820F7750) and F4 (0x820C4918) are NOT separate continuations: their
+# hooks use jump_address back into the parent so the loop-back branches resolve.
+0x820C7454 = { name = "ge_cont_820C7454" }  # F5 continuation (sub_820C7390)
+0x820C7430 = { name = "ge_cont_820C7430" }  # F6 continuation (sub_820C7390)
+0x820A3E9C = { name = "ge_cont_820A3E9C" }  # F7 continuation (sub_820A3C20)
+0x820F79F0 = { name = "ge_body_820F79F0" }  # F2 loop body (one r26 iteration)
+0x820F7D0C = { name = "ge_epi_820F7D0C" }   # F2 epilogue (post-loop, returns)
+# watch-volume save continuations (CE enters the save routine past its clamp)
+0x82184E18 = { name = "ge_cont_82184E18" }
+0x82184E48 = { name = "ge_cont_82184E48" }
+[[midasm_hook]]
+address = 0x82198C94
+name = "ge_dbg_now"
+registers = ["r9", "r30"]
+after_instruction = true
+[[midasm_hook]]
+address = 0x82199944
+name = "ge_diag_vdswap"
+registers = ["r31", "r30"]
+after_instruction = true
+[[midasm_hook]]
+address = 0x821A4D50
+name = "ge_trace_render_submit"
+registers = ["r3"]
+after_instruction = false
+[[midasm_hook]]
+address = 0x8209F5F0
+name = "ge_hook_830E0670"
+registers = ["r3", "r11", "r28"]
+after_instruction = false
+return = true
+[[midasm_hook]]
+address = 0x820F774C
+name = "ge_hook_830E0630"
+registers = ["r30"]
+after_instruction = false
+jump_address_on_true = 0x820F768C
+jump_address_on_false = 0x820F7760
+[[midasm_hook]]
+address = 0x820C4914
+name = "ge_hook_830E0200"
+registers = ["r31", "r29", "r28", "r11", "r23", "r21"]
+after_instruction = false
+jump_address_on_true = 0x820C485C
+jump_address_on_false = 0x820C4920
+[[midasm_hook]]
+address = 0x820C7450
+name = "ge_hook_830E04D0"
+registers = ["r11", "r10", "r9"]
+after_instruction = false
+return = true
+[[midasm_hook]]
+address = 0x820C742C
+name = "ge_hook_830E0560"
+registers = ["r11", "r10", "r9"]
+after_instruction = false
+return = true
+[[midasm_hook]]
+address = 0x820A3E50
+name = "ge_hook_830E0460"
+registers = ["r11", "r4", "r29", "r7", "r28", "r6", "r31", "r5", "r27", "r3"]
+after_instruction = false
+return = true
+[[midasm_hook]]
+address = 0x820B40E4
+name = "ge_hook_830E0750"
+registers = ["r7", "r8", "r11", "f1"]
+after_instruction = false
+return = true
+[[midasm_hook]]
+address = 0x820F79EC
+name = "ge_f2_driver"
+registers = ["r26"]
+after_instruction = true
+return = true
+[[midasm_hook]]
+address = 0x820F7A2C
+name = "ge_f2_skip"
+registers = ["r3"]
+after_instruction = false
+return_on_true = true
+# Mouse-look is now a once-per-frame port of the xenia-canary mousehook
+# (ge_mouse_camera in ge_hooks.cpp), driven from ge_inject_keyboard below. The
+# old per-site ge_bondview_control look hooks are gone.
+# KEYBOARD: after XamInputGetState fills the slot-0 gamepad buffer (unk_830C8B9C)
+# and before ge_input_poll_controllers dispatches it -> OR keyboard buttons in.
+[[midasm_hook]]
+address = 0x823B25E4
+name = "ge_inject_keyboard"
+registers = ["r11"]
+after_instruction = true
+[[midasm_hook]]
+address = 0x823AE294
+name = "ge_skip_null_attr_store"
+registers = ["r11"]
+after_instruction = false
+jump_address_on_true = 0x823AE29C
+[[midasm_hook]]
+address = 0x823AE348
+name = "ge_skip_null_attr_first"
+registers = ["r3"]
+after_instruction = false
+jump_address_on_true = 0x823AE34C
+[[midasm_hook]]
+address = 0x823AE350
+name = "ge_skip_null_attr_second"
+registers = ["r3"]
+after_instruction = false
+jump_address_on_true = 0x823AE354
+[[midasm_hook]]
+address = 0x823AE2FC
+name = "ge_skip_null_attr_reloc_table"
+registers = ["r8"]
+after_instruction = true
+jump_address_on_true = 0x823AE344
+[[midasm_hook]]
+address = 0x823EDF70
+name = "ge_skip_null_memset_dst"
+registers = ["r3"]
+after_instruction = false
+jump_address_on_true = 0x823EE00C
+[[midasm_hook]]
+address = 0x823EE010
+name = "ge_skip_null_memcpy_ptr"
+registers = ["r3", "r4", "r5"]
+after_instruction = false
+jump_address_on_true = 0x823EE0E8
+[[midasm_hook]]
+address = 0x8240A558
+name = "ge_skip_null_bitset_write"
+registers = ["r3", "r4"]
+after_instruction = false
+return_on_true = true
+[[midasm_hook]]
+address = 0x8240A580
+name = "ge_skip_null_bitset_write"
+registers = ["r3", "r4"]
+after_instruction = false
+return_on_true = true
+[[midasm_hook]]
+address = 0x8240A5A0
+name = "ge_skip_null_bitset_test"
+registers = ["r3", "r4"]
+after_instruction = false
+return_on_true = true
+[[midasm_hook]]
+address = 0x823A6148
+name = "ge_clamp_startup_list_count"
+registers = ["r10", "r11", "r31"]
+after_instruction = false
+[[midasm_hook]]
+address = 0x823A6158
+name = "ge_skip_null_startup_item"
+registers = ["r3"]
+after_instruction = true
+jump_address_on_true = 0x823A6174
+[[midasm_hook]]
+address = 0x823A5A04
+name = "ge_skip_null_state_table"
+registers = ["r11", "r19"]
+after_instruction = false
+jump_address_on_true = 0x823A5A48
+# Hidden debug menu enable (TCRF: byte 0x82189F2B 0x0F->0x00). Replace the dead
+# `beq` at 0x82189F2C with a live gate so LB toggles the debug menu when the
+# ge_debug_menu cvar is on; off = original retail behaviour. See ge_hooks.cpp.
+[[midasm_hook]]
+address = 0x82189F2C
+name = "ge_debug_gate"
+registers = ["r30"]
+after_instruction = false
+jump_address_on_true = 0x82189F4C
+jump_address_on_false = 0x82189F30
+# --- BeanTools Community Edition CODE fixes (instruction patches; see ge_hooks.cpp) ---
+# fix_door_volume_clamp @0x820DD814: li r3,0 -> li r3,1
+[[midasm_hook]]
+address = 0x820DD814
+name = "ge_ce_door_vol"
+registers = ["r3"]
+after_instruction = true
+# remove_beta_string_at_logo @0x820ED678: ori r3,r3,0x9D97 -> ...0x9CE3
+[[midasm_hook]]
+address = 0x820ED678
+name = "ge_ce_beta_str"
+registers = ["r3"]
+after_instruction = true
+# extend_audio_distance: re-store 6500.0f into CurveDistanceScaler (stfs r31+0x5C)
+[[midasm_hook]]
+address = 0x8214438C
+name = "ge_ce_audio_dist"
+registers = ["r31"]
+after_instruction = true
+# hardcode_near_clip_to_2: re-store 2.0f at the per-fog near-clip store site
+[[midasm_hook]]
+address = 0x82117B44
+name = "ge_ce_near_clip"
+registers = ["r11"]
+after_instruction = true
+# remove_original_graphics_mode_blur @0x82188E70: NOOP `bne cr6,+0x19C`
+[[midasm_hook]]
+address = 0x82188E70
+name = "ge_ce_blur"
+registers = ["r3"]
+after_instruction = false
+jump_address_on_true = 0x8218900C
+jump_address_on_false = 0x82188E74
+# remove_original_graphics_mode_from_intro @0x8209972C: force `b 0x82099750`
+[[midasm_hook]]
+address = 0x8209972C
+name = "ge_ce_intro_gfx"
+registers = ["r3"]
+after_instruction = false
+jump_address_on_true = 0x82099750
+jump_address_on_false = 0x82099730
+# --- BeanTools CE MP / network hack-functions (see ge_hooks.cpp) -------------
+# disable_doors_autoclosing_on_mp @0x820E4F1C
+[[midasm_hook]]
+address = 0x820E4F1C
+name = "ge_ce_mp_door"
+registers = ["r11"]
+after_instruction = true
+# disable_player_collisions_for_network_mp @0x820CDFA4 (replaces bl sub_820B3E90)
+[[midasm_hook]]
+address = 0x820CDFA4
+name = "ge_ce_mp_collision"
+registers = []
+after_instruction = false
+return = true
+# fix_golden_gun_respawn_visiblity_flag @0x820CF940 (replaces cmpwi/bne)
+[[midasm_hook]]
+address = 0x820CF940
+name = "ge_ce_golden_gun"
+registers = ["r11"]
+after_instruction = false
+jump_address_on_true = 0x820CF948
+jump_address_on_false = 0x820CF94C
+# make_mp_always_use_p2_fog @0x82117CB0
+[[midasm_hook]]
+address = 0x82117CB0
+name = "ge_ce_p2_fog"
+registers = ["r3"]
+after_instruction = false
+jump_address_on_true = 0x82117CB8
+jump_address_on_false = 0x82117CB4
+# fix_network_armor_bug @0x8216BC1C (after stw r12,0x64(r30); cal_dam)
+[[midasm_hook]]
+address = 0x8216BC1C
+name = "ge_ce_armor_fix"
+registers = ["r30"]
+after_instruction = true
+# increase_mp_characters: li r11,0x21 -> li r11,0x32 at the two unlock sites
+[[midasm_hook]]
+address = 0x820EF350
+name = "ge_ce_mp_charcount"
+registers = ["r11"]
+after_instruction = true
+[[midasm_hook]]
+address = 0x82106C54
+name = "ge_ce_mp_charcount"
+registers = ["r11"]
+after_instruction = true
+# add_sfx_to_remote_player_weapons @0x8216E25C (before `add r11,r10,r11`)
+[[midasm_hook]]
+address = 0x8216E25C
+name = "ge_ce_remote_weapon_sfx"
+registers = ["r11"]
+after_instruction = false
+# set_mp_sfx_to_use_player_location: 4 sfx sites -> play + 3D-position (replaces
+# `bl sub_82144920`; jump_address skips the original bl). gasp / slapper / knife /
+# item-equip.
+[[midasm_hook]]
+address = 0x820BF264
+name = "ge_ce_sfx_3d"
+registers = []
+after_instruction = false
+jump_address = 0x820BF268
+[[midasm_hook]]
+address = 0x820CDC5C
+name = "ge_ce_sfx_3d"
+registers = []
+after_instruction = false
+jump_address = 0x820CDC60
+[[midasm_hook]]
+address = 0x820ACF54
+name = "ge_ce_sfx_3d"
+registers = []
+after_instruction = false
+jump_address = 0x820ACF58
+[[midasm_hook]]
+address = 0x820AC4D0
+name = "ge_ce_sfx_3d"
+registers = []
+after_instruction = false
+jump_address = 0x820AC4D4
+# gasp/argh for remote players (set_mp_sfx gasp half) @0x820BF408
+[[midasm_hook]]
+address = 0x820BF408
+name = "ge_ce_gasp"
+registers = []
+after_instruction = false
+jump_address = 0x820BF40C
+# only_trigger_mp_death_tune @0x820BFB04 (skip the death-tune bl if flag set)
+[[midasm_hook]]
+address = 0x820BFB04
+name = "ge_ce_death_tune"
+registers = []
+after_instruction = false
+jump_address_on_true = 0x820BFB08
+# kill-tune 5.0f relocation @0x8209D88C (read +0x3A8 not +0x3AC)
+[[midasm_hook]]
+address = 0x8209D88C
+name = "ge_ce_killtune_float"
+registers = ["r11", "f1"]
+after_instruction = true
+# fix_watch_volume_sliders_range: read (halve for display) + save (double) sites
+[[midasm_hook]]
+address = 0x820C82C4
+name = "ge_ce_watch_music_read"
+registers = ["r3"]
+after_instruction = false
+jump_address = 0x820C82C8
+[[midasm_hook]]
+address = 0x820C8324
+name = "ge_ce_watch_music_read"
+registers = ["r3"]
+after_instruction = false
+jump_address = 0x820C8328
+[[midasm_hook]]
+address = 0x820C8154
+name = "ge_ce_watch_sfx_read"
+registers = ["r3"]
+after_instruction = false
+jump_address = 0x820C8158
+[[midasm_hook]]
+address = 0x820C81B4
+name = "ge_ce_watch_sfx_read"
+registers = ["r3"]
+after_instruction = false
+jump_address = 0x820C81B8
+[[midasm_hook]]
+address = 0x820C831C
+name = "ge_ce_watch_music_save"
+registers = []
+after_instruction = false
+jump_address = 0x820C8320
+[[midasm_hook]]
+address = 0x820C81AC
+name = "ge_ce_watch_sfx_save"
+registers = []
+after_instruction = false
+jump_address = 0x820C81B0

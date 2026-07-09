@@ -1,0 +1,13 @@
+[project]
+sdk_version = "0.8.0.0"
+name = "ge"
+
+[entrypoint]
+file_path = "assets/default.xex"
+out_directory_path = "generated"
+includes = [
+  "ge_config.toml",
+]
+
+setjmp_address = 0x823F22C0
+longjmp_address = 0x823F1FA0

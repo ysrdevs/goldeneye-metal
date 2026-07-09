@@ -1,0 +1,46 @@
+# --- Build output ---
+/out/
+/build/
+/cmake-build-*/
+*.pdb
+*.exe
+*.ilk
+*.exp
+*.lib
+*.obj
+*.o
+
+# --- Recompiled game code (GENERATED from your own copy of the game) ---
+# Produced by `rexglue codegen` from the manifest + your XEX. Not committed:
+# it is derived from copyrighted game code. Regenerate it locally — see README.
+/generated/
+
+# --- Game files: provide your OWN legally-owned copy of GoldenEye 007 ---
+# (the XEX + extracted assets go in assets/). Never committed.
+/assets/*
+!/assets/.gitkeep
+
+# --- Runtime config (written by the game at runtime) ---
+ge.toml
+/logs/
+*.xtr
+*.ppm
+*.raw
+*.rgba
+/captures/
+
+# --- Local dev / debug tooling (not part of the source) ---
+/parse_dump.py
+/sample_stack.py
+/walk_thread.py
+/launch_online_2p.bat
+/launch_online_2p.ps1
+/CODEGEN COMMAND.txt
+
+# --- Editor / OS ---
+.vs/
+.vscode/
+.idea/
+*.user
+Thumbs.db
+.DS_Store
