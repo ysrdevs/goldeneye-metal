@@ -53,16 +53,15 @@ now holds the title wait until the CP swap counter advances or the ring drains, 
 waiting, never changes the title's skip bits or presented counter, and leaves RPTR writeback solely
 to the CP.
 
-In a bounded run with scavenging, replay, forced presentation, and replacement rendering disabled,
+In bounded runs with scavenging, replay, forced presentation, and replacement rendering disabled,
 WPTR progressed beyond 1088, the Metal primary-ring worker passed batch 192, and normal
-`IssueSwap` reached 64. The same path now produces the animated RARE splash from real title
-shaders, vertex and index data, textures, constants, resolves, and swaps. At swap 64, the normal
-presenter captured 17,562 visible pixels with an RGB range of 229 and a clearly readable `RARE`
-wordmark. This is the first recognizable title-driven frame through the real ring and normal
-resolve/swap path. It does not yet satisfy the full strict-success definition because
-fixed-function and render-target composition fidelity remain incomplete, and it is not yet the
-target menu. A later 30-second bounded run continued the animation through normal `IssueSwap` 192
-without index-delivery errors.
+`IssueSwap` reached at least 320. The same path produces the classification screen and animated
+RARE splash from real title shaders, vertex and index data, textures, constants, resolves, and
+swaps. The classification screen is readable across the full 1280x720 output, and the later gold
+RARE logo is shaded, animated, and presented from the current live render target. This is no longer
+dependent on retaining a stale nonzero CPU readback. It does not yet satisfy the full
+strict-success definition because culling, depth/stencil, and guest MSAA fidelity remain
+incomplete, and it is not yet the target menu.
 
 The decisive geometry fault was discarded index delivery. A four-vertex title triangle fan was
 converted correctly by `PrimitiveProcessor` to the six indices `(1,2,0,2,3,0)`, but Metal issued
@@ -70,6 +69,24 @@ converted correctly by `PrimitiveProcessor` to the six indices `(1,2,0,2,3,0)`, 
 omission affected normal DMA-indexed draws and point/rectangle adapter indices. Metal now carries
 every processed index-buffer type into `drawIndexedPrimitives`, preserves the processed endian and
 line-loop constants, restores the guest alpha test, and flips Y for Metal's viewport convention.
+
+The fixed-function and composition blocker exposed by live viewport/scissor state is resolved for
+the observed title sequence. GoldenEye describes its 4xMSAA 720p frame through three resolve bands
+(256, 256, and 208 lines). Metal now reads the current matching single-sample host context at each
+copy, uses the authoritative local source rectangle, and assembles those bands at guest destination
+Y 0, 256, and 512. This avoids both stale cross-target CPU caches and the wrap caused by dumping a
+720-line logical target into the 512-line physical capacity of the 4xMSAA EDRAM layout. In the
+proving frame, the three copies assembled to 73,900 visible pixels before the final normal
+`IssueCopy`/`IssueSwap` route. Faithful guest multisampling is still future work.
+
+Live guest viewport and scissor state is now applied to normal Metal draws. Metal pipelines are
+also keyed by the active render-target index, normalized per-channel write mask, and
+`RB_BLENDCONTROL`; blend-factor/operation mappings, dynamic blend constants, and the reversed Metal
+channel-mask bit order are implemented. The two observed title modes (`0x00010001` replacement and
+`0x07060706` source-alpha blending) now render correctly, and the isolated test covers a partial
+R/B write mask. With those states enabled, swap 5 is a clean readable classification screen, while
+swaps 64, 128, and 192 show successive views of the gold rotating RARE logo through current-context
+copies.
 
 ### Working foundations
 
@@ -86,7 +103,8 @@ line-loop constants, restores the guest alpha test, and flips Y for Metal's view
 - Guest output capture and swap presentation plumbing
 - Standalone `metal_resolve_test` with byte-for-byte CPU/GPU comparison
 - Standalone `metal_pipeline_probe_test` for external-buffer and array-texture delivery
-- Indexed fan-remap and scissor regression coverage in `metal_pipeline_probe_test`
+- Indexed fan-remap, scissor, source-alpha blend, and partial-write-mask regression coverage in
+  `metal_pipeline_probe_test`
 
 ### Milestones
 
@@ -94,10 +112,10 @@ line-loop constants, restores the guest alpha test, and flips Y for Metal's view
 | --- | --- | --- |
 | A. Controlled resolve diagnostic | Passed | Magenta resolve reaches the destination and presentation path |
 | B. Controlled render-target diagnostic | Passed | A solid Metal render target survives readback and resolve |
-| C. Real producer content | Recognizable partial result | Real title shaders and resources produce an animated RARE logo; fixed-function state is incomplete |
+| C. Real producer content | Recognizable partial result | Real title shaders and resources produce a readable classification screen and shaded animated RARE logo; depth/stencil and culling remain incomplete |
 | D. Guest-visible resolve | Passed for current producer | Nonzero producer output reaches the guest buffer and normal presenter |
 | E. Recognizable menu | Not reached | A recognizable title-driven splash is working, but no correct menu frame has been produced |
-| F. Sustained title execution | Passed | WPTR >1088 and normal `IssueSwap` 192 without scavenging or replay |
+| F. Sustained title execution | Passed | WPTR >1088 and normal `IssueSwap` 320 without scavenging or replay |
 
 ## Primary blocker
 
@@ -106,25 +124,27 @@ and pixel stages agree on interpolator locations, packed float/bool/fetch consta
 array textures and samplers are bound, processed indices are consumed, and the title splash is
 recognizable.
 
-The remaining blocker is faithful render-target composition and fixed-function state. The Metal
-probe layer now has tested indexed and scissor submission plus viewport plumbing, but globally
-applying the live guest viewport/scissor currently leaves individual host render targets nonzero
-while the normal final resolve is blank. This identifies an ownership/composition mismatch rather
-than an MSL interface failure. Blend equations, per-channel write masks, culling, depth/stencil,
-and MSAA state are still absent. Missing game data remains a separate launch problem and must not
-be diagnosed as a renderer failure.
+The remaining blocker is the next layer of fixed-function fidelity. Live viewport/scissor, current
+host-context ownership, the observed banded copy sequence, the title's two blend modes, blend
+constants, and per-channel write masks are now active and verified within the current producer
+path. Culling/front-face selection, shared depth/stencil ownership, and true guest MSAA behavior
+are still absent. The title advances past the classification screen and through the RARE animation;
+the next splash begins, but its current output is incomplete and the target menu has not been
+reached. Those missing states are the next known fidelity gaps, not yet a proven singular cause of
+the splash failure. Missing game data remains a separate launch problem and must not be diagnosed
+as a renderer failure.
 
 ## Next development priority
 
 Work in this order:
 
-1. Reconcile host render-target ownership/composition so the tested guest viewport and scissor can
-   be enabled without blanking the final resolve.
-2. Add RT blend equations, blend constants, and per-channel color-write masks to Metal pipeline
-   creation and keys.
-3. Apply cull/front-face state, then build shared depth/stencil ownership and MSAA behavior.
-4. Advance beyond the recognizable RARE splash to a correct title/menu frame through the normal
-   resolve and `IssueSwap` path.
+1. Apply guest cull/front-face state and add focused regression coverage.
+2. Build shared depth/stencil ownership and depth/stencil clear behavior for persistent Metal
+   render targets.
+3. Replace the current single-sample host approximation with faithful guest MSAA ownership and
+   resolve behavior.
+4. Diagnose the incomplete post-RARE splash, then advance to a correct title/menu frame through the
+   normal `IssueCopy` and `IssueSwap` path.
 5. Audit pacing, input, and long-run stability once the frame is visually correct.
 
 Do not restore heuristic command scavenging or direct presentation shortcuts. The real ring and

@@ -46,13 +46,25 @@ struct ProbeRasterizationState {
   uint32_t scissor_y = 0;
   uint32_t scissor_width = 0;
   uint32_t scissor_height = 0;
+  double blend_red = 0.0;
+  double blend_green = 0.0;
+  double blend_blue = 0.0;
+  double blend_alpha = 0.0;
+};
+
+struct ProbeColorTargetState {
+  // Xenos RB_COLOR_MASK nibble order: R, G, B, A in bits 0...3.
+  uint8_t write_mask = 0xF;
+  // Normalized RB_BLENDCONTROL value (reserved bits removed).
+  uint32_t blend_control = 0x00010001;
 };
 
 void* CreateMslLibrary(void* metal_device, const std::string& source, std::string* error_out);
 void ReleaseMslLibrary(void* metal_library);
 bool ValidateMslSource(void* metal_device, const std::string& source, std::string* error_out);
 void* CreateRenderPipelineState(void* metal_device, void* vertex_library, void* fragment_library,
-                                std::string* error_out);
+                                std::string* error_out,
+                                const ProbeColorTargetState* color_target_state = nullptr);
 void ReleaseRenderPipelineState(void* pipeline_state);
 void* CreatePipelineProbeContext(void* metal_device, std::string* error_out);
 void* CreateHostRenderTargetContext(void* metal_device, std::string* error_out);

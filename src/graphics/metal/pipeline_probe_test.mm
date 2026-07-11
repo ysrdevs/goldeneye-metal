@@ -22,9 +22,11 @@
 
 namespace {
 
+using rex::graphics::metal::ClearPipelineProbeContext;
 using rex::graphics::metal::CreateMslLibrary;
 using rex::graphics::metal::CreatePipelineProbeContext;
 using rex::graphics::metal::CreateRenderPipelineState;
+using rex::graphics::metal::ProbeColorTargetState;
 using rex::graphics::metal::ProbeIndexBuffer;
 using rex::graphics::metal::ProbeRasterizationState;
 using rex::graphics::metal::ProbeSamplerSlot;
@@ -106,18 +108,43 @@ int RunPipelineProbeTest() {
     }
     void* pipeline_state =
         CreateRenderPipelineState(device, vertex_library, fragment_library, &error);
+    ProbeColorTargetState alpha_blend_target_state;
+    alpha_blend_target_state.write_mask = 0xF;
+    // RB_BLENDCONTROL0: source alpha / inverse source alpha, add, for both
+    // color and alpha. This is the title's dominant translucent-draw mode.
+    alpha_blend_target_state.blend_control = 0x07060706;
+    void* alpha_blend_pipeline_state =
+        pipeline_state ? CreateRenderPipelineState(device, vertex_library, fragment_library, &error,
+                                                   &alpha_blend_target_state)
+                       : nullptr;
+    ProbeColorTargetState partial_write_target_state;
+    // Xenos mask bits are R/G/B/A. Writing only red and blue makes a mask-order
+    // error visible in every channel of the BGRA8 readback.
+    partial_write_target_state.write_mask = 0x5;
+    partial_write_target_state.blend_control = 0x00010001;
+    void* partial_write_pipeline_state =
+        alpha_blend_pipeline_state
+            ? CreateRenderPipelineState(device, vertex_library, fragment_library, &error,
+                                        &partial_write_target_state)
+            : nullptr;
     ReleaseMslLibrary(vertex_library);
     ReleaseMslLibrary(fragment_library);
-    if (!pipeline_state) {
+    auto release_pipeline_states = [&]() {
+      ReleaseRenderPipelineState(partial_write_pipeline_state);
+      ReleaseRenderPipelineState(alpha_blend_pipeline_state);
+      ReleaseRenderPipelineState(pipeline_state);
+    };
+    if (!pipeline_state || !alpha_blend_pipeline_state || !partial_write_pipeline_state) {
       std::fprintf(stderr, "[metal_pipeline_probe_test] FAIL: render pipeline: %s\n",
                    error.c_str());
+      release_pipeline_states();
       return 1;
     }
 
     void* context = CreatePipelineProbeContext(device, &error);
     if (!context) {
       std::fprintf(stderr, "[metal_pipeline_probe_test] FAIL: probe context: %s\n", error.c_str());
-      ReleaseRenderPipelineState(pipeline_state);
+      release_pipeline_states();
       return 1;
     }
 
@@ -133,7 +160,7 @@ int RunPipelineProbeTest() {
     if (!position_buffer) {
       std::fprintf(stderr, "[metal_pipeline_probe_test] FAIL: external position buffer\n");
       ReleasePipelineProbeContext(context);
-      ReleaseRenderPipelineState(pipeline_state);
+      release_pipeline_states();
       return 1;
     }
 
@@ -187,14 +214,14 @@ int RunPipelineProbeTest() {
       std::fprintf(stderr, "[metal_pipeline_probe_test] FAIL: probe draw/readback: %s\n",
                    error.c_str());
       ReleasePipelineProbeContext(context);
-      ReleaseRenderPipelineState(pipeline_state);
+      release_pipeline_states();
       return 1;
     }
     if (bgra.size() != size_t(kWidth) * kHeight * 4) {
       std::fprintf(stderr, "[metal_pipeline_probe_test] FAIL: readback size %zu, expected %zu\n",
                    bgra.size(), size_t(kWidth) * kHeight * 4);
       ReleasePipelineProbeContext(context);
-      ReleaseRenderPipelineState(pipeline_state);
+      release_pipeline_states();
       return 1;
     }
 
@@ -217,7 +244,7 @@ int RunPipelineProbeTest() {
                    center[0], center[1], center[2], center[3], corner[0], corner[1], corner[2],
                    corner[3], textured_pixels, clear_pixels);
       ReleasePipelineProbeContext(context);
-      ReleaseRenderPipelineState(pipeline_state);
+      release_pipeline_states();
       return 1;
     }
 
@@ -234,7 +261,7 @@ int RunPipelineProbeTest() {
     if (!fan_position_buffer) {
       std::fprintf(stderr, "[metal_pipeline_probe_test] FAIL: indexed position buffer\n");
       ReleasePipelineProbeContext(context);
-      ReleaseRenderPipelineState(pipeline_state);
+      release_pipeline_states();
       return 1;
     }
     ProbeIndexBuffer fan_index_buffer;
@@ -248,7 +275,7 @@ int RunPipelineProbeTest() {
       std::fprintf(stderr, "[metal_pipeline_probe_test] FAIL: external index buffer\n");
       [fan_position_buffer release];
       ReleasePipelineProbeContext(context);
-      ReleaseRenderPipelineState(pipeline_state);
+      release_pipeline_states();
       return 1;
     }
     ProbeIndexBuffer external_fan_index_buffer;
@@ -304,10 +331,81 @@ int RunPipelineProbeTest() {
     bool scissored_ok = scissored_left && scissored_right &&
                         PixelNear(scissored_left, kExpectedBgra) &&
                         PixelNear(scissored_right, kClearBgra);
+
+    auto render_indexed_fan = [&](void* draw_pipeline_state, const ProbeTextureSlot* draw_texture) {
+      return RenderPipelineProbeToContext(
+          context, draw_pipeline_state, kUnusedSystemConstants.data(),
+          sizeof(kUnusedSystemConstants), nullptr, 0, nullptr, 0, nullptr, 0, fan_position_buffer,
+          nullptr, 0, 0, draw_texture, 1, 1,
+          /*primitive_type=TriangleList=*/4, uint32_t(kFanIndices.size()), kWidth, kHeight, &error,
+          /*vertex_shared_memory_buffer_index=*/3, UINT32_MAX, UINT32_MAX, nullptr, 0, UINT32_MAX,
+          UINT32_MAX, nullptr, &sampler, nullptr, 0, UINT32_MAX, nullptr, 0, UINT32_MAX, UINT32_MAX,
+          &fan_index_buffer);
+    };
+
+    // Blend a half-transparent source over a nontrivial destination. Using the
+    // same factors for color and alpha exercises every field in 0x07060706.
+    constexpr std::array<uint8_t, 4> kBlendSourceRgba = {224, 128, 32, 128};
+    constexpr std::array<uint8_t, 4> kBlendDestinationRgba = {32, 64, 128, 192};
+    constexpr std::array<uint8_t, 4> kBlendDestinationBgra = {128, 64, 32, 192};
+    // round(src * 128 / 255 + dst * 127 / 255), in BGRA order.
+    constexpr std::array<uint8_t, 4> kExpectedBlendedBgra = {80, 96, 128, 160};
+    ProbeTextureSlot blend_texture;
+    blend_texture.rgba = kBlendSourceRgba.data();
+    blend_texture.width = 1;
+    blend_texture.height = 1;
+    blend_texture.array_length = 1;
+    blend_texture.bytes_per_row = kBlendSourceRgba.size();
+    blend_texture.bytes_per_image = kBlendSourceRgba.size();
+    bool blend_cleared = ClearPipelineProbeContext(
+        context, kWidth, kHeight, double(kBlendDestinationRgba[0]) / 255.0,
+        double(kBlendDestinationRgba[1]) / 255.0, double(kBlendDestinationRgba[2]) / 255.0,
+        double(kBlendDestinationRgba[3]) / 255.0, &error);
+    bool blend_rendered =
+        blend_cleared && render_indexed_fan(alpha_blend_pipeline_state, &blend_texture);
+    std::vector<uint8_t> blend_bgra;
+    bool blend_read =
+        blend_rendered && ReadPipelineProbeContext(context, kWidth, kHeight, blend_bgra, &error);
+    const uint8_t* blend_center =
+        blend_read ? blend_bgra.data() + (size_t(kHeight / 2) * kWidth + kWidth / 2) * 4 : nullptr;
+    const uint8_t* blend_corner = blend_read ? blend_bgra.data() : nullptr;
+    bool blend_ok = blend_center && blend_corner &&
+                    PixelNear(blend_center, kExpectedBlendedBgra, 2) &&
+                    PixelNear(blend_corner, kBlendDestinationBgra);
+
+    // Opaque replacement with only Xenos R and B enabled. G and A must retain
+    // the clear value; this specifically catches a direct (unreversed) mapping
+    // from Xenos mask bits to Metal's opposite-order MTLColorWriteMask bits.
+    constexpr std::array<uint8_t, 4> kMaskSourceRgba = {201, 151, 101, 51};
+    constexpr std::array<uint8_t, 4> kMaskDestinationRgba = {17, 71, 113, 199};
+    constexpr std::array<uint8_t, 4> kMaskDestinationBgra = {113, 71, 17, 199};
+    constexpr std::array<uint8_t, 4> kExpectedMaskedBgra = {101, 71, 201, 199};
+    ProbeTextureSlot mask_texture;
+    mask_texture.rgba = kMaskSourceRgba.data();
+    mask_texture.width = 1;
+    mask_texture.height = 1;
+    mask_texture.array_length = 1;
+    mask_texture.bytes_per_row = kMaskSourceRgba.size();
+    mask_texture.bytes_per_image = kMaskSourceRgba.size();
+    bool mask_cleared = ClearPipelineProbeContext(
+        context, kWidth, kHeight, double(kMaskDestinationRgba[0]) / 255.0,
+        double(kMaskDestinationRgba[1]) / 255.0, double(kMaskDestinationRgba[2]) / 255.0,
+        double(kMaskDestinationRgba[3]) / 255.0, &error);
+    bool mask_rendered =
+        mask_cleared && render_indexed_fan(partial_write_pipeline_state, &mask_texture);
+    std::vector<uint8_t> mask_bgra;
+    bool mask_read =
+        mask_rendered && ReadPipelineProbeContext(context, kWidth, kHeight, mask_bgra, &error);
+    const uint8_t* mask_center =
+        mask_read ? mask_bgra.data() + (size_t(kHeight / 2) * kWidth + kWidth / 2) * 4 : nullptr;
+    const uint8_t* mask_corner = mask_read ? mask_bgra.data() : nullptr;
+    bool mask_ok = mask_center && mask_corner && PixelNear(mask_center, kExpectedMaskedBgra) &&
+                   PixelNear(mask_corner, kMaskDestinationBgra);
+
     [fan_metal_index_buffer release];
     [fan_position_buffer release];
     ReleasePipelineProbeContext(context);
-    ReleaseRenderPipelineState(pipeline_state);
+    release_pipeline_states();
     if (!indexed_ok) {
       std::fprintf(stderr,
                    "[metal_pipeline_probe_test] FAIL: indexed fan draw/readback: %s "
@@ -320,11 +418,33 @@ int RunPipelineProbeTest() {
                    error.c_str());
       return 1;
     }
+    if (!blend_ok) {
+      std::fprintf(stderr,
+                   "[metal_pipeline_probe_test] FAIL: source-alpha blend: %s "
+                   "clear=%d draw=%d read=%d center=%u,%u,%u,%u corner=%u,%u,%u,%u\n",
+                   error.c_str(), int(blend_cleared), int(blend_rendered), int(blend_read),
+                   blend_center ? blend_center[0] : 0, blend_center ? blend_center[1] : 0,
+                   blend_center ? blend_center[2] : 0, blend_center ? blend_center[3] : 0,
+                   blend_corner ? blend_corner[0] : 0, blend_corner ? blend_corner[1] : 0,
+                   blend_corner ? blend_corner[2] : 0, blend_corner ? blend_corner[3] : 0);
+      return 1;
+    }
+    if (!mask_ok) {
+      std::fprintf(stderr,
+                   "[metal_pipeline_probe_test] FAIL: partial color write mask: %s "
+                   "clear=%d draw=%d read=%d center=%u,%u,%u,%u corner=%u,%u,%u,%u\n",
+                   error.c_str(), int(mask_cleared), int(mask_rendered), int(mask_read),
+                   mask_center ? mask_center[0] : 0, mask_center ? mask_center[1] : 0,
+                   mask_center ? mask_center[2] : 0, mask_center ? mask_center[3] : 0,
+                   mask_corner ? mask_corner[0] : 0, mask_corner ? mask_corner[1] : 0,
+                   mask_corner ? mask_corner[2] : 0, mask_corner ? mask_corner[3] : 0);
+      return 1;
+    }
 
     std::fprintf(stdout,
                  "[metal_pipeline_probe_test] PASS: external MTLBuffer rasterized %zu sentinel "
                  "pixels; indexed fan remap rasterized %zu; scissor clipped its right half "
-                 "(%zu clear)\n",
+                 "(%zu clear); source-alpha blend and R/B write mask matched\n",
                  textured_pixels, indexed_textured_pixels, clear_pixels);
     return 0;
   }

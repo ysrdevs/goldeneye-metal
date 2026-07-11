@@ -23,10 +23,12 @@ and swap presentation. The title's real primary ring, indirect buffers, shaders,
 `XE_SWAP` now run continuously through Metal without command scavenging or replay. Authoritative
 vertex-buffer delivery, translated array-texture bindings, and CPU/Metal resolve coherence are in
 place. Metal now consumes guest DMA, converted, and built-in index buffers through real indexed
-draws, preserves the guest alpha test, and uses the correct Metal Y orientation. Those fixes turn
-the previous malformed full-screen polygon into a readable title-driven RARE logo through the
-normal resolve and presentation path. The current blocker is faithful render-target composition
-and fixed-function state; this is the next demonstrated blocker after command and shader delivery.
+draws, preserves the guest alpha test, and applies live viewport, scissor, blend, blend-constant,
+and per-channel color-write state. Current single-sample host contexts assemble the observed title
+sequence's three resolve bands described by its 4xMSAA layout through the normal `IssueCopy` and
+`IssueSwap` route. Those fixes produce a clean classification screen and shaded, animated gold
+RARE logo. The next known fidelity gaps are culling, depth/stencil, and true guest MSAA behavior;
+the incomplete post-RARE splash still needs focused diagnosis.
 
 See [the native Metal status report](docs/GOLDENEYE_NATIVE_METAL_PROJECT_STATUS.md) for the exact
 milestones, evidence, and next development priority.
@@ -120,9 +122,9 @@ is responsible for supplying compatible files they are legally authorized to use
 ## Contributing
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change. The immediate priority is a
-correct title/menu frame with faithful composition and fixed-function state: no synthetic geometry,
-replacement shaders, guessed command buffers, or heuristic presentation may count as completion
-evidence.
+correct title/menu frame with faithful depth/stencil, culling, and MSAA state: no synthetic
+geometry, replacement shaders, guessed command buffers, or heuristic presentation may count as
+completion evidence.
 
 ## Licensing and trademarks
 

@@ -69,9 +69,11 @@ resolve to null. Game data stays local and must never be committed.
 kernel, and compares GPU output against a CPU reference byte for byte.
 
 `metal_pipeline_probe_test` renders through an externally owned Metal vertex buffer, samples a
-single-layer `texture2d_array`, expands a four-vertex fan through a six-entry index buffer, and
-checks scissor delivery. It protects the resource contract used by translated producer
-draws. It does not replace title-level validation of texture-cache uploads or resolve coherence.
+single-layer `texture2d_array`, expands a four-vertex fan through a six-entry index buffer, checks
+scissor delivery, verifies the title's source-alpha blend mode, and validates Xenos-to-Metal
+per-channel write-mask mapping. It protects the resource and fixed-function contract used by
+translated producer draws. It does not replace title-level validation of texture-cache uploads or
+resolve coherence.
 
 Unit tests are enabled by the Apple Silicon preset. PPC assembly tests are disabled by default and
 require an external `powerpc-none-elf` binutils toolchain. Enable them explicitly with:

@@ -68,10 +68,64 @@ bool IsProbeRasterizationStateValid(const ProbeRasterizationState* state, uint32
       state->viewport_z_min > 1.0 || state->viewport_z_max < 0.0 || state->viewport_z_max > 1.0 ||
       !state->scissor_width || !state->scissor_height || state->scissor_x > width ||
       state->scissor_y > height || state->scissor_width > width - state->scissor_x ||
-      state->scissor_height > height - state->scissor_y) {
+      state->scissor_height > height - state->scissor_y || !std::isfinite(state->blend_red) ||
+      !std::isfinite(state->blend_green) || !std::isfinite(state->blend_blue) ||
+      !std::isfinite(state->blend_alpha)) {
     return false;
   }
   return true;
+}
+
+MTLBlendFactor GetMetalBlendFactor(uint32_t factor, bool alpha) {
+  switch (factor & 0x1F) {
+    case 1:
+      return MTLBlendFactorOne;
+    case 4:
+    case 6:
+      return alpha ? MTLBlendFactorSourceAlpha
+                   : (factor == 4 ? MTLBlendFactorSourceColor : MTLBlendFactorSourceAlpha);
+    case 5:
+    case 7:
+      return alpha ? MTLBlendFactorOneMinusSourceAlpha
+                   : (factor == 5 ? MTLBlendFactorOneMinusSourceColor
+                                  : MTLBlendFactorOneMinusSourceAlpha);
+    case 8:
+    case 10:
+      return alpha
+                 ? MTLBlendFactorDestinationAlpha
+                 : (factor == 8 ? MTLBlendFactorDestinationColor : MTLBlendFactorDestinationAlpha);
+    case 9:
+    case 11:
+      return alpha ? MTLBlendFactorOneMinusDestinationAlpha
+                   : (factor == 9 ? MTLBlendFactorOneMinusDestinationColor
+                                  : MTLBlendFactorOneMinusDestinationAlpha);
+    case 12:
+    case 14:
+      return alpha || factor == 14 ? MTLBlendFactorBlendAlpha : MTLBlendFactorBlendColor;
+    case 13:
+    case 15:
+      return alpha || factor == 15 ? MTLBlendFactorOneMinusBlendAlpha
+                                   : MTLBlendFactorOneMinusBlendColor;
+    case 16:
+      return MTLBlendFactorSourceAlphaSaturated;
+    default:
+      return MTLBlendFactorZero;
+  }
+}
+
+MTLBlendOperation GetMetalBlendOperation(uint32_t operation) {
+  switch (operation & 0x7) {
+    case 1:
+      return MTLBlendOperationSubtract;
+    case 2:
+      return MTLBlendOperationMin;
+    case 3:
+      return MTLBlendOperationMax;
+    case 4:
+      return MTLBlendOperationReverseSubtract;
+    default:
+      return MTLBlendOperationAdd;
+  }
 }
 
 id<MTLTexture> CreateProbeTexture(id<MTLDevice> device, const ProbeTextureSlot& slot) {
@@ -245,7 +299,8 @@ bool ValidateMslSource(void* metal_device, const std::string& source, std::strin
 }
 
 void* CreateRenderPipelineState(void* metal_device, void* vertex_library, void* fragment_library,
-                                std::string* error_out) {
+                                std::string* error_out,
+                                const ProbeColorTargetState* color_target_state) {
   if (!metal_device || !vertex_library || !fragment_library) {
     if (error_out) {
       *error_out = "missing Metal device or shader library";
@@ -272,7 +327,42 @@ void* CreateRenderPipelineState(void* metal_device, void* vertex_library, void* 
   MTLRenderPipelineDescriptor* descriptor = [[MTLRenderPipelineDescriptor alloc] init];
   descriptor.vertexFunction = vertex_function;
   descriptor.fragmentFunction = fragment_function;
-  descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+  MTLRenderPipelineColorAttachmentDescriptor* color_attachment = descriptor.colorAttachments[0];
+  color_attachment.pixelFormat = MTLPixelFormatBGRA8Unorm;
+  if (color_target_state) {
+    uint32_t write_mask = color_target_state->write_mask & 0xF;
+    MTLColorWriteMask metal_write_mask = MTLColorWriteMaskNone;
+    if (write_mask & 0x1) {
+      metal_write_mask |= MTLColorWriteMaskRed;
+    }
+    if (write_mask & 0x2) {
+      metal_write_mask |= MTLColorWriteMaskGreen;
+    }
+    if (write_mask & 0x4) {
+      metal_write_mask |= MTLColorWriteMaskBlue;
+    }
+    if (write_mask & 0x8) {
+      metal_write_mask |= MTLColorWriteMaskAlpha;
+    }
+    color_attachment.writeMask = metal_write_mask;
+
+    uint32_t blend_control = color_target_state->blend_control & 0x1FFF1FFF;
+    uint32_t color_source = blend_control & 0x1F;
+    uint32_t color_operation = (blend_control >> 5) & 0x7;
+    uint32_t color_destination = (blend_control >> 8) & 0x1F;
+    uint32_t alpha_source = (blend_control >> 16) & 0x1F;
+    uint32_t alpha_operation = (blend_control >> 21) & 0x7;
+    uint32_t alpha_destination = (blend_control >> 24) & 0x1F;
+    color_attachment.sourceRGBBlendFactor = GetMetalBlendFactor(color_source, false);
+    color_attachment.rgbBlendOperation = GetMetalBlendOperation(color_operation);
+    color_attachment.destinationRGBBlendFactor = GetMetalBlendFactor(color_destination, false);
+    color_attachment.sourceAlphaBlendFactor = GetMetalBlendFactor(alpha_source, true);
+    color_attachment.alphaBlendOperation = GetMetalBlendOperation(alpha_operation);
+    color_attachment.destinationAlphaBlendFactor = GetMetalBlendFactor(alpha_destination, true);
+    color_attachment.blendingEnabled = color_source != 1 || color_operation != 0 ||
+                                       color_destination != 0 || alpha_source != 1 ||
+                                       alpha_operation != 0 || alpha_destination != 0;
+  }
 
   NSError* error = nil;
   id<MTLRenderPipelineState> pipeline_state =
@@ -774,6 +864,10 @@ bool RenderPipelineProbeToContext(
                               rasterization_state->scissor_width,
                               rasterization_state->scissor_height};
     [encoder setScissorRect:scissor];
+    [encoder setBlendColorRed:rasterization_state->blend_red
+                        green:rasterization_state->blend_green
+                         blue:rasterization_state->blend_blue
+                        alpha:rasterization_state->blend_alpha];
   }
   [encoder setVertexBuffer:system_buffer offset:0 atIndex:0];
   [encoder setFragmentBuffer:system_buffer offset:0 atIndex:0];
@@ -1172,6 +1266,10 @@ bool RenderPipelineProbe(
                               rasterization_state->scissor_width,
                               rasterization_state->scissor_height};
     [encoder setScissorRect:scissor];
+    [encoder setBlendColorRed:rasterization_state->blend_red
+                        green:rasterization_state->blend_green
+                         blue:rasterization_state->blend_blue
+                        alpha:rasterization_state->blend_alpha];
   }
   [encoder setVertexBuffer:system_buffer offset:0 atIndex:0];
   [encoder setFragmentBuffer:system_buffer offset:0 atIndex:0];

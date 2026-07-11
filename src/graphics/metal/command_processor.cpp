@@ -2588,13 +2588,26 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       pixel_shader && pixel_translation_ok &&
       register_file_->Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kColorDepth &&
       !IsVoidFragmentMsl(pixel_translation)) {
-    void* pipeline_state = EnsureRenderPipeline(*route_vertex_shader, *pixel_shader);
     uint32_t normalized_color_mask = active_color_write_mask();
-    if (pipeline_state && normalized_color_mask) {
+    if (normalized_color_mask) {
       update_draw_constants();
       bool routed_this_draw = false;
       for (uint32_t rt_index = 0; rt_index < xenos::kMaxColorRenderTargets; ++rt_index) {
         if (!((normalized_color_mask >> (rt_index * 4)) & 0xF)) {
+          continue;
+        }
+        reg::RB_COLOR_INFO rt_color_info = register_file_->Get<reg::RB_COLOR_INFO>(
+            reg::RB_COLOR_INFO::rt_register_indices[rt_index]);
+        uint32_t rt_format_component_count =
+            xenos::GetColorRenderTargetFormatComponentCount(rt_color_info.color_format);
+        uint32_t rt_format_component_mask =
+            (uint32_t(1) << rt_format_component_count) - 1;
+        uint32_t rt_color_write_mask =
+            (register_file_->values[XE_GPU_REG_RB_COLOR_MASK] >> (rt_index * 4)) &
+            rt_format_component_mask;
+        void* pipeline_state = EnsureRenderPipeline(*route_vertex_shader, *pixel_shader, rt_index,
+                                                    rt_color_write_mask);
+        if (!pipeline_state) {
           continue;
         }
         HostRenderTarget* active_host_rt = EnsureHostRenderTarget(rt_index);
@@ -2608,27 +2621,11 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
         TryRenderPipelineProbe(*route_vertex_shader, *pixel_shader, pipeline_state, host_prim_type,
                                host_draw_vertex_count, true,
                                primitive_processing_ok ? &primitive_processing_result : nullptr);
-        if (latest_host_render_target_width_ && latest_host_render_target_height_ &&
-            !latest_host_render_target_bgra_.empty()) {
-          bool new_has_visible_rgb = BgraHasNonZeroRgb(latest_host_render_target_bgra_);
-          bool cached_has_visible_rgb = BgraHasNonZeroRgb(active_host_rt->bgra);
-          if (new_has_visible_rgb || !cached_has_visible_rgb) {
-            active_host_rt->bgra = latest_host_render_target_bgra_;
-            active_host_rt->width = latest_host_render_target_width_;
-            active_host_rt->height = latest_host_render_target_height_;
-          } else {
-            static std::atomic<uint32_t> preserved_rt_logs{0};
-            uint32_t preserved_rt_index =
-                preserved_rt_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (preserved_rt_index <= 16 || (preserved_rt_index & 0xFF) == 0) {
-              std::fprintf(stderr,
-                           "[metal] preserved owned RT#%u draw=%u rt=%u "
-                           "new_visible=0 cached_visible=%u\n",
-                           preserved_rt_index, metal_draw_index, rt_index,
-                           CountVisibleRgbPixels(active_host_rt->bgra));
-              std::fflush(stderr);
-            }
-          }
+        if (last_host_render_target_probe_read_ && latest_host_render_target_width_ &&
+            latest_host_render_target_height_ && !latest_host_render_target_bgra_.empty()) {
+          active_host_rt->bgra = latest_host_render_target_bgra_;
+          active_host_rt->width = latest_host_render_target_width_;
+          active_host_rt->height = latest_host_render_target_height_;
         }
         if (vertex_shader->ucode_data_hash() == UINT64_C(0x0a6d1dd7767fdf27) &&
             pixel_shader->ucode_data_hash() == UINT64_C(0x2e372ea28cc404b7) && rt_index == 0 &&
@@ -4484,55 +4481,26 @@ bool MetalCommandProcessor::IssueCopy() {
   void* resolve_host_rt_context =
       resolve_host_rt && resolve_host_rt->context ? resolve_host_rt->context : nullptr;
   auto refresh_resolve_host_rt = [&](uint32_t resolve_width, uint32_t resolve_height) -> bool {
-    if (resolve_host_rt && resolve_host_rt->width == resolve_width &&
-        resolve_host_rt->height >= resolve_height &&
-        resolve_host_rt->bgra.size() >= size_t(resolve_width) * resolve_height * 4) {
-      latest_host_render_target_bgra_ = resolve_host_rt->bgra;
-      latest_host_render_target_width_ = resolve_host_rt->width;
-      latest_host_render_target_height_ = resolve_host_rt->height;
-      static std::atomic<uint32_t> host_rt_cache_source_logs{0};
-      uint32_t cache_source_index =
-          host_rt_cache_source_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-      if (cache_source_index <= 16 || (cache_source_index & 0xFF) == 0) {
-        std::fprintf(stderr,
-                     "[metal] host RT resolve using owned cache#%u rt=%u visible=%u "
-                     "size=%ux%u\n",
-                     cache_source_index, uint32_t(active_copy_control.copy_src_select),
-                     CountVisibleRgbPixels(latest_host_render_target_bgra_),
-                     latest_host_render_target_width_, latest_host_render_target_height_);
-        std::fflush(stderr);
-      }
-      return true;
-    }
     if (resolve_host_rt_context) {
       void* saved_host_render_target_context = host_render_target_context_;
       host_render_target_context_ = resolve_host_rt_context;
       bool refreshed = RefreshHostRenderTargetBacking(resolve_width, resolve_height);
       host_render_target_context_ = saved_host_render_target_context;
       if (refreshed && resolve_host_rt) {
-        bool refreshed_has_visible_rgb = BgraHasNonZeroRgb(latest_host_render_target_bgra_);
-        bool cached_has_visible_rgb = BgraHasNonZeroRgb(resolve_host_rt->bgra);
-        if (!refreshed_has_visible_rgb && cached_has_visible_rgb &&
-            resolve_host_rt->width == resolve_width && resolve_host_rt->height == resolve_height) {
-          static std::atomic<uint32_t> host_rt_cache_resolve_logs{0};
-          uint32_t cache_resolve_index =
-              host_rt_cache_resolve_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-          if (cache_resolve_index <= 16 || (cache_resolve_index & 0xFF) == 0) {
-            std::fprintf(stderr,
-                         "[metal] host RT resolve using cached producer#%u rt=%u "
-                         "context_visible=0 cached_visible=%u size=%ux%u\n",
-                         cache_resolve_index, uint32_t(active_copy_control.copy_src_select),
-                         CountVisibleRgbPixels(resolve_host_rt->bgra), resolve_host_rt->width,
-                         resolve_host_rt->height);
-            std::fflush(stderr);
-          }
-          latest_host_render_target_bgra_ = resolve_host_rt->bgra;
-          latest_host_render_target_width_ = resolve_host_rt->width;
-          latest_host_render_target_height_ = resolve_host_rt->height;
-        } else {
-          resolve_host_rt->bgra = latest_host_render_target_bgra_;
-          resolve_host_rt->width = latest_host_render_target_width_;
-          resolve_host_rt->height = latest_host_render_target_height_;
+        resolve_host_rt->bgra = latest_host_render_target_bgra_;
+        resolve_host_rt->width = latest_host_render_target_width_;
+        resolve_host_rt->height = latest_host_render_target_height_;
+        static std::atomic<uint32_t> host_rt_context_source_logs{0};
+        uint32_t context_source_index =
+            host_rt_context_source_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (context_source_index <= 16 || (context_source_index & 0xFF) == 0) {
+          std::fprintf(stderr,
+                       "[metal] host RT resolve using live context#%u rt=%u visible=%u "
+                       "size=%ux%u\n",
+                       context_source_index, uint32_t(active_copy_control.copy_src_select),
+                       CountVisibleRgbPixels(latest_host_render_target_bgra_),
+                       latest_host_render_target_width_, latest_host_render_target_height_);
+          std::fflush(stderr);
         }
         return true;
       }
@@ -4710,9 +4678,19 @@ bool MetalCommandProcessor::IssueCopy() {
       }
       uint32_t copy_width = std::min(rect_width, source_rect_width);
       uint32_t copy_height = std::min(rect_height, source_rect_height);
+      bool can_resolve_directly_from_host_rt =
+          resolve_host_rt && host_source_rect_x <= latest_host_render_target_width_ &&
+          host_source_rect_y <= latest_host_render_target_height_ &&
+          copy_width <= latest_host_render_target_width_ - host_source_rect_x &&
+          copy_height <= latest_host_render_target_height_ - host_source_rect_y;
       std::vector<uint8_t> edram_resolved_bgra;
       bool used_edram_resolve = false;
-      if (resolve_host_rt && DumpHostRenderTargetToEdram(*resolve_host_rt)) {
+      // The persistent Metal target is already the resolved, single-sample representation of the
+      // guest render target. Prefer it when the ResolveInfo-derived local source rectangle fits.
+      // Dumping the entire logical 720-line target into 4xMSAA EDRAM would wrap after the physical
+      // 512-line capacity and overwrite the band being resolved.
+      if (!can_resolve_directly_from_host_rt && resolve_host_rt &&
+          DumpHostRenderTargetToEdram(*resolve_host_rt)) {
         used_edram_resolve =
             ResolveEdramToBgra(resolve_info, copy_width, copy_height, edram_resolved_bgra);
       }
@@ -6509,13 +6487,26 @@ MetalShader::MetalTranslation* MetalCommandProcessor::GetTranslatedShader(MetalS
 }
 
 void* MetalCommandProcessor::EnsureRenderPipeline(MetalShader& vertex_shader,
-                                                  MetalShader& pixel_shader) {
+                                                  MetalShader& pixel_shader, uint32_t rt_index,
+                                                  uint32_t color_write_mask) {
+  if (rt_index >= xenos::kMaxColorRenderTargets) {
+    return nullptr;
+  }
   uint64_t vertex_modification = 0;
   uint64_t pixel_modification = 0;
   GetCurrentShaderModifications(&vertex_shader, &pixel_shader, vertex_modification,
                                 pixel_modification);
-  uint64_t pipeline_key_parts[4] = {vertex_shader.ucode_data_hash(), pixel_shader.ucode_data_hash(),
-                                    vertex_modification, pixel_modification};
+  uint32_t blend_control =
+      register_file_
+          ? register_file_->values[reg::RB_BLENDCONTROL::rt_register_indices[rt_index]] & 0x1FFF1FFF
+          : 0x00010001;
+  uint64_t pipeline_key_parts[6] = {
+      vertex_shader.ucode_data_hash(),
+      pixel_shader.ucode_data_hash(),
+      vertex_modification,
+      pixel_modification,
+      rt_index,
+      uint64_t(color_write_mask & 0xF) | (uint64_t(blend_control) << 32)};
   uint64_t pipeline_key = XXH3_64bits(pipeline_key_parts, sizeof(pipeline_key_parts));
   auto existing_pipeline = render_pipeline_states_.find(pipeline_key);
   if (existing_pipeline != render_pipeline_states_.end()) {
@@ -6531,27 +6522,36 @@ void* MetalCommandProcessor::EnsureRenderPipeline(MetalShader& vertex_shader,
   }
 
   std::string pipeline_error;
-  void* pipeline_state =
-      CreateRenderPipelineState(metal_device_, vertex_translation->metal_library(),
-                                pixel_translation->metal_library(), &pipeline_error);
+  ProbeColorTargetState color_target_state;
+  color_target_state.write_mask = uint8_t(color_write_mask & 0xF);
+  color_target_state.blend_control = blend_control;
+  void* pipeline_state = CreateRenderPipelineState(
+      metal_device_, vertex_translation->metal_library(), pixel_translation->metal_library(),
+      &pipeline_error, &color_target_state);
   render_pipeline_states_.emplace(pipeline_key, pipeline_state);
 
   static std::atomic<uint32_t> pipeline_logs{0};
   uint32_t pipeline_log_index = pipeline_logs.fetch_add(1, std::memory_order_relaxed) + 1;
   if (pipeline_state) {
     if (pipeline_log_index <= 16 || (pipeline_log_index & 0x3F) == 0) {
-      std::fprintf(stderr, "[metal] render pipeline ready#%u vs=%016llx ps=%016llx key=%016llx\n",
+      std::fprintf(stderr,
+                   "[metal] render pipeline ready#%u vs=%016llx ps=%016llx rt=%u "
+                   "mask=0x%x blend=0x%08x key=%016llx\n",
                    pipeline_log_index,
                    static_cast<unsigned long long>(vertex_shader.ucode_data_hash()),
-                   static_cast<unsigned long long>(pixel_shader.ucode_data_hash()),
+                   static_cast<unsigned long long>(pixel_shader.ucode_data_hash()), rt_index,
+                   color_target_state.write_mask, color_target_state.blend_control,
                    static_cast<unsigned long long>(pipeline_key));
       std::fflush(stderr);
     }
   } else if (pipeline_log_index <= 16 || (pipeline_log_index & 0x3F) == 0) {
     std::fprintf(
-        stderr, "[metal] render pipeline failed#%u vs=%016llx ps=%016llx: %s\n", pipeline_log_index,
-        static_cast<unsigned long long>(vertex_shader.ucode_data_hash()),
-        static_cast<unsigned long long>(pixel_shader.ucode_data_hash()), pipeline_error.c_str());
+        stderr,
+        "[metal] render pipeline failed#%u vs=%016llx ps=%016llx rt=%u "
+        "mask=0x%x blend=0x%08x: %s\n",
+        pipeline_log_index, static_cast<unsigned long long>(vertex_shader.ucode_data_hash()),
+        static_cast<unsigned long long>(pixel_shader.ucode_data_hash()), rt_index,
+        color_target_state.write_mask, color_target_state.blend_control, pipeline_error.c_str());
     std::fflush(stderr);
   }
   return pipeline_state;
@@ -7945,6 +7945,7 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
     MetalShader& vertex_shader, MetalShader& pixel_shader, void* pipeline_state,
     xenos::PrimitiveType prim_type, uint32_t index_count, bool host_render_target_debug,
     const PrimitiveProcessor::ProcessingResult* primitive_processing_result) {
+  last_host_render_target_probe_read_ = false;
   if (!pipeline_state || !metal_device_ || !memory_) {
     return;
   }
@@ -7975,8 +7976,9 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
   uint64_t pixel_modification = 0;
   GetCurrentShaderModifications(&vertex_shader, &pixel_shader, vertex_modification,
                                 pixel_modification);
-  uint64_t pipeline_key_parts[4] = {vertex_shader.ucode_data_hash(), pixel_shader.ucode_data_hash(),
-                                    vertex_modification, pixel_modification};
+  uint64_t pipeline_key_parts[5] = {vertex_shader.ucode_data_hash(), pixel_shader.ucode_data_hash(),
+                                    vertex_modification, pixel_modification,
+                                    uint64_t(reinterpret_cast<uintptr_t>(pipeline_state))};
   uint64_t pipeline_key = XXH3_64bits(pipeline_key_parts, sizeof(pipeline_key_parts));
   bool first_pipeline_probe = probed_pipeline_keys_.emplace(pipeline_key).second;
 
@@ -8170,6 +8172,36 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
 
   uint32_t probe_width = std::max<uint32_t>(fallback_output_width_, 1);
   uint32_t probe_height = std::max<uint32_t>(fallback_output_height_, 1);
+  draw_util::ViewportInfo probe_viewport_info = {};
+  reg::RB_DEPTHCONTROL probe_depth_control = draw_util::GetNormalizedDepthControl(*register_file_);
+  draw_util::GetHostViewportInfo(*register_file_, 1, 1, true, probe_width, probe_height, true,
+                                 probe_depth_control, false, false, pixel_shader.writes_depth(),
+                                 probe_viewport_info);
+  draw_util::Scissor probe_scissor = {};
+  draw_util::GetScissor(*register_file_, probe_scissor);
+  uint32_t probe_scissor_x = std::min(probe_scissor.offset[0], probe_width);
+  uint32_t probe_scissor_y = std::min(probe_scissor.offset[1], probe_height);
+  uint32_t probe_scissor_width = std::min(probe_scissor.extent[0], probe_width - probe_scissor_x);
+  uint32_t probe_scissor_height = std::min(probe_scissor.extent[1], probe_height - probe_scissor_y);
+  if (!probe_viewport_info.xy_extent[0] || !probe_viewport_info.xy_extent[1] ||
+      !probe_scissor_width || !probe_scissor_height) {
+    return;
+  }
+  ProbeRasterizationState probe_rasterization_state = {};
+  probe_rasterization_state.viewport_x = probe_viewport_info.xy_offset[0];
+  probe_rasterization_state.viewport_y = probe_viewport_info.xy_offset[1];
+  probe_rasterization_state.viewport_width = probe_viewport_info.xy_extent[0];
+  probe_rasterization_state.viewport_height = probe_viewport_info.xy_extent[1];
+  probe_rasterization_state.viewport_z_min = probe_viewport_info.z_min;
+  probe_rasterization_state.viewport_z_max = probe_viewport_info.z_max;
+  probe_rasterization_state.scissor_x = probe_scissor_x;
+  probe_rasterization_state.scissor_y = probe_scissor_y;
+  probe_rasterization_state.scissor_width = probe_scissor_width;
+  probe_rasterization_state.scissor_height = probe_scissor_height;
+  probe_rasterization_state.blend_red = register_file_->Get<float>(XE_GPU_REG_RB_BLEND_RED);
+  probe_rasterization_state.blend_green = register_file_->Get<float>(XE_GPU_REG_RB_BLEND_GREEN);
+  probe_rasterization_state.blend_blue = register_file_->Get<float>(XE_GPU_REG_RB_BLEND_BLUE);
+  probe_rasterization_state.blend_alpha = register_file_->Get<float>(XE_GPU_REG_RB_BLEND_ALPHA);
   const uint8_t* probe_initial_bgra = nullptr;
   size_t probe_initial_row_pitch = 0;
   if (resolved_color_width_ == probe_width && resolved_color_height_ == probe_height &&
@@ -8331,7 +8363,7 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
         fragment_sampler_slots.empty() ? nullptr : fragment_sampler_slots.data(), nullptr, 0,
         UINT32_MAX, bool_loop_constants_.data(), bool_loop_constants_.size() * sizeof(uint32_t),
         vertex_buffer_bindings.bool_loop_constants, fragment_bool_loop_constants_buffer_index,
-        probe_index_buffer_ptr);
+        probe_index_buffer_ptr, &probe_rasterization_state);
     ++pipeline_probe_draws_this_swap_;
     if (!persistent_probe_ok) {
       ++pipeline_probe_failure_count_;
@@ -8351,7 +8383,8 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
     bool nonzero = false;
     if (should_read) {
       if (host_render_target_debug) {
-        RefreshHostRenderTargetBacking(probe_width, probe_height);
+        last_host_render_target_probe_read_ =
+            RefreshHostRenderTargetBacking(probe_width, probe_height);
         nonzero = BgraHasNonZeroRgb(latest_host_render_target_bgra_);
         if (!nonzero && MetalHostRenderTargetSolidTestEnabled()) {
           if (void* solid_pipeline_state = EnsureSolidColorPipeline(vertex_shader)) {

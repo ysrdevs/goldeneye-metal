@@ -65,7 +65,8 @@ class MetalCommandProcessor final : public CommandProcessor {
   MetalShader::MetalTranslation* GetTranslatedShader(MetalShader& shader);
   bool EnsureShaderTranslated(MetalShader& shader, uint64_t modification);
   bool EnsureShaderTranslated(MetalShader& shader);
-  void* EnsureRenderPipeline(MetalShader& vertex_shader, MetalShader& pixel_shader);
+  void* EnsureRenderPipeline(MetalShader& vertex_shader, MetalShader& pixel_shader,
+                             uint32_t rt_index = 0, uint32_t color_write_mask = 0xF);
   void UpdateMinimalSystemConstants(xenos::PrimitiveType prim_type,
                                     const IndexBufferInfo* index_buffer_info);
   void UpdateGuestConstantBuffers();
@@ -287,6 +288,7 @@ class MetalCommandProcessor final : public CommandProcessor {
   uint32_t host_pixel_skipped_vertices_this_swap_ = 0;
   uint64_t latest_texture_candidate_score_ = 0;
   bool logged_incomplete_ = false;
+  bool last_host_render_target_probe_read_ = false;
   bool last_swap_fetch_valid_ = false;
   bool last_position_registers_valid_ = false;
 };
