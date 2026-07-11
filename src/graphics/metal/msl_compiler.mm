@@ -3,6 +3,7 @@
 #import <Metal/Metal.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace rex::graphics::metal {
@@ -27,6 +28,50 @@ MTLPrimitiveType ToMetalPrimitiveType(uint32_t primitive_type) {
     default:
       return MTLPrimitiveTypeTriangle;
   }
+}
+
+bool IsProbeIndexBufferValid(const ProbeIndexBuffer* index_buffer, uint32_t index_count) {
+  if (!index_buffer) {
+    return true;
+  }
+  bool has_data = index_buffer->data != nullptr;
+  bool has_metal_buffer = index_buffer->metal_buffer != nullptr;
+  if (has_data == has_metal_buffer ||
+      (index_buffer->index_size != 2 && index_buffer->index_size != 4) ||
+      index_buffer->offset % index_buffer->index_size) {
+    return false;
+  }
+  size_t required_size = size_t(index_count) * index_buffer->index_size;
+  if (index_buffer->offset > index_buffer->size ||
+      required_size > index_buffer->size - index_buffer->offset) {
+    return false;
+  }
+  return !has_metal_buffer ||
+         index_buffer->offset + required_size <= [(id<MTLBuffer>)index_buffer->metal_buffer length];
+}
+
+bool IsProbeRasterizationStateValid(const ProbeRasterizationState* state, uint32_t width,
+                                    uint32_t height) {
+  if (!state) {
+    return true;
+  }
+  if (!std::isfinite(state->viewport_x) || !std::isfinite(state->viewport_y) ||
+      !std::isfinite(state->viewport_width) || !std::isfinite(state->viewport_height) ||
+      !std::isfinite(state->viewport_z_min) || !std::isfinite(state->viewport_z_max) ||
+      state->viewport_width <= 0.0 || state->viewport_height <= 0.0 ||
+      !std::isfinite(state->viewport_x + state->viewport_width) ||
+      !std::isfinite(state->viewport_y + state->viewport_height) || state->viewport_x < 0.0 ||
+      state->viewport_y < 0.0 || state->viewport_x > double(width) ||
+      state->viewport_y > double(height) ||
+      state->viewport_width > double(width) - state->viewport_x ||
+      state->viewport_height > double(height) - state->viewport_y || state->viewport_z_min < 0.0 ||
+      state->viewport_z_min > 1.0 || state->viewport_z_max < 0.0 || state->viewport_z_max > 1.0 ||
+      !state->scissor_width || !state->scissor_height || state->scissor_x > width ||
+      state->scissor_y > height || state->scissor_width > width - state->scissor_x ||
+      state->scissor_height > height - state->scissor_y) {
+    return false;
+  }
+  return true;
 }
 
 id<MTLTexture> CreateProbeTexture(id<MTLDevice> device, const ProbeTextureSlot& slot) {
@@ -548,12 +593,25 @@ bool RenderPipelineProbeToContext(
     const ProbeSamplerSlot* fragment_samplers, const void* vertex_data, size_t vertex_data_size,
     uint32_t vertex_data_buffer_index, const void* bool_loop_constants,
     size_t bool_loop_constants_size, uint32_t vertex_bool_loop_constants_buffer_index,
-    uint32_t fragment_bool_loop_constants_buffer_index) {
+    uint32_t fragment_bool_loop_constants_buffer_index, const ProbeIndexBuffer* index_buffer,
+    const ProbeRasterizationState* rasterization_state) {
   auto* context = static_cast<PipelineProbeContext*>(opaque_context);
   if (!context || !pipeline_state || !system_constants || !system_constants_size || !width ||
       !height || !vertex_count) {
     if (error_out) {
       *error_out = "missing probe context, pipeline state, constants, or target size";
+    }
+    return false;
+  }
+  if (!IsProbeIndexBufferValid(index_buffer, vertex_count)) {
+    if (error_out) {
+      *error_out = "invalid probe index buffer";
+    }
+    return false;
+  }
+  if (!IsProbeRasterizationStateValid(rasterization_state, width, height)) {
+    if (error_out) {
+      *error_out = "invalid probe viewport or scissor";
     }
     return false;
   }
@@ -595,6 +653,16 @@ bool RenderPipelineProbeToContext(
                                              length:vertex_data_size
                                             options:MTLResourceStorageModeShared];
   }
+  id<MTLBuffer> index_buffer_object = nil;
+  if (index_buffer) {
+    if (index_buffer->metal_buffer) {
+      index_buffer_object = [(id<MTLBuffer>)index_buffer->metal_buffer retain];
+    } else {
+      index_buffer_object = [device newBufferWithBytes:index_buffer->data
+                                                length:index_buffer->size
+                                               options:MTLResourceStorageModeShared];
+    }
+  }
   uint32_t shared_dummy_words[4] = {};
   id<MTLBuffer> shared_memory_buffer = nil;
   if (shared_memory_metal_buffer) {
@@ -610,7 +678,7 @@ bool RenderPipelineProbeToContext(
                                                length:sizeof(shared_dummy_words)
                                               options:MTLResourceStorageModeShared];
   }
-  if (!system_buffer || !shared_memory_buffer) {
+  if (!system_buffer || !shared_memory_buffer || (index_buffer && !index_buffer_object)) {
     if (system_buffer) {
       [system_buffer release];
     }
@@ -629,13 +697,18 @@ bool RenderPipelineProbeToContext(
     if (vertex_data_buffer) {
       [vertex_data_buffer release];
     }
+    if (index_buffer_object) {
+      [index_buffer_object release];
+    }
     if (shared_memory_buffer) {
       [shared_memory_buffer release];
     }
     if (error_out) {
-      *error_out = vertex_shared_memory_buffer_index != UINT32_MAX && !shared_memory_buffer
-                       ? "required persistent shared-memory buffer is unavailable"
-                       : "failed to create persistent probe argument buffers";
+      *error_out = index_buffer && !index_buffer_object
+                       ? "failed to create persistent probe index buffer"
+                       : (vertex_shared_memory_buffer_index != UINT32_MAX && !shared_memory_buffer
+                              ? "required persistent shared-memory buffer is unavailable"
+                              : "failed to create persistent probe argument buffers");
     }
     return false;
   }
@@ -691,6 +764,17 @@ bool RenderPipelineProbeToContext(
 
   id<MTLRenderCommandEncoder> encoder = [command_buffer renderCommandEncoderWithDescriptor:pass];
   [encoder setRenderPipelineState:(id<MTLRenderPipelineState>)pipeline_state];
+  if (rasterization_state) {
+    MTLViewport viewport = {
+        rasterization_state->viewport_x,     rasterization_state->viewport_y,
+        rasterization_state->viewport_width, rasterization_state->viewport_height,
+        rasterization_state->viewport_z_min, rasterization_state->viewport_z_max};
+    [encoder setViewport:viewport];
+    MTLScissorRect scissor = {rasterization_state->scissor_x, rasterization_state->scissor_y,
+                              rasterization_state->scissor_width,
+                              rasterization_state->scissor_height};
+    [encoder setScissorRect:scissor];
+  }
   [encoder setVertexBuffer:system_buffer offset:0 atIndex:0];
   [encoder setFragmentBuffer:system_buffer offset:0 atIndex:0];
   if (fetch_buffer) {
@@ -739,9 +823,18 @@ bool RenderPipelineProbeToContext(
   BindProbeTextures(encoder, fragment_texture_objects, false);
   BindProbeSamplers(encoder, vertex_sampler_objects, true);
   BindProbeSamplers(encoder, fragment_sampler_objects, false);
-  [encoder drawPrimitives:ToMetalPrimitiveType(primitive_type)
-              vertexStart:0
-              vertexCount:vertex_count];
+  if (index_buffer_object) {
+    [encoder drawIndexedPrimitives:ToMetalPrimitiveType(primitive_type)
+                        indexCount:vertex_count
+                         indexType:index_buffer->index_size == 2 ? MTLIndexTypeUInt16
+                                                                 : MTLIndexTypeUInt32
+                       indexBuffer:index_buffer_object
+                 indexBufferOffset:index_buffer->offset];
+  } else {
+    [encoder drawPrimitives:ToMetalPrimitiveType(primitive_type)
+                vertexStart:0
+                vertexCount:vertex_count];
+  }
   [encoder endEncoding];
   [command_buffer commit];
   [command_buffer waitUntilCompleted];
@@ -769,6 +862,9 @@ bool RenderPipelineProbeToContext(
   }
   if (vertex_data_buffer) {
     [vertex_data_buffer release];
+  }
+  if (index_buffer_object) {
+    [index_buffer_object release];
   }
   [shared_memory_buffer release];
   ReleaseOwnedProbeTextures(vertex_texture_objects, dummy_texture);
@@ -864,11 +960,24 @@ bool RenderPipelineProbe(
     const void* vertex_data, size_t vertex_data_size, uint32_t vertex_data_buffer_index,
     const void* bool_loop_constants, size_t bool_loop_constants_size,
     uint32_t vertex_bool_loop_constants_buffer_index,
-    uint32_t fragment_bool_loop_constants_buffer_index) {
+    uint32_t fragment_bool_loop_constants_buffer_index, const ProbeIndexBuffer* index_buffer,
+    const ProbeRasterizationState* rasterization_state) {
   if (!metal_device || !pipeline_state || !system_constants || !system_constants_size || !width ||
       !height || !vertex_count) {
     if (error_out) {
       *error_out = "missing Metal device, pipeline state, system constants, or target size";
+    }
+    return false;
+  }
+  if (!IsProbeIndexBufferValid(index_buffer, vertex_count)) {
+    if (error_out) {
+      *error_out = "invalid probe index buffer";
+    }
+    return false;
+  }
+  if (!IsProbeRasterizationStateValid(rasterization_state, width, height)) {
+    if (error_out) {
+      *error_out = "invalid probe viewport or scissor";
     }
     return false;
   }
@@ -931,6 +1040,16 @@ bool RenderPipelineProbe(
                                              length:vertex_data_size
                                             options:MTLResourceStorageModeShared];
   }
+  id<MTLBuffer> index_buffer_object = nil;
+  if (index_buffer) {
+    if (index_buffer->metal_buffer) {
+      index_buffer_object = [(id<MTLBuffer>)index_buffer->metal_buffer retain];
+    } else {
+      index_buffer_object = [device newBufferWithBytes:index_buffer->data
+                                                length:index_buffer->size
+                                               options:MTLResourceStorageModeShared];
+    }
+  }
   uint32_t shared_dummy_words[4] = {};
   id<MTLBuffer> shared_memory_buffer = nil;
   if (shared_memory_metal_buffer) {
@@ -947,7 +1066,7 @@ bool RenderPipelineProbe(
                                               options:MTLResourceStorageModeShared];
   }
 
-  if (!system_buffer || !shared_memory_buffer) {
+  if (!system_buffer || !shared_memory_buffer || (index_buffer && !index_buffer_object)) {
     if (system_buffer) {
       [system_buffer release];
     }
@@ -966,15 +1085,20 @@ bool RenderPipelineProbe(
     if (vertex_data_buffer) {
       [vertex_data_buffer release];
     }
+    if (index_buffer_object) {
+      [index_buffer_object release];
+    }
     if (shared_memory_buffer) {
       [shared_memory_buffer release];
     }
     [render_texture release];
     [command_queue release];
     if (error_out) {
-      *error_out = vertex_shared_memory_buffer_index != UINT32_MAX && !shared_memory_buffer
-                       ? "required shared-memory buffer is unavailable"
-                       : "failed to create argument buffers";
+      *error_out = index_buffer && !index_buffer_object
+                       ? "failed to create probe index buffer"
+                       : (vertex_shared_memory_buffer_index != UINT32_MAX && !shared_memory_buffer
+                              ? "required shared-memory buffer is unavailable"
+                              : "failed to create argument buffers");
     }
     return false;
   }
@@ -1038,6 +1162,17 @@ bool RenderPipelineProbe(
 
   id<MTLRenderCommandEncoder> encoder = [command_buffer renderCommandEncoderWithDescriptor:pass];
   [encoder setRenderPipelineState:(id<MTLRenderPipelineState>)pipeline_state];
+  if (rasterization_state) {
+    MTLViewport viewport = {
+        rasterization_state->viewport_x,     rasterization_state->viewport_y,
+        rasterization_state->viewport_width, rasterization_state->viewport_height,
+        rasterization_state->viewport_z_min, rasterization_state->viewport_z_max};
+    [encoder setViewport:viewport];
+    MTLScissorRect scissor = {rasterization_state->scissor_x, rasterization_state->scissor_y,
+                              rasterization_state->scissor_width,
+                              rasterization_state->scissor_height};
+    [encoder setScissorRect:scissor];
+  }
   [encoder setVertexBuffer:system_buffer offset:0 atIndex:0];
   [encoder setFragmentBuffer:system_buffer offset:0 atIndex:0];
   if (fetch_buffer) {
@@ -1086,9 +1221,18 @@ bool RenderPipelineProbe(
   BindProbeTextures(encoder, fragment_texture_objects, false);
   BindProbeSamplers(encoder, vertex_sampler_objects, true);
   BindProbeSamplers(encoder, fragment_sampler_objects, false);
-  [encoder drawPrimitives:ToMetalPrimitiveType(primitive_type)
-              vertexStart:0
-              vertexCount:vertex_count];
+  if (index_buffer_object) {
+    [encoder drawIndexedPrimitives:ToMetalPrimitiveType(primitive_type)
+                        indexCount:vertex_count
+                         indexType:index_buffer->index_size == 2 ? MTLIndexTypeUInt16
+                                                                 : MTLIndexTypeUInt32
+                       indexBuffer:index_buffer_object
+                 indexBufferOffset:index_buffer->offset];
+  } else {
+    [encoder drawPrimitives:ToMetalPrimitiveType(primitive_type)
+                vertexStart:0
+                vertexCount:vertex_count];
+  }
   [encoder endEncoding];
   [command_buffer commit];
   [command_buffer waitUntilCompleted];
@@ -1121,6 +1265,9 @@ bool RenderPipelineProbe(
   }
   if (vertex_data_buffer) {
     [vertex_data_buffer release];
+  }
+  if (index_buffer_object) {
+    [index_buffer_object release];
   }
   [shared_memory_buffer release];
   ReleaseOwnedProbeTextures(vertex_texture_objects, dummy_texture);

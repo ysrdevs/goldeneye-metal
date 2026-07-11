@@ -1,7 +1,8 @@
 # Contributing to GoldenEye Metal
 
-Thank you for helping with the project. The current engineering priority is the first recognizable
-title-driven frame through the native Metal path, followed by a stable menu and playable runtime.
+Thank you for helping with the project. The current engineering priority is a correct title/menu
+frame with faithful render-target composition and fixed-function state, followed by stable
+interaction and a playable runtime.
 
 ## Before changing code
 

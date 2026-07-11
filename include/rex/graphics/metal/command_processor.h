@@ -70,9 +70,10 @@ class MetalCommandProcessor final : public CommandProcessor {
                                     const IndexBufferInfo* index_buffer_info);
   void UpdateGuestConstantBuffers();
   bool EnsureVertexFetchRangesResident(const MetalShader& vertex_shader);
-  void TryRenderPipelineProbe(MetalShader& vertex_shader, MetalShader& pixel_shader,
-                              void* pipeline_state, xenos::PrimitiveType prim_type,
-                              uint32_t index_count, bool host_render_target_debug = false);
+  void TryRenderPipelineProbe(
+      MetalShader& vertex_shader, MetalShader& pixel_shader, void* pipeline_state,
+      xenos::PrimitiveType prim_type, uint32_t index_count, bool host_render_target_debug = false,
+      const PrimitiveProcessor::ProcessingResult* primitive_processing_result = nullptr);
   struct HostRenderTarget;
   bool RefreshPipelineProbeBacking(uint32_t width, uint32_t height);
   bool RefreshHostRenderTargetBacking(uint32_t width, uint32_t height);

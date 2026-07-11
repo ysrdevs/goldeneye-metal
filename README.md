@@ -6,8 +6,7 @@ backend, and game integration in one tree.
 
 > [!WARNING]
 > The macOS build is not playable yet. The native title path now runs continuously and presents
-> nonzero output, but that output is malformed geometry and flat color rather than a recognizable
-> menu.
+> a recognizable animated RARE splash, but it has not reached a correct menu or playable game.
 
 ## Project status
 
@@ -23,8 +22,11 @@ decode and upload, Xenos-to-SPIR-V-to-MSL translation, private Metal render targ
 and swap presentation. The title's real primary ring, indirect buffers, shaders, resolves, and
 `XE_SWAP` now run continuously through Metal without command scavenging or replay. Authoritative
 vertex-buffer delivery, translated array-texture bindings, and CPU/Metal resolve coherence are in
-place. Real producer pixels now survive the normal resolve and presentation path; the current
-blocker is faithful fragment inputs, render state, and output rather than command delivery.
+place. Metal now consumes guest DMA, converted, and built-in index buffers through real indexed
+draws, preserves the guest alpha test, and uses the correct Metal Y orientation. Those fixes turn
+the previous malformed full-screen polygon into a readable title-driven RARE logo through the
+normal resolve and presentation path. The current blocker is faithful render-target composition
+and fixed-function state; this is the next demonstrated blocker after command and shader delivery.
 
 See [the native Metal status report](docs/GOLDENEYE_NATIVE_METAL_PROJECT_STATUS.md) for the exact
 milestones, evidence, and next development priority.
@@ -118,8 +120,9 @@ is responsible for supplying compatible files they are legally authorized to use
 ## Contributing
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change. The immediate priority is a
-faithful, title-driven Metal frame: no synthetic geometry, replacement shaders, guessed command
-buffers, or heuristic presentation may count as completion evidence.
+correct title/menu frame with faithful composition and fixed-function state: no synthetic geometry,
+replacement shaders, guessed command buffers, or heuristic presentation may count as completion
+evidence.
 
 ## Licensing and trademarks
 

@@ -68,8 +68,9 @@ resolve to null. Game data stays local and must never be committed.
 `metal_resolve_test` allocates Metal EDRAM and destination buffers, runs the native resolve-copy
 kernel, and compares GPU output against a CPU reference byte for byte.
 
-`metal_pipeline_probe_test` renders through an externally owned Metal vertex buffer and samples a
-single-layer `texture2d_array`. It protects the resource contract used by translated producer
+`metal_pipeline_probe_test` renders through an externally owned Metal vertex buffer, samples a
+single-layer `texture2d_array`, expands a four-vertex fan through a six-entry index buffer, and
+checks scissor delivery. It protects the resource contract used by translated producer
 draws. It does not replace title-level validation of texture-cache uploads or resolve coherence.
 
 Unit tests are enabled by the Apple Silicon preset. PPC assembly tests are disabled by default and

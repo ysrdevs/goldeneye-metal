@@ -1,6 +1,6 @@
 # GoldenEye native Metal project status
 
-Last updated: 2026-07-10
+Last updated: 2026-07-11
 
 ## Goal
 
@@ -55,10 +55,21 @@ to the CP.
 
 In a bounded run with scavenging, replay, forced presentation, and replacement rendering disabled,
 WPTR progressed beyond 1088, the Metal primary-ring worker passed batch 192, and normal
-`IssueSwap` reached 64. The same run produced nonzero pixels from real title shaders and resources,
-carried them through the normal guest resolve, and presented them. Captured results contain
-malformed geometry and flat colors rather than a recognizable menu, so fixed-function and
-fragment-output fidelity remain incomplete.
+`IssueSwap` reached 64. The same path now produces the animated RARE splash from real title
+shaders, vertex and index data, textures, constants, resolves, and swaps. At swap 64, the normal
+presenter captured 17,562 visible pixels with an RGB range of 229 and a clearly readable `RARE`
+wordmark. This is the first recognizable title-driven frame through the real ring and normal
+resolve/swap path. It does not yet satisfy the full strict-success definition because
+fixed-function and render-target composition fidelity remain incomplete, and it is not yet the
+target menu. A later 30-second bounded run continued the animation through normal `IssueSwap` 192
+without index-delivery errors.
+
+The decisive geometry fault was discarded index delivery. A four-vertex title triangle fan was
+converted correctly by `PrimitiveProcessor` to the six indices `(1,2,0,2,3,0)`, but Metal issued
+`drawPrimitives(6)`, causing vertex fetches 4 and 5 to read beyond a four-vertex buffer. The same
+omission affected normal DMA-indexed draws and point/rectangle adapter indices. Metal now carries
+every processed index-buffer type into `drawIndexedPrimitives`, preserves the processed endian and
+line-loop constants, restores the guest alpha test, and flips Y for Metal's viewport convention.
 
 ### Working foundations
 
@@ -75,6 +86,7 @@ fragment-output fidelity remain incomplete.
 - Guest output capture and swap presentation plumbing
 - Standalone `metal_resolve_test` with byte-for-byte CPU/GPU comparison
 - Standalone `metal_pipeline_probe_test` for external-buffer and array-texture delivery
+- Indexed fan-remap and scissor regression coverage in `metal_pipeline_probe_test`
 
 ### Milestones
 
@@ -82,36 +94,38 @@ fragment-output fidelity remain incomplete.
 | --- | --- | --- |
 | A. Controlled resolve diagnostic | Passed | Magenta resolve reaches the destination and presentation path |
 | B. Controlled render-target diagnostic | Passed | A solid Metal render target survives readback and resolve |
-| C. Real producer content | In progress | Real title shaders now produce nonzero pixels, but the image is malformed |
+| C. Real producer content | Recognizable partial result | Real title shaders and resources produce an animated RARE logo; fixed-function state is incomplete |
 | D. Guest-visible resolve | Passed for current producer | Nonzero producer output reaches the guest buffer and normal presenter |
-| E. Recognizable menu | Not reached | No strict-path menu frame has been produced |
-| F. Sustained title execution | Passed | WPTR >1088 and normal `IssueSwap` 64 without scavenging or replay |
+| E. Recognizable menu | Not reached | A recognizable title-driven splash is working, but no correct menu frame has been produced |
+| F. Sustained title execution | Passed | WPTR >1088 and normal `IssueSwap` 192 without scavenging or replay |
 
 ## Primary blocker
 
-Fetch constant 95 is no longer an unknown. Its live value addresses `0x1FABD330`, contains 30
-dwords, uses endian mode 2, and supplies six five-dword vertices through `fetch_constants[47].zw`.
-The referenced range is made resident in the authoritative Metal shared-memory buffer before the
-draw. The exact content vertex shader produces coverage with both a controlled solid fragment and
-real title pixel shaders.
+Shader interface and basic draw delivery are no longer the primary failure. The translated vertex
+and pixel stages agree on interpolator locations, packed float/bool/fetch constants are delivered,
+array textures and samplers are bound, processed indices are consumed, and the title splash is
+recognizable.
 
-The remaining failure is output fidelity. The first sustained frames contain title-driven pixels,
-but geometry and color are visibly corrupt. The next investigation must compare the earliest
-malformed draw's interpolators, packed constants, texture contents and sampler state, then apply
-the guest viewport, scissor, culling, depth, blend, and color-write state faithfully. Missing game
-data remains a separate launch problem and must not be diagnosed as a renderer failure.
+The remaining blocker is faithful render-target composition and fixed-function state. The Metal
+probe layer now has tested indexed and scissor submission plus viewport plumbing, but globally
+applying the live guest viewport/scissor currently leaves individual host render targets nonzero
+while the normal final resolve is blank. This identifies an ownership/composition mismatch rather
+than an MSL interface failure. Blend equations, per-channel write masks, culling, depth/stencil,
+and MSAA state are still absent. Missing game data remains a separate launch problem and must not
+be diagnosed as a renderer failure.
 
 ## Next development priority
 
 Work in this order:
 
-1. Capture the earliest malformed nonzero draw and its complete live register snapshot.
-2. Validate its vertex-to-fragment interpolators, packed constants, texture contents, texture type,
-   and sampler state against the translated MSL.
-3. Apply and verify the guest viewport, scissor, culling, depth, blend, and color-write state.
-4. Replace remaining probe-specific system-constant overrides with faithful guest state.
-5. Produce a recognizable title frame through the normal resolve and `IssueSwap` path.
-6. Audit pacing, input, and long-run stability once the frame is visually correct.
+1. Reconcile host render-target ownership/composition so the tested guest viewport and scissor can
+   be enabled without blanking the final resolve.
+2. Add RT blend equations, blend constants, and per-channel color-write masks to Metal pipeline
+   creation and keys.
+3. Apply cull/front-face state, then build shared depth/stencil ownership and MSAA behavior.
+4. Advance beyond the recognizable RARE splash to a correct title/menu frame through the normal
+   resolve and `IssueSwap` path.
+5. Audit pacing, input, and long-run stability once the frame is visually correct.
 
 Do not restore heuristic command scavenging or direct presentation shortcuts. The real ring and
 normal `XE_SWAP` path now provide the authoritative evidence needed to debug production.

@@ -61,12 +61,56 @@ class MetalPrimitiveProcessor final : public PrimitiveProcessor {
                             rectangle_lists_supported_without_vs_expansion);
   }
 
+  bool GetProcessedIndexBufferData(const ProcessingResult& result, const void*& data_out,
+                                   size_t& size_out) const {
+    size_t index_size = result.host_index_format == xenos::IndexFormat::kInt16 ? sizeof(uint16_t)
+                                                                               : sizeof(uint32_t);
+    size_t required_size = size_t(result.host_draw_vertex_count) * index_size;
+    switch (result.index_buffer_type) {
+      case ProcessedIndexBufferType::kHostBuiltinForAuto:
+      case ProcessedIndexBufferType::kHostBuiltinForDMA: {
+        size_t offset = result.host_index_buffer_handle;
+        if (offset > builtin_index_buffer_.size() ||
+            required_size > builtin_index_buffer_.size() - offset) {
+          return false;
+        }
+        data_out = builtin_index_buffer_.data() + offset;
+        size_out = required_size;
+        return true;
+      }
+      case ProcessedIndexBufferType::kHostConverted: {
+        size_t handle = result.host_index_buffer_handle;
+        if (handle >= converted_index_buffers_.size() ||
+            handle >= converted_index_buffer_offsets_.size()) {
+          return false;
+        }
+        const std::vector<uint8_t>& storage = *converted_index_buffers_[handle];
+        size_t offset = converted_index_buffer_offsets_[handle];
+        if (offset > storage.size() || required_size > storage.size() - offset) {
+          return false;
+        }
+        data_out = storage.data() + offset;
+        size_out = required_size;
+        return true;
+      }
+      default:
+        return false;
+    }
+  }
+
+  void EndFrame() {
+    ClearPerFrameCache();
+    converted_index_buffers_.clear();
+    converted_index_buffer_offsets_.clear();
+  }
+
   void Shutdown() {
     if (shutdown_) {
       return;
     }
     shutdown_ = true;
     converted_index_buffers_.clear();
+    converted_index_buffer_offsets_.clear();
     builtin_index_buffer_.clear();
     ShutdownCommon();
   }
@@ -92,6 +136,7 @@ class MetalPrimitiveProcessor final : public PrimitiveProcessor {
       mapping += GetSimdCoalignmentOffset(mapping, coalignment_original_address);
     }
     backend_handle_out = converted_index_buffers_.size();
+    converted_index_buffer_offsets_.push_back(size_t(mapping - storage->data()));
     converted_index_buffers_.push_back(std::move(storage));
     return mapping;
   }
@@ -100,6 +145,7 @@ class MetalPrimitiveProcessor final : public PrimitiveProcessor {
   bool shutdown_ = false;
   std::vector<uint8_t> builtin_index_buffer_;
   std::vector<std::unique_ptr<std::vector<uint8_t>>> converted_index_buffers_;
+  std::vector<size_t> converted_index_buffer_offsets_;
 };
 
 std::unique_ptr<PrimitiveProcessor> CreateMetalPrimitiveProcessor(const RegisterFile& register_file,
@@ -1876,6 +1922,9 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   host_fallback_pixel_draws_this_swap_ = 0;
   host_pixel_skipped_vertices_this_swap_ = 0;
   host_pixel_shader_draws_this_swap_.clear();
+  if (primitive_processor_) {
+    static_cast<MetalPrimitiveProcessor*>(primitive_processor_.get())->EndFrame();
+  }
   LogIncompleteOnce("swap");
 }
 
@@ -2489,6 +2538,12 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   auto update_draw_constants = [&]() {
     if (!draw_constants_updated) {
       UpdateMinimalSystemConstants(prim_type, index_buffer_info);
+      if (primitive_processing_ok) {
+        system_constants_.vertex_index_endian =
+            primitive_processing_result.host_shader_index_endian;
+        system_constants_.line_loop_closing_index =
+            primitive_processing_result.line_loop_closing_index;
+      }
       UpdateGuestConstantBuffers();
       draw_constants_updated = true;
     }
@@ -2551,7 +2606,8 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
         void* saved_host_render_target_context = host_render_target_context_;
         host_render_target_context_ = active_host_rt->context;
         TryRenderPipelineProbe(*route_vertex_shader, *pixel_shader, pipeline_state, host_prim_type,
-                               host_draw_vertex_count, true);
+                               host_draw_vertex_count, true,
+                               primitive_processing_ok ? &primitive_processing_result : nullptr);
         if (latest_host_render_target_width_ && latest_host_render_target_height_ &&
             !latest_host_render_target_bgra_.empty()) {
           bool new_has_visible_rgb = BgraHasNonZeroRgb(latest_host_render_target_bgra_);
@@ -7756,7 +7812,7 @@ void MetalCommandProcessor::UpdateMinimalSystemConstants(xenos::PrimitiveType pr
   reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
   draw_util::ViewportInfo viewport_info = {};
   draw_util::GetHostViewportInfo(
-      regs, 1, 1, false, fallback_output_width_, fallback_output_height_, true,
+      regs, 1, 1, true, fallback_output_width_, fallback_output_height_, true,
       normalized_depth_control, false, false,
       active_pixel_shader_ && static_cast<MetalShader*>(active_pixel_shader_)->writes_depth(),
       viewport_info);
@@ -7885,11 +7941,10 @@ bool MetalCommandProcessor::EnsureVertexFetchRangesResident(const MetalShader& v
   return true;
 }
 
-void MetalCommandProcessor::TryRenderPipelineProbe(MetalShader& vertex_shader,
-                                                   MetalShader& pixel_shader, void* pipeline_state,
-                                                   xenos::PrimitiveType prim_type,
-                                                   uint32_t index_count,
-                                                   bool host_render_target_debug) {
+void MetalCommandProcessor::TryRenderPipelineProbe(
+    MetalShader& vertex_shader, MetalShader& pixel_shader, void* pipeline_state,
+    xenos::PrimitiveType prim_type, uint32_t index_count, bool host_render_target_debug,
+    const PrimitiveProcessor::ProcessingResult* primitive_processing_result) {
   if (!pipeline_state || !metal_device_ || !memory_) {
     return;
   }
@@ -7963,13 +8018,18 @@ void MetalCommandProcessor::TryRenderPipelineProbe(MetalShader& vertex_shader,
   }
 
   uint32_t probe_primitive_type = uint32_t(prim_type);
-  uint32_t probe_vertex_count = std::max(index_count, UINT32_C(1));
-  if (current_host_vertex_shader_type_ ==
-      Shader::HostVertexShaderType::kRectangleListAsTriangleStrip) {
+  uint32_t probe_vertex_count = index_count;
+  if (!probe_vertex_count) {
+    return;
+  }
+  if (!primitive_processing_result &&
+      current_host_vertex_shader_type_ ==
+          Shader::HostVertexShaderType::kRectangleListAsTriangleStrip) {
     probe_primitive_type = uint32_t(xenos::PrimitiveType::kTriangleStrip);
     probe_vertex_count = std::max((index_count / 3) * 4, UINT32_C(4));
-  } else if (current_host_vertex_shader_type_ ==
-             Shader::HostVertexShaderType::kPointListAsTriangleStrip) {
+  } else if (!primitive_processing_result &&
+             current_host_vertex_shader_type_ ==
+                 Shader::HostVertexShaderType::kPointListAsTriangleStrip) {
     probe_primitive_type = uint32_t(xenos::PrimitiveType::kTriangleStrip);
     probe_vertex_count = std::max(index_count * 4, UINT32_C(4));
   }
@@ -8207,14 +8267,50 @@ void MetalCommandProcessor::TryRenderPipelineProbe(MetalShader& vertex_shader,
       std::fflush(stderr);
     }
   }
-  SpirvShaderTranslator::SystemConstants probe_system_constants = system_constants_;
-  uint32_t alpha_shift = SpirvShaderTranslator::kSysFlag_AlphaPassIfLess_Shift;
-  probe_system_constants.flags &= ~(UINT32_C(7) << alpha_shift);
-  probe_system_constants.flags |= uint32_t(xenos::CompareFunction::kAlways) << alpha_shift;
-  probe_system_constants.alpha_to_mask = 0;
-  for (uint32_t i = 0; i < 4; ++i) {
-    probe_system_constants.color_exp_bias[i] = 1.0f;
+  ProbeIndexBuffer probe_index_buffer;
+  const ProbeIndexBuffer* probe_index_buffer_ptr = nullptr;
+  if (primitive_processing_result && primitive_processing_result->index_buffer_type !=
+                                         PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
+    const void* index_data = nullptr;
+    void* index_metal_buffer = nullptr;
+    size_t index_data_size = 0;
+    size_t index_buffer_offset = 0;
+    if (primitive_processing_result->index_buffer_type ==
+        PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA) {
+      index_metal_buffer = shared_memory_ ? shared_memory_->buffer() : nullptr;
+      index_data_size = SharedMemory::kBufferSize;
+      index_buffer_offset = primitive_processing_result->guest_index_base;
+    } else if (primitive_processor_) {
+      auto* metal_primitive_processor =
+          static_cast<MetalPrimitiveProcessor*>(primitive_processor_.get());
+      metal_primitive_processor->GetProcessedIndexBufferData(*primitive_processing_result,
+                                                             index_data, index_data_size);
+    }
+    if ((!index_data && !index_metal_buffer) || !index_data_size) {
+      static std::atomic<uint32_t> index_buffer_failure_logs{0};
+      uint32_t failure_index =
+          index_buffer_failure_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (failure_index <= 16 || (failure_index & 0x3F) == 0) {
+        std::fprintf(stderr,
+                     "[metal] guest pipeline index buffer unavailable#%u type=%u "
+                     "count=%u handle=%zu base=0x%08x\n",
+                     failure_index, uint32_t(primitive_processing_result->index_buffer_type),
+                     primitive_processing_result->host_draw_vertex_count,
+                     primitive_processing_result->host_index_buffer_handle,
+                     primitive_processing_result->guest_index_base);
+        std::fflush(stderr);
+      }
+      return;
+    }
+    probe_index_buffer.data = index_data;
+    probe_index_buffer.metal_buffer = index_metal_buffer;
+    probe_index_buffer.size = index_data_size;
+    probe_index_buffer.offset = index_buffer_offset;
+    probe_index_buffer.index_size =
+        primitive_processing_result->host_index_format == xenos::IndexFormat::kInt16 ? 2 : 4;
+    probe_index_buffer_ptr = &probe_index_buffer;
   }
+  SpirvShaderTranslator::SystemConstants probe_system_constants = system_constants_;
   if (persistent_context) {
     std::string persistent_probe_error;
     bool persistent_probe_ok = RenderPipelineProbeToContext(
@@ -8234,7 +8330,8 @@ void MetalCommandProcessor::TryRenderPipelineProbe(MetalShader& vertex_shader,
         vertex_sampler_slots.empty() ? nullptr : vertex_sampler_slots.data(),
         fragment_sampler_slots.empty() ? nullptr : fragment_sampler_slots.data(), nullptr, 0,
         UINT32_MAX, bool_loop_constants_.data(), bool_loop_constants_.size() * sizeof(uint32_t),
-        vertex_buffer_bindings.bool_loop_constants, fragment_bool_loop_constants_buffer_index);
+        vertex_buffer_bindings.bool_loop_constants, fragment_bool_loop_constants_buffer_index,
+        probe_index_buffer_ptr);
     ++pipeline_probe_draws_this_swap_;
     if (!persistent_probe_ok) {
       ++pipeline_probe_failure_count_;
@@ -8438,7 +8535,8 @@ void MetalCommandProcessor::TryRenderPipelineProbe(MetalShader& vertex_shader,
       vertex_sampler_slots.empty() ? nullptr : vertex_sampler_slots.data(),
       fragment_sampler_slots.empty() ? nullptr : fragment_sampler_slots.data(), nullptr, 0,
       UINT32_MAX, bool_loop_constants_.data(), bool_loop_constants_.size() * sizeof(uint32_t),
-      vertex_buffer_bindings.bool_loop_constants, fragment_bool_loop_constants_buffer_index);
+      vertex_buffer_bindings.bool_loop_constants, fragment_bool_loop_constants_buffer_index,
+      probe_index_buffer_ptr);
   if (!probe_ok) {
     ++pipeline_probe_failure_count_;
     if (pipeline_probe_failure_count_ <= 8 || (pipeline_probe_failure_count_ & 0x3F) == 0) {
