@@ -2,6 +2,8 @@
 
 #import <Metal/Metal.h>
 
+#include <xxhash.h>
+
 #include <algorithm>
 #include <cstring>
 #include <vector>
@@ -66,8 +68,28 @@ class MetalTextureCache::MetalTexture final : public TextureCache::Texture {
 
   void* texture() const { return texture_; }
 
+  bool SourceFingerprintMatches(XXH128_hash_t fingerprint, size_t source_span) const {
+    return source_fingerprint_valid_ && source_span == source_span_ &&
+           XXH128_isEqual(source_fingerprint_, fingerprint);
+  }
+
+  void SetSourceFingerprint(XXH128_hash_t fingerprint, size_t source_span) {
+    source_fingerprint_ = fingerprint;
+    source_span_ = source_span;
+    source_fingerprint_valid_ = true;
+  }
+
  private:
   void* texture_ = nullptr;
+  // SharedMemory intentionally widens ordinary CPU write invalidations to as
+  // much as 256 KiB. Games commonly place immutable texture data next to
+  // frequently rewritten vertex or index data in the same invalidation block.
+  // Keep a bounded content fingerprint so those conservative watch hits can be
+  // re-armed without repeating the much more expensive CPU untile and Metal
+  // texture upload. The immutable TextureKey supplies all layout metadata.
+  XXH128_hash_t source_fingerprint_ = {};
+  size_t source_span_ = 0;
+  bool source_fingerprint_valid_ = false;
 };
 
 std::unique_ptr<MetalTextureCache> MetalTextureCache::Create(const RegisterFile& register_file,
@@ -243,22 +265,35 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
     return false;
   }
 
+  // Validate every slice before accepting a fingerprint hit. Hash the layout's
+  // full data extent, including a last slice whose tiled address upper bound
+  // may be larger than the aligned distance between slices.
+  uint64_t source_span = level.level_data_extent_bytes;
+  for (uint32_t slice = 0; slice < array_size; ++slice) {
+    uint64_t slice_offset = uint64_t(slice) * level.array_slice_stride_bytes;
+    if (uint64_t(base_physical) + slice_offset >= SharedMemory::kBufferSize ||
+        !guest_memory.TranslatePhysical<const uint8_t*>(
+            uint32_t(uint64_t(base_physical) + slice_offset))) {
+      return false;
+    }
+    if (uint64_t(base_physical) + slice_offset + level.array_slice_data_extent_bytes >
+        SharedMemory::kBufferSize) {
+      return false;
+    }
+  }
+  if (!source_span || uint64_t(base_physical) + source_span > SharedMemory::kBufferSize ||
+      source_span > SIZE_MAX) {
+    return false;
+  }
+  XXH128_hash_t source_fingerprint =
+      XXH3_128bits(buffer_contents + base_physical, size_t(source_span));
+  if (metal_texture.SourceFingerprintMatches(source_fingerprint, size_t(source_span))) {
+    return true;
+  }
+
   std::vector<uint8_t> linear_data(size_t(x_blocks) * y_blocks * bytes_per_block);
   for (uint32_t slice = 0; slice < array_size; ++slice) {
     uint32_t slice_offset = slice * level.array_slice_stride_bytes;
-    // Validate the guest address exactly as before (rejects unmapped/OOB guest
-    // physical addresses), then read the bytes from the UMA shared buffer.
-    if (!guest_memory.TranslatePhysical<const uint8_t*>(base_physical + slice_offset)) {
-      return false;
-    }
-    // Bound the slice's source span within the shared buffer so the tiled
-    // Untile / CopySwapBlock reads below cannot run past the buffer end.
-    uint64_t slice_source_span = level.array_slice_stride_bytes
-                                     ? uint64_t(level.array_slice_stride_bytes)
-                                     : uint64_t(level.row_pitch_bytes) * y_blocks;
-    if (uint64_t(base_physical) + slice_offset + slice_source_span > SharedMemory::kBufferSize) {
-      return false;
-    }
     const uint8_t* guest_base = buffer_contents + base_physical + slice_offset;
 
     if (key.tiled) {
@@ -293,6 +328,8 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
                                                bytesPerRow:size_t(x_blocks) * bytes_per_block
                                              bytesPerImage:linear_data.size()];
   }
+
+  metal_texture.SetSourceFingerprint(source_fingerprint, size_t(source_span));
 
   return true;
 }

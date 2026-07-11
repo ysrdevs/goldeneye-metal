@@ -49,9 +49,9 @@ Sustained title execution is now working. The old two-swap ceiling was caused by
 GPU-wait recovery: while Metal still owned a primary batch, it set a title-owned skip bit. The
 title's submission routine saw that bit and returned before writing WPTR for kickoffs 31 and 32.
 The recovery also published a sampled RPTR into command-processor-owned writeback memory. The hook
-now holds the title wait until the CP swap counter advances or the ring drains, yields while
-waiting, never changes the title's skip bits or presented counter, and leaves RPTR writeback solely
-to the CP. Ring completion is evaluated from one atomic snapshot: the ring must be configured, its
+now holds the title wait until the CP swap counter advances or the ring drains, backs off briefly
+while waiting, never changes the title's skip bits or presented counter, and leaves RPTR writeback
+solely to the CP. Ring completion is evaluated from one atomic snapshot: the ring must be configured, its
 write pointer must be valid, and no commands may be pending. This also treats a wrapped write
 pointer of zero as a valid drained state instead of confusing it with an uninitialized ring.
 
@@ -60,17 +60,23 @@ WPTR progressed beyond 1088, the Metal primary-ring worker passed batch 192, and
 `IssueSwap` reached at least 1408. The same path now produces the classification screen, complete
 gun-barrel sequence, animated RARE splash, and dossier-style main menu from real title shaders,
 vertex and index data, textures, constants, resolves, and swaps. The classification screen is
-readable across the full 1280x720 output, the gold RARE logo is shaded and animated, and presenter
-frame 1344 is a recognizable main menu with the portrait, crest, numbered options, selected row,
-help text, and page treatment intact. These frames come from the current live render target rather
-than a retained stale readback.
+readable across the full 1280x720 output, the gold RARE logo is shaded and animated, and the menu
+retains its portrait, crest, numbered options, selected row, help text, and page treatment. These
+frames come from the current live render target rather than a retained stale readback.
 
-The menu proving run used `GOLDENEYE_AUTO_START=periodic`, an input-only diagnostic that injects
-ordinary guest Start-button edges after release gaps. It does not replace graphics, alter PM4,
-force presentation, or bypass resolves. The captured menu therefore satisfies the strict rendering
-provenance requirements for the first target milestone. It does not establish playable output:
-culling, depth/stencil, and guest MSAA fidelity remain incomplete, normal macOS keyboard delivery
-is absent, and navigation into gameplay has not been verified.
+A corrected-clock 1280x720 proving run on an Apple M3 Ultra used
+`GOLDENEYE_AUTO_START=menu` and reached the dossier menu. Short captured intervals reported 30.0
+and 59.9 guest-delivered frames per second; this proves a large pacing improvement but not
+sustained 60 FPS. The diagnostic uses monotonic host time: Start is held from 200 ms until 1200 ms,
+released until 2000 ms, and then pulsed for 250 ms every 6000 ms. Menu mode stops all injection at
+19 seconds, before the fourth retry would begin at 20 seconds; one observation saw the menu by
+18.14 seconds and provided an unforced measurement window. This changes input only and does not
+inject another Start edge into the reached menu; it does not replace graphics, alter PM4, force
+presentation, or bypass resolves. The title's own idle behavior remains active. The captured menu
+therefore satisfies the strict rendering-provenance requirements for the first target milestone.
+It does not establish playable output: culling, depth/stencil, and guest MSAA fidelity remain
+incomplete, normal macOS keyboard delivery is absent, and navigation into gameplay has not been
+verified.
 
 The dominant host-side pacing fault after reaching the menu was a synchronous Metal wait after
 every persistent producer draw. Those draws now use bounded asynchronous command-buffer queues:
@@ -91,12 +97,33 @@ bytes still match; tracked guest writes invalidate it, and a final comparison pr
 untracked CPU writes. Tiled surface ranges now use the real tiled-address extent rather than a
 linear byte-size estimate, fixing the previously omitted tail of a 1280x720 destination.
 
-A representative fixed early checkpoint improved from 14.43 seconds on the original per-draw-wait
-path to approximately 10.5 seconds, about 27%. The result varies with host scheduling and the
-real-time periodic input diagnostic, so it is not a stable FPS claim. The same optimized strict
-path still takes far too long to reach and animate the later menu; the project remains well short
-of playable pacing despite the measurable startup improvement. Menu visual parity was confirmed
-after these changes, and no diagnostic rendering shortcut is part of the result.
+The POSIX tick counter returns nanoseconds, but the former macOS frequency calculation divided one
+billion by the value from `clock_getres`. That value is the clock's precision, not the unit of the
+counter. On a timer with a multi-nanosecond quantum this accelerated guest time and scaled the FPS
+display by the same factor. The frequency now correctly reports one billion ticks per second, and
+a regression test protects that unit contract.
+
+The presenter now draws a default-on FPS overlay into each completed guest front buffer. It counts
+successful guest frame deliveries over a monotonic interval, not CAMetalLayer paint events, so
+window repaints cannot inflate the displayed rate. `REX_METAL_SHOW_FPS=false` hides the overlay
+without changing rendering.
+
+Menu profiling exposed three avoidable hot paths. First, 256 KiB guest-memory invalidation blocks
+could repeatedly invalidate a texture even when its own bytes were unchanged. The texture cache
+now fingerprints the synchronized resident source span and skips CPU untile and Metal upload when
+the bytes still match. Second, finalized MSL translations retain immutable reflection for buffer
+indices, texture-fetch mappings, interpolators, memory-export state, and void fragments, removing
+per-draw source scans and temporary reflection allocations. Third, per-draw constants, CPU vertex
+data, and nonresident indices are suballocated from reusable upload arenas whose lifetime follows
+their Metal command buffers instead of allocating a new buffer for each binding.
+
+An exact GPU tiled-write resolve exists behind
+`GOLDENEYE_METAL_GPU_TILED_RESOLVE=1`, with byte-for-byte coverage for full and partial rectangles
+and all four 128-bit endian modes. It remains experimental and disabled by default because it did
+not outperform the optimized CPU path on the proving system. It was not required for the observed
+30.0-to-59.9 FPS menu samples. Menu visual parity was confirmed after the active performance
+changes, and no diagnostic rendering shortcut is part of that result. Gameplay correctness and
+performance remain unmeasured.
 
 The decisive geometry fault was discarded index delivery. A four-vertex title triangle fan was
 converted correctly by `PrimitiveProcessor` to the six indices `(1,2,0,2,3,0)`, but Metal issued
@@ -154,6 +181,13 @@ longer blocked on that sequence.
 - Regional private render-target readback with reusable staging and ordered queued clears
 - Exact resolved-surface swap reuse guarded by fetch metadata, guest-byte comparison, tracked
   invalidation, and the true tiled-memory extent
+- Texture-source fingerprinting that suppresses redundant untile and upload work after coarse
+  guest-memory invalidation
+- Immutable per-translation MSL reflection used directly by draw delivery
+- Reusable command-buffer-owned upload arenas for constants, CPU vertex data, and indices
+- Correct nanosecond POSIX clock frequency with unit regression coverage
+- Default-on guest-delivery FPS overlay, disableable with `REX_METAL_SHOW_FPS=false`
+- Byte-exact experimental GPU tiled resolve behind a default-off diagnostic flag
 - Recognizable main-menu presentation through real title draws, guest-visible resolves, and normal
   `IssueSwap`
 
@@ -165,7 +199,7 @@ longer blocked on that sequence.
 | B. Controlled render-target diagnostic | Passed | A solid Metal render target survives readback and resolve |
 | C. Real producer content | Passed for the first menu target | Real title shaders and resources produce the classification, gun-barrel and RARE sequences, then a recognizable main menu; depth/stencil and culling remain incomplete |
 | D. Guest-visible resolve | Passed for current producer | Nonzero producer output reaches the guest buffer and normal presenter |
-| E. Recognizable menu | Passed | Presenter frame 1344 contains the real dossier-style main menu through the strict draw/resolve/swap path |
+| E. Recognizable menu | Passed | Corrected-clock 1280x720 captures on Apple M3 Ultra present the real dossier-style menu through the strict draw/resolve/swap path; short samples reported 30.0 and 59.9 guest-delivered FPS |
 | F. Sustained title execution | Passed | WPTR >1088 and normal `IssueSwap` at least 1408 without scavenging, replay, or forced presentation |
 
 ## Primary blocker
@@ -187,23 +221,25 @@ blend constants, and per-channel write masks are active and verified. Culling/fr
 shared depth/stencil ownership, and true guest MSAA behavior are still absent and are likely to
 matter more in gameplay than in the mostly layered 2D menu. The former per-draw wait has been
 replaced by bounded asynchronous submission with explicit safety fences, and visual parity has
-been rechecked at the menu. The early checkpoint is faster, but late-title pacing remains the
-immediate runtime blocker. Missing game data remains a separate launch problem and must not be
-diagnosed as a renderer failure.
+been rechecked at the menu. Corrected-clock menu samples now range from 30.0 to 59.9 FPS on the
+proving system, so the catastrophic pacing fault is gone, but sustained menu pacing still needs
+characterization. Performance after entering a mission is unknown and must be measured
+independently. Missing game data remains a separate launch problem and must not be diagnosed as a
+renderer failure.
 
 ## Next development priority
 
 Work in this order:
 
-1. Profile the late title/menu path with dumps and verbose logs disabled, separating guest pacing,
-   command processing, resolve/readback, and presentation costs at fixed swap checkpoints.
-2. Remove the remaining CPU round trips in the exact resolve/swap route where ownership permits,
-   while keeping guest-memory coherence and strict provenance intact.
-3. Wire normal macOS keyboard events into the input path or validate the SDL controller route, then
+1. Wire normal macOS keyboard events into the input path or validate the SDL controller route, then
    navigate the real menu into the first mission without automated selection.
-4. Apply guest cull/front-face state and add focused regression coverage before judging 3D scenes.
-5. Build shared depth/stencil ownership and faithful guest MSAA resolve behavior for persistent
+2. Capture and profile the first gameplay scene with dumps and verbose logging disabled,
+   separating guest pacing, command processing, texture work, resolve/readback, and presentation.
+3. Apply guest cull/front-face state and add focused regression coverage before judging 3D scenes.
+4. Build shared depth/stencil ownership and faithful guest MSAA resolve behavior for persistent
    Metal render targets.
+5. Re-evaluate the experimental GPU tiled resolve only against representative gameplay workloads;
+   keep the proven CPU path as the default until measurements justify a change.
 
 Do not restore heuristic command scavenging or direct presentation shortcuts. The real ring and
 normal `XE_SWAP` path now provide the authoritative evidence needed to debug production.

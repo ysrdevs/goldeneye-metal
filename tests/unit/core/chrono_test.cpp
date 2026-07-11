@@ -16,8 +16,16 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <rex/chrono/chrono.h>
+#include <rex/chrono/clock.h>
+#include <rex/platform.h>
 
 using rex::chrono::WinSystemClock;
+
+#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+TEST_CASE("POSIX host tick frequency matches nanosecond tick units", "[chrono]") {
+  CHECK(rex::chrono::Clock::host_tick_frequency_platform() == 1000000000ull);
+}
+#endif
 
 // =============================================================================
 // Known FILETIME constants

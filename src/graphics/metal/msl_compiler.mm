@@ -393,12 +393,53 @@ namespace {
 
 constexpr uint32_t kMaxProbeDrawsPerCommandBuffer = 64;
 constexpr uint32_t kMaxCommittedProbeCommandBuffers = 4;
+constexpr size_t kProbeUploadAlignment = 256;
+constexpr size_t kProbeUploadChunkSize = 1 << 20;
+constexpr uint32_t kInvalidProbeUploadArena = UINT32_MAX;
+
+uint32_t GetTiledRgba8Offset(uint32_t x, uint32_t y, uint32_t pitch) {
+  pitch = (pitch + 31u) & ~31u;
+  uint32_t macro = ((x >> 5u) + (y >> 5u) * (pitch >> 5u)) << 9u;
+  uint32_t micro = ((x & 7u) + ((y & 14u) << 2u)) << 2u;
+  uint32_t offset = macro + ((micro & ~15u) << 1u) + (micro & 15u) + ((y & 1u) << 4u);
+  return ((offset & ~511u) << 3u) + ((y & 16u) << 7u) + ((offset & 448u) << 2u) +
+         (((((y & 8u) >> 2u) + (x >> 3u)) & 3u) << 6u) + (offset & 63u);
+}
+
+uint32_t GetTiledRgba8UpperBound(uint32_t right, uint32_t bottom, uint32_t pitch) {
+  if (!right || !bottom) {
+    return 0;
+  }
+  uint32_t tile_x = (right - 1u) & ~31u;
+  uint32_t tile_y = (bottom - 1u) & ~31u;
+  return GetTiledRgba8Offset(tile_x, tile_y, pitch) + 4096u;
+}
 
 struct CommittedProbeCommandBuffer {
   // Explicit +1 ownership transferred from PipelineProbeContext's open buffer.
   id<MTLCommandBuffer> command_buffer = nil;
   uint32_t draw_submission_count = 0;
+  uint32_t upload_arena_index = kInvalidProbeUploadArena;
 };
+
+struct ProbeUploadChunk {
+  id<MTLBuffer> buffer = nil;
+  size_t capacity = 0;
+  size_t offset = 0;
+};
+
+struct ProbeUploadArena {
+  std::vector<ProbeUploadChunk> chunks;
+  bool in_use = false;
+};
+
+struct ProbeUploadAllocation {
+  id<MTLBuffer> buffer = nil;
+  NSUInteger offset = 0;
+};
+
+struct PipelineProbeContext;
+void ResetOpenProbeBindingTracking(PipelineProbeContext* context);
 
 struct PipelineProbeContext {
   id<MTLDevice> device = nil;
@@ -410,6 +451,7 @@ struct PipelineProbeContext {
   id<MTLSamplerState> dummy_sampler = nil;
   std::unordered_map<uint64_t, id<MTLSamplerState>> sampler_cache;
   id<MTLRenderPipelineState> clear_pipeline_state = nil;
+  id<MTLComputePipelineState> tiled_resolve_pipeline_state = nil;
   MTLStorageMode storage_mode = MTLStorageModeShared;
   uint32_t width = 0;
   uint32_t height = 0;
@@ -420,6 +462,7 @@ struct PipelineProbeContext {
   id<MTLCommandBuffer> open_command_buffer = nil;
   id<MTLRenderCommandEncoder> open_render_encoder = nil;
   uint32_t open_draw_submission_count = 0;
+  uint32_t open_upload_arena_index = kInvalidProbeUploadArena;
   // Bindings persist within an encoder. Track everything optional so each draw
   // can clear the previous draw's state before installing its own resources.
   uint32_t tracked_vertex_buffer_mask = 0;
@@ -431,7 +474,261 @@ struct PipelineProbeContext {
   // All buffers use this context's single queue, so waiting for the newest also
   // completes older buffers while retaining their individual error status.
   std::vector<CommittedProbeCommandBuffer> committed_command_buffers;
+  // Each arena belongs to exactly one open or committed command buffer. It is
+  // reset only after that buffer completes, so draw data may be copied once
+  // and bound by offset without allocating an MTLBuffer for every argument.
+  ProbeUploadArena upload_arenas[kMaxCommittedProbeCommandBuffers];
+  PipelineProbeUploadStats upload_stats;
 };
+
+struct TiledResolveConstants {
+  uint32_t source_row_pitch;
+  uint32_t destination_buffer_offset;
+  uint32_t destination_pitch;
+  uint32_t destination_x;
+  uint32_t destination_y;
+  uint32_t copy_width;
+  uint32_t copy_height;
+  uint32_t destination_endian;
+};
+
+void ResetProbeUploadArena(ProbeUploadArena& arena) {
+  for (ProbeUploadChunk& chunk : arena.chunks) {
+    chunk.offset = 0;
+  }
+}
+
+uint32_t AcquireProbeUploadArena(PipelineProbeContext* context) {
+  for (uint32_t i = 0; i < kMaxCommittedProbeCommandBuffers; ++i) {
+    ProbeUploadArena& arena = context->upload_arenas[i];
+    if (!arena.in_use) {
+      ResetProbeUploadArena(arena);
+      arena.in_use = true;
+      return i;
+    }
+  }
+  return kInvalidProbeUploadArena;
+}
+
+void ReleaseProbeUploadArena(PipelineProbeContext* context, uint32_t arena_index) {
+  if (arena_index >= kMaxCommittedProbeCommandBuffers) {
+    return;
+  }
+  ProbeUploadArena& arena = context->upload_arenas[arena_index];
+  ResetProbeUploadArena(arena);
+  arena.in_use = false;
+}
+
+ProbeUploadAllocation UploadProbeDrawData(PipelineProbeContext* context, const void* source,
+                                          size_t length, std::string* error_out) {
+  ProbeUploadAllocation allocation;
+  if (!source || !length) {
+    return allocation;
+  }
+  if (context->open_upload_arena_index >= kMaxCommittedProbeCommandBuffers ||
+      length > SIZE_MAX - (kProbeUploadAlignment - 1)) {
+    if (error_out) {
+      *error_out = "persistent probe upload arena is unavailable or the upload is too large";
+    }
+    return allocation;
+  }
+
+  ProbeUploadArena& arena = context->upload_arenas[context->open_upload_arena_index];
+  for (ProbeUploadChunk& chunk : arena.chunks) {
+    if (chunk.offset > SIZE_MAX - (kProbeUploadAlignment - 1)) {
+      continue;
+    }
+    size_t aligned_offset =
+        (chunk.offset + (kProbeUploadAlignment - 1)) & ~(kProbeUploadAlignment - 1);
+    if (aligned_offset <= chunk.capacity && length <= chunk.capacity - aligned_offset) {
+      uint8_t* destination = static_cast<uint8_t*>([chunk.buffer contents]);
+      if (!destination) {
+        continue;
+      }
+      std::memcpy(destination + aligned_offset, source, length);
+      chunk.offset = aligned_offset + length;
+      allocation.buffer = chunk.buffer;
+      allocation.offset = NSUInteger(aligned_offset);
+      ++context->upload_stats.suballocation_count;
+      context->upload_stats.suballocation_bytes += length;
+      return allocation;
+    }
+  }
+
+  size_t aligned_length = (length + (kProbeUploadAlignment - 1)) & ~(kProbeUploadAlignment - 1);
+  size_t chunk_capacity = std::max(kProbeUploadChunkSize, aligned_length);
+  id<MTLBuffer> buffer = [context->device newBufferWithLength:chunk_capacity
+                                                      options:MTLResourceStorageModeShared];
+  uint8_t* destination = buffer ? static_cast<uint8_t*>([buffer contents]) : nullptr;
+  if (!buffer || !destination) {
+    if (buffer) {
+      [buffer release];
+    }
+    if (error_out) {
+      *error_out = "failed to grow the persistent probe upload arena";
+    }
+    return allocation;
+  }
+
+  std::memcpy(destination, source, length);
+  ProbeUploadChunk chunk;
+  chunk.buffer = buffer;
+  chunk.capacity = chunk_capacity;
+  chunk.offset = length;
+  arena.chunks.push_back(chunk);
+  allocation.buffer = buffer;
+  ++context->upload_stats.buffer_allocation_count;
+  context->upload_stats.buffer_allocation_bytes += chunk_capacity;
+  ++context->upload_stats.suballocation_count;
+  context->upload_stats.suballocation_bytes += length;
+  return allocation;
+}
+
+void DiscardEmptyOpenPipelineProbeCommandBuffer(PipelineProbeContext* context) {
+  if (!context || context->open_draw_submission_count) {
+    return;
+  }
+  if (context->open_render_encoder) {
+    [context->open_render_encoder endEncoding];
+    [context->open_render_encoder release];
+    context->open_render_encoder = nil;
+  }
+  if (context->open_command_buffer) {
+    [context->open_command_buffer release];
+    context->open_command_buffer = nil;
+  }
+  ReleaseProbeUploadArena(context, context->open_upload_arena_index);
+  context->open_upload_arena_index = kInvalidProbeUploadArena;
+  ResetOpenProbeBindingTracking(context);
+}
+
+bool EnsureTiledResolvePipelineState(PipelineProbeContext* context, std::string* error_out) {
+  if (!context || !context->device) {
+    if (error_out) {
+      *error_out = "missing probe context or Metal device";
+    }
+    return false;
+  }
+  if (context->tiled_resolve_pipeline_state) {
+    return true;
+  }
+  static constexpr char kTiledResolveMsl[] = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+
+struct TiledResolveConstants {
+  uint source_row_pitch;
+  uint destination_buffer_offset;
+  uint destination_pitch;
+  uint destination_x;
+  uint destination_y;
+  uint copy_width;
+  uint copy_height;
+  uint destination_endian;
+};
+
+uint tiled_rgba8_offset(uint x, uint y, uint pitch) {
+  constexpr uint bytes_per_pixel_log2 = 2;
+  uint aligned_pitch = (pitch + 31u) & ~31u;
+  uint row_macro = ((y / 32u) * (aligned_pitch / 32u)) << (bytes_per_pixel_log2 + 7u);
+  uint row_micro = ((y & 6u) << 2u) << bytes_per_pixel_log2;
+  uint row_base = row_macro + ((row_micro & ~15u) << 1u) + (row_micro & 15u) +
+                  ((y & 8u) << (3u + bytes_per_pixel_log2)) + ((y & 1u) << 4u);
+  uint column_macro = (x / 32u) << (bytes_per_pixel_log2 + 7u);
+  uint column_micro = (x & 7u) << bytes_per_pixel_log2;
+  uint offset = row_base + column_macro + ((column_micro & ~15u) << 1u) +
+                (column_micro & 15u);
+  return ((offset & ~511u) << 3u) + ((offset & 448u) << 2u) + (offset & 63u) +
+         ((y & 16u) << 7u) + (((((y & 8u) >> 2u) + (x >> 3u)) & 3u) << 6u);
+}
+
+kernel void resolve_bgra8_to_xenos_tiled(
+    device const uchar* source [[buffer(0)]], device uint* destination [[buffer(1)]],
+    constant TiledResolveConstants& constants [[buffer(2)]],
+    uint2 position [[thread_position_in_grid]]) {
+  if (position.x >= constants.copy_width || position.y >= constants.copy_height) {
+    return;
+  }
+  uint source_offset = position.y * constants.source_row_pitch + position.x * 4u;
+  uchar4 bgra = uchar4(source[source_offset], source[source_offset + 1u],
+                       source[source_offset + 2u], source[source_offset + 3u]);
+  uchar4 packed;
+  switch (constants.destination_endian) {
+    case 1u:  // Endian128::k8in16.
+      packed = bgra.yzwx;
+      break;
+    case 2u:  // Endian128::k8in32.
+      packed = bgra.wxyz;
+      break;
+    case 3u:  // Endian128::k16in32.
+      packed = bgra.xwzy;
+      break;
+    default:  // Endian128::kNone: raw BGRA becomes guest RGBA.
+      packed = bgra.zyxw;
+      break;
+  }
+  uint tiled_offset = tiled_rgba8_offset(constants.destination_x + position.x,
+                                         constants.destination_y + position.y,
+                                         constants.destination_pitch);
+  uint byte_offset = constants.destination_buffer_offset + tiled_offset;
+  destination[byte_offset >> 2u] = uint(packed.x) | (uint(packed.y) << 8u) |
+                                   (uint(packed.z) << 16u) | (uint(packed.w) << 24u);
+}
+)MSL";
+
+  NSError* error = nil;
+  id<MTLLibrary> library =
+      [context->device newLibraryWithSource:[NSString stringWithUTF8String:kTiledResolveMsl]
+                                    options:nil
+                                      error:&error];
+  if (!library) {
+    if (error_out) {
+      *error_out = error ? [[error localizedDescription] UTF8String]
+                         : "tiled resolve compute library failed";
+    }
+    return false;
+  }
+  id<MTLFunction> function = [library newFunctionWithName:@"resolve_bgra8_to_xenos_tiled"];
+  if (function) {
+    context->tiled_resolve_pipeline_state =
+        [context->device newComputePipelineStateWithFunction:function error:&error];
+    [function release];
+  }
+  [library release];
+  if (!context->tiled_resolve_pipeline_state) {
+    if (error_out) {
+      *error_out = error ? [[error localizedDescription] UTF8String]
+                         : "tiled resolve compute pipeline failed";
+    }
+    return false;
+  }
+  return true;
+}
+
+id<MTLBuffer> EnsureProbeReadbackBuffer(PipelineProbeContext* context, uint32_t full_width,
+                                        uint32_t full_height, size_t row_pitch,
+                                        uint32_t read_height, std::string* error_out) {
+  size_t readback_size = row_pitch * read_height;
+  if (context->private_readback_capacity < readback_size) {
+    size_t full_row_pitch = (size_t(full_width) * 4 + 255) & ~size_t(255);
+    size_t allocation_size = std::max(readback_size, full_row_pitch * full_height);
+    id<MTLBuffer> larger_readback_buffer =
+        [context->device newBufferWithLength:allocation_size options:MTLResourceStorageModeShared];
+    if (larger_readback_buffer) {
+      if (context->private_readback_buffer) {
+        [context->private_readback_buffer release];
+      }
+      context->private_readback_buffer = larger_readback_buffer;
+      context->private_readback_capacity = allocation_size;
+    }
+  }
+  id<MTLBuffer> readback_buffer =
+      context->private_readback_capacity >= readback_size ? context->private_readback_buffer : nil;
+  if (!readback_buffer && error_out) {
+    *error_out = "failed to create persistent render target staging buffer";
+  }
+  return readback_buffer;
+}
 
 bool EnsureDummyProbeResources(PipelineProbeContext* context, std::string* error_out) {
   if (context->dummy_texture && context->dummy_sampler) {
@@ -533,7 +830,8 @@ bool FinalizeOpenPipelineProbeCommandBuffer(PipelineProbeContext* context, std::
     return true;
   }
   if (!context->open_command_buffer || !context->open_render_encoder ||
-      !context->open_draw_submission_count) {
+      !context->open_draw_submission_count ||
+      context->open_upload_arena_index >= kMaxCommittedProbeCommandBuffers) {
     if (context->open_render_encoder) {
       [context->open_render_encoder endEncoding];
       [context->open_render_encoder release];
@@ -543,6 +841,8 @@ bool FinalizeOpenPipelineProbeCommandBuffer(PipelineProbeContext* context, std::
       [context->open_command_buffer release];
       context->open_command_buffer = nil;
     }
+    ReleaseProbeUploadArena(context, context->open_upload_arena_index);
+    context->open_upload_arena_index = kInvalidProbeUploadArena;
     context->open_draw_submission_count = 0;
     ResetOpenProbeBindingTracking(context);
     context->initialized = false;
@@ -558,8 +858,10 @@ bool FinalizeOpenPipelineProbeCommandBuffer(PipelineProbeContext* context, std::
   CommittedProbeCommandBuffer committed;
   committed.command_buffer = context->open_command_buffer;
   committed.draw_submission_count = context->open_draw_submission_count;
+  committed.upload_arena_index = context->open_upload_arena_index;
   context->open_command_buffer = nil;
   context->open_draw_submission_count = 0;
+  context->open_upload_arena_index = kInvalidProbeUploadArena;
   ResetOpenProbeBindingTracking(context);
   context->committed_command_buffers.push_back(committed);
   [committed.command_buffer commit];
@@ -578,6 +880,7 @@ bool ConsumeCompletedPipelineProbeCommands(PipelineProbeContext* context, std::s
       first_error = description ? description : "asynchronous probe command buffer failed";
     }
     [command_buffer release];
+    ReleaseProbeUploadArena(context, committed.upload_arena_index);
   }
   context->committed_command_buffers.clear();
   if (first_error.empty()) {
@@ -603,6 +906,7 @@ bool WaitPendingPipelineProbeCommands(PipelineProbeContext* context, std::string
   }
   uint32_t pending_submission_count = GetPendingProbeDrawSubmissionCount(context);
   if (!pending_submission_count) {
+    DiscardEmptyOpenPipelineProbeCommandBuffer(context);
     return true;
   }
   if (waited_submission_count_out) {
@@ -624,8 +928,23 @@ bool EnsureOpenPipelineProbeEncoder(PipelineProbeContext* context, std::string* 
     return false;
   }
 
+  uint32_t upload_arena_index = AcquireProbeUploadArena(context);
+  if (upload_arena_index == kInvalidProbeUploadArena) {
+    if (!WaitPendingPipelineProbeCommands(context, error_out, nullptr)) {
+      return false;
+    }
+    upload_arena_index = AcquireProbeUploadArena(context);
+  }
+  if (upload_arena_index == kInvalidProbeUploadArena) {
+    if (error_out) {
+      *error_out = "no reusable persistent probe upload arena is available";
+    }
+    return false;
+  }
+
   id<MTLCommandBuffer> command_buffer = [context->command_queue commandBuffer];
   if (!command_buffer) {
+    ReleaseProbeUploadArena(context, upload_arena_index);
     if (error_out) {
       *error_out = "failed to create persistent probe command buffer";
     }
@@ -639,6 +958,7 @@ bool EnsureOpenPipelineProbeEncoder(PipelineProbeContext* context, std::string* 
   pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
   id<MTLRenderCommandEncoder> encoder = [command_buffer renderCommandEncoderWithDescriptor:pass];
   if (!encoder) {
+    ReleaseProbeUploadArena(context, upload_arena_index);
     if (error_out) {
       *error_out = "failed to create persistent probe command encoder";
     }
@@ -648,6 +968,7 @@ bool EnsureOpenPipelineProbeEncoder(PipelineProbeContext* context, std::string* 
   context->open_command_buffer = [command_buffer retain];
   context->open_render_encoder = [encoder retain];
   context->open_draw_submission_count = 0;
+  context->open_upload_arena_index = upload_arena_index;
   ResetOpenProbeBindingTracking(context);
   return true;
 }
@@ -854,6 +1175,15 @@ uint32_t GetPipelineProbeContextPendingSubmissionCount(void* opaque_context) {
   return GetPendingProbeDrawSubmissionCount(context);
 }
 
+bool GetPipelineProbeContextUploadStats(void* opaque_context, PipelineProbeUploadStats* stats_out) {
+  auto* context = static_cast<PipelineProbeContext*>(opaque_context);
+  if (!context || !stats_out) {
+    return false;
+  }
+  *stats_out = context->upload_stats;
+  return true;
+}
+
 void ResetPipelineProbeContext(void* opaque_context) {
   auto* context = static_cast<PipelineProbeContext*>(opaque_context);
   if (context) {
@@ -886,6 +1216,9 @@ void ReleasePipelineProbeContext(void* opaque_context) {
   if (context->clear_pipeline_state) {
     [context->clear_pipeline_state release];
   }
+  if (context->tiled_resolve_pipeline_state) {
+    [context->tiled_resolve_pipeline_state release];
+  }
   if (context->render_texture) {
     [context->render_texture release];
   }
@@ -902,6 +1235,15 @@ void ReleasePipelineProbeContext(void* opaque_context) {
     [sampler.second release];
   }
   context->sampler_cache.clear();
+  for (ProbeUploadArena& arena : context->upload_arenas) {
+    for (ProbeUploadChunk& chunk : arena.chunks) {
+      if (chunk.buffer) {
+        [chunk.buffer release];
+      }
+    }
+    arena.chunks.clear();
+    arena.in_use = false;
+  }
   if (context->command_queue) {
     [context->command_queue release];
   }
@@ -1056,19 +1398,19 @@ bool QueuePipelineProbeContextClearRect(void* opaque_context, uint32_t width, ui
       return false;
     }
 
-    float clear_constants[4] = {float(red), float(green), float(blue), float(alpha)};
-    id<MTLBuffer> constants_buffer =
-        [context->device newBufferWithBytes:clear_constants
-                                     length:sizeof(clear_constants)
-                                    options:MTLResourceStorageModeShared];
-    if (!constants_buffer) {
-      if (error_out) {
-        *error_out = "failed to create queued clear constants buffer";
-      }
+    if (!EnsureOpenPipelineProbeEncoder(context, error_out)) {
       return false;
     }
-    if (!EnsureOpenPipelineProbeEncoder(context, error_out)) {
-      [constants_buffer release];
+    float clear_constants[4] = {float(red), float(green), float(blue), float(alpha)};
+    ProbeUploadAllocation constants =
+        UploadProbeDrawData(context, clear_constants, sizeof(clear_constants), error_out);
+    if (!constants.buffer) {
+      DiscardEmptyOpenPipelineProbeCommandBuffer(context);
+      if (error_out) {
+        if (error_out->empty()) {
+          *error_out = "failed to upload queued clear constants";
+        }
+      }
       return false;
     }
 
@@ -1084,13 +1426,11 @@ bool QueuePipelineProbeContextClearRect(void* opaque_context, uint32_t width, ui
     [encoder setDepthClipMode:MTLDepthClipModeClip];
     [encoder setBlendColorRed:0.0 green:0.0 blue:0.0 alpha:0.0];
     [encoder setRenderPipelineState:context->clear_pipeline_state];
-    [encoder setFragmentBuffer:constants_buffer offset:0 atIndex:0];
+    [encoder setFragmentBuffer:constants.buffer offset:constants.offset atIndex:0];
     TrackOpenProbeBufferBinding(context, false, 0);
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     ++context->open_draw_submission_count;
     context->initialized = true;
-    // The command buffer retains encoded resources until completion.
-    [constants_buffer release];
 
     if (context->open_draw_submission_count >= kMaxProbeDrawsPerCommandBuffer &&
         !FinalizeOpenPipelineProbeCommandBuffer(context, error_out)) {
@@ -1147,51 +1487,41 @@ bool RenderPipelineProbeToContext(
       return false;
     }
 
+    if (!EnsureOpenPipelineProbeEncoder(context, error_out)) {
+      return false;
+    }
+
     id<MTLDevice> device = context->device;
-    id<MTLBuffer> system_buffer = [device newBufferWithBytes:system_constants
-                                                      length:system_constants_size
-                                                     options:MTLResourceStorageModeShared];
-    id<MTLBuffer> float_buffer = nil;
-    if (float_constants && float_constants_size) {
-      float_buffer = [device newBufferWithBytes:float_constants
-                                         length:float_constants_size
-                                        options:MTLResourceStorageModeShared];
+    ProbeUploadAllocation system_buffer =
+        UploadProbeDrawData(context, system_constants, system_constants_size, error_out);
+    ProbeUploadAllocation float_buffer =
+        UploadProbeDrawData(context, float_constants, float_constants_size, error_out);
+    ProbeUploadAllocation fragment_float_buffer = UploadProbeDrawData(
+        context, fragment_float_constants, fragment_float_constants_size, error_out);
+    ProbeUploadAllocation fetch_buffer =
+        UploadProbeDrawData(context, fetch_constants, fetch_constants_size, error_out);
+    ProbeUploadAllocation bool_loop_buffer =
+        UploadProbeDrawData(context, bool_loop_constants, bool_loop_constants_size, error_out);
+    ProbeUploadAllocation vertex_data_buffer;
+    if (vertex_data_buffer_index != UINT32_MAX) {
+      vertex_data_buffer = UploadProbeDrawData(context, vertex_data, vertex_data_size, error_out);
     }
-    id<MTLBuffer> fragment_float_buffer = nil;
-    if (fragment_float_constants && fragment_float_constants_size) {
-      fragment_float_buffer = [device newBufferWithBytes:fragment_float_constants
-                                                  length:fragment_float_constants_size
-                                                 options:MTLResourceStorageModeShared];
-    }
-    id<MTLBuffer> fetch_buffer = nil;
-    if (fetch_constants && fetch_constants_size) {
-      fetch_buffer = [device newBufferWithBytes:fetch_constants
-                                         length:fetch_constants_size
-                                        options:MTLResourceStorageModeShared];
-    }
-    id<MTLBuffer> bool_loop_buffer = nil;
-    if (bool_loop_constants && bool_loop_constants_size) {
-      bool_loop_buffer = [device newBufferWithBytes:bool_loop_constants
-                                             length:bool_loop_constants_size
-                                            options:MTLResourceStorageModeShared];
-    }
-    id<MTLBuffer> vertex_data_buffer = nil;
-    if (vertex_data && vertex_data_size && vertex_data_buffer_index != UINT32_MAX) {
-      vertex_data_buffer = [device newBufferWithBytes:vertex_data
-                                               length:vertex_data_size
-                                              options:MTLResourceStorageModeShared];
-    }
+    ProbeUploadAllocation uploaded_index_buffer;
+    id<MTLBuffer> external_index_buffer = nil;
     id<MTLBuffer> index_buffer_object = nil;
+    NSUInteger index_buffer_offset = 0;
     if (index_buffer) {
       if (index_buffer->metal_buffer) {
-        index_buffer_object = [(id<MTLBuffer>)index_buffer->metal_buffer retain];
+        external_index_buffer = [(id<MTLBuffer>)index_buffer->metal_buffer retain];
+        index_buffer_object = external_index_buffer;
+        index_buffer_offset = NSUInteger(index_buffer->offset);
       } else {
-        index_buffer_object = [device newBufferWithBytes:index_buffer->data
-                                                  length:index_buffer->size
-                                                 options:MTLResourceStorageModeShared];
+        uploaded_index_buffer =
+            UploadProbeDrawData(context, index_buffer->data, index_buffer->size, error_out);
+        index_buffer_object = uploaded_index_buffer.buffer;
+        index_buffer_offset = uploaded_index_buffer.offset + NSUInteger(index_buffer->offset);
       }
     }
-    uint32_t shared_dummy_words[4] = {};
     id<MTLBuffer> shared_memory_buffer = nil;
     if (shared_memory_metal_buffer) {
       shared_memory_buffer = [(id<MTLBuffer>)shared_memory_metal_buffer retain];
@@ -1201,52 +1531,35 @@ bool RenderPipelineProbeToContext(
                                                       options:MTLResourceStorageModeShared
                                                   deallocator:nil];
     }
-    if (!shared_memory_buffer && vertex_shared_memory_buffer_index == UINT32_MAX) {
-      shared_memory_buffer = [device newBufferWithBytes:shared_dummy_words
-                                                 length:sizeof(shared_dummy_words)
-                                                options:MTLResourceStorageModeShared];
-    }
     bool missing_argument_buffer =
-        !system_buffer || !shared_memory_buffer ||
-        (float_constants && float_constants_size && !float_buffer) ||
-        (fragment_float_constants && fragment_float_constants_size && !fragment_float_buffer) ||
-        (fetch_constants && fetch_constants_size && !fetch_buffer) ||
-        (bool_loop_constants && bool_loop_constants_size && !bool_loop_buffer) ||
+        !system_buffer.buffer ||
+        (vertex_shared_memory_buffer_index != UINT32_MAX && !shared_memory_buffer) ||
+        (float_constants && float_constants_size && !float_buffer.buffer) ||
+        (fragment_float_constants && fragment_float_constants_size &&
+         !fragment_float_buffer.buffer) ||
+        (fetch_constants && fetch_constants_size && !fetch_buffer.buffer) ||
+        (bool_loop_constants && bool_loop_constants_size && !bool_loop_buffer.buffer) ||
         (vertex_data && vertex_data_size && vertex_data_buffer_index != UINT32_MAX &&
-         !vertex_data_buffer) ||
+         !vertex_data_buffer.buffer) ||
         (index_buffer && !index_buffer_object);
     if (missing_argument_buffer) {
-      if (system_buffer) {
-        [system_buffer release];
-      }
-      if (float_buffer) {
-        [float_buffer release];
-      }
-      if (fragment_float_buffer) {
-        [fragment_float_buffer release];
-      }
-      if (fetch_buffer) {
-        [fetch_buffer release];
-      }
-      if (bool_loop_buffer) {
-        [bool_loop_buffer release];
-      }
-      if (vertex_data_buffer) {
-        [vertex_data_buffer release];
-      }
-      if (index_buffer_object) {
-        [index_buffer_object release];
+      if (external_index_buffer) {
+        [external_index_buffer release];
       }
       if (shared_memory_buffer) {
         [shared_memory_buffer release];
       }
       if (error_out) {
-        *error_out = index_buffer && !index_buffer_object
-                         ? "failed to create persistent probe index buffer"
-                         : (vertex_shared_memory_buffer_index != UINT32_MAX && !shared_memory_buffer
-                                ? "required persistent shared-memory buffer is unavailable"
-                                : "failed to create persistent probe argument buffers");
+        if (error_out->empty()) {
+          *error_out =
+              index_buffer && !index_buffer_object
+                  ? "failed to upload persistent probe index data"
+                  : (vertex_shared_memory_buffer_index != UINT32_MAX && !shared_memory_buffer
+                         ? "required persistent shared-memory buffer is unavailable"
+                         : "failed to upload persistent probe argument data");
+        }
       }
+      DiscardEmptyOpenPipelineProbeCommandBuffer(context);
       return false;
     }
 
@@ -1266,36 +1579,18 @@ bool RenderPipelineProbeToContext(
                               fragment_sampler_objects);
 
     auto release_submission_resources = [&]() {
-      [system_buffer release];
-      if (float_buffer) {
-        [float_buffer release];
+      if (external_index_buffer) {
+        [external_index_buffer release];
       }
-      if (fragment_float_buffer) {
-        [fragment_float_buffer release];
+      if (shared_memory_buffer) {
+        [shared_memory_buffer release];
       }
-      if (fetch_buffer) {
-        [fetch_buffer release];
-      }
-      if (bool_loop_buffer) {
-        [bool_loop_buffer release];
-      }
-      if (vertex_data_buffer) {
-        [vertex_data_buffer release];
-      }
-      if (index_buffer_object) {
-        [index_buffer_object release];
-      }
-      [shared_memory_buffer release];
       ReleaseOwnedProbeTextures(vertex_texture_objects, dummy_texture);
       ReleaseOwnedProbeTextures(fragment_texture_objects, dummy_texture);
       vertex_sampler_objects.clear();
       fragment_sampler_objects.clear();
     };
 
-    if (!EnsureOpenPipelineProbeEncoder(context, error_out)) {
-      release_submission_resources();
-      return false;
-    }
     id<MTLRenderCommandEncoder> encoder = context->open_render_encoder;
     ClearTrackedOpenProbeBindings(context);
     [encoder setRenderPipelineState:(id<MTLRenderPipelineState>)pipeline_state];
@@ -1322,39 +1617,43 @@ bool RenderPipelineProbeToContext(
     [encoder setViewport:viewport];
     [encoder setScissorRect:scissor];
     [encoder setBlendColorRed:blend_red green:blend_green blue:blend_blue alpha:blend_alpha];
-    [encoder setVertexBuffer:system_buffer offset:0 atIndex:0];
-    [encoder setFragmentBuffer:system_buffer offset:0 atIndex:0];
+    [encoder setVertexBuffer:system_buffer.buffer offset:system_buffer.offset atIndex:0];
+    [encoder setFragmentBuffer:system_buffer.buffer offset:system_buffer.offset atIndex:0];
     if (vertex_fetch_constants_buffer_index != UINT32_MAX) {
-      [encoder setVertexBuffer:fetch_buffer offset:0 atIndex:vertex_fetch_constants_buffer_index];
+      [encoder setVertexBuffer:fetch_buffer.buffer
+                        offset:fetch_buffer.offset
+                       atIndex:vertex_fetch_constants_buffer_index];
       TrackOpenProbeBufferBinding(context, true, vertex_fetch_constants_buffer_index);
     }
     if (fragment_fetch_constants_buffer_index != UINT32_MAX) {
-      [encoder setFragmentBuffer:fetch_buffer
-                          offset:0
+      [encoder setFragmentBuffer:fetch_buffer.buffer
+                          offset:fetch_buffer.offset
                          atIndex:fragment_fetch_constants_buffer_index];
       TrackOpenProbeBufferBinding(context, false, fragment_fetch_constants_buffer_index);
     }
     if (vertex_bool_loop_constants_buffer_index != UINT32_MAX) {
-      [encoder setVertexBuffer:bool_loop_buffer
-                        offset:0
+      [encoder setVertexBuffer:bool_loop_buffer.buffer
+                        offset:bool_loop_buffer.offset
                        atIndex:vertex_bool_loop_constants_buffer_index];
       TrackOpenProbeBufferBinding(context, true, vertex_bool_loop_constants_buffer_index);
     }
     if (fragment_bool_loop_constants_buffer_index != UINT32_MAX) {
-      [encoder setFragmentBuffer:bool_loop_buffer
-                          offset:0
+      [encoder setFragmentBuffer:bool_loop_buffer.buffer
+                          offset:bool_loop_buffer.offset
                          atIndex:fragment_bool_loop_constants_buffer_index];
       TrackOpenProbeBufferBinding(context, false, fragment_bool_loop_constants_buffer_index);
     }
     if (vertex_float_constants_buffer_index != UINT32_MAX) {
-      [encoder setVertexBuffer:float_buffer offset:0 atIndex:vertex_float_constants_buffer_index];
+      [encoder setVertexBuffer:float_buffer.buffer
+                        offset:float_buffer.offset
+                       atIndex:vertex_float_constants_buffer_index];
       TrackOpenProbeBufferBinding(context, true, vertex_float_constants_buffer_index);
     }
-    id<MTLBuffer> fragment_constants_to_bind =
-        fragment_float_buffer ? fragment_float_buffer : float_buffer;
+    const ProbeUploadAllocation& fragment_constants_to_bind =
+        fragment_float_buffer.buffer ? fragment_float_buffer : float_buffer;
     if (fragment_float_constants_buffer_index != UINT32_MAX) {
-      [encoder setFragmentBuffer:fragment_constants_to_bind
-                          offset:0
+      [encoder setFragmentBuffer:fragment_constants_to_bind.buffer
+                          offset:fragment_constants_to_bind.offset
                          atIndex:fragment_float_constants_buffer_index];
       TrackOpenProbeBufferBinding(context, false, fragment_float_constants_buffer_index);
     }
@@ -1365,7 +1664,9 @@ bool RenderPipelineProbeToContext(
       TrackOpenProbeBufferBinding(context, true, vertex_shared_memory_buffer_index);
     }
     if (vertex_data_buffer_index != UINT32_MAX) {
-      [encoder setVertexBuffer:vertex_data_buffer offset:0 atIndex:vertex_data_buffer_index];
+      [encoder setVertexBuffer:vertex_data_buffer.buffer
+                        offset:vertex_data_buffer.offset
+                       atIndex:vertex_data_buffer_index];
       TrackOpenProbeBufferBinding(context, true, vertex_data_buffer_index);
     }
     BindProbeTextures(encoder, vertex_texture_objects, true);
@@ -1382,7 +1683,7 @@ bool RenderPipelineProbeToContext(
                            indexType:index_buffer->index_size == 2 ? MTLIndexTypeUInt16
                                                                    : MTLIndexTypeUInt32
                          indexBuffer:index_buffer_object
-                   indexBufferOffset:index_buffer->offset];
+                   indexBufferOffset:index_buffer_offset];
     } else {
       [encoder drawPrimitives:ToMetalPrimitiveType(primitive_type)
                   vertexStart:0
@@ -1457,29 +1758,10 @@ bool ReadPipelineProbeContextRect(void* opaque_context, uint32_t width, uint32_t
         return false;
       }
       size_t row_pitch = (size_t(read_width) * 4 + 255) & ~size_t(255);
-      size_t readback_size = row_pitch * read_height;
-      if (context->private_readback_capacity < readback_size) {
-        size_t full_row_pitch = (size_t(width) * 4 + 255) & ~size_t(255);
-        size_t allocation_size = std::max(readback_size, full_row_pitch * height);
-        id<MTLBuffer> larger_readback_buffer =
-            [context->device newBufferWithLength:allocation_size
-                                         options:MTLResourceStorageModeShared];
-        if (larger_readback_buffer) {
-          if (context->private_readback_buffer) {
-            [context->private_readback_buffer release];
-          }
-          context->private_readback_buffer = larger_readback_buffer;
-          context->private_readback_capacity = allocation_size;
-        }
-      }
-      id<MTLBuffer> readback_buffer = context->private_readback_capacity >= readback_size
-                                          ? context->private_readback_buffer
-                                          : nil;
+      id<MTLBuffer> readback_buffer =
+          EnsureProbeReadbackBuffer(context, width, height, row_pitch, read_height, error_out);
       if (!readback_buffer) {
         WaitPendingPipelineProbeCommands(context, nullptr, nullptr);
-        if (error_out) {
-          *error_out = "failed to create private render target readback buffer";
-        }
         return false;
       }
       id<MTLCommandBuffer> command_buffer = [context->command_queue commandBuffer];
@@ -1543,6 +1825,173 @@ bool ReadPipelineProbeContextRect(void* opaque_context, uint32_t width, uint32_t
                           bytesPerRow:size_t(read_width) * 4
                            fromRegion:region
                           mipmapLevel:0];
+    return true;
+  }
+}
+
+bool ResolvePipelineProbeContextToXenosTiled(void* opaque_context, uint32_t width, uint32_t height,
+                                             uint32_t source_x, uint32_t source_y,
+                                             uint32_t resolve_width, uint32_t resolve_height,
+                                             const ProbeTiledResolveTarget& destination,
+                                             std::vector<uint8_t>* bgra_out,
+                                             std::string* error_out) {
+  @autoreleasepool {
+    auto* context = static_cast<PipelineProbeContext*>(opaque_context);
+    if (bgra_out) {
+      bgra_out->clear();
+    }
+    if (!context) {
+      if (error_out) {
+        *error_out = "missing probe context";
+      }
+      return false;
+    }
+
+    auto reject_and_drain = [&](const std::string& reason) {
+      std::string drain_error;
+      bool drained = WaitPendingPipelineProbeCommands(context, &drain_error, nullptr);
+      if (error_out) {
+        *error_out = reason;
+        if (!drained && !drain_error.empty()) {
+          error_out->append("; prior render work failed: ");
+          error_out->append(drain_error);
+        }
+      }
+      return false;
+    };
+
+    bool texture_valid = context->render_texture && context->initialized && width && height &&
+                         context->width == width && context->height == height;
+    if (!texture_valid) {
+      return reject_and_drain("persistent probe texture is unavailable or has a different size");
+    }
+    if (!resolve_width || !resolve_height || source_x >= width || source_y >= height ||
+        resolve_width > width - source_x || resolve_height > height - source_y ||
+        !destination.metal_buffer || !destination.pitch || !destination.height ||
+        destination.x >= destination.pitch || destination.y >= destination.height ||
+        resolve_width > destination.pitch - destination.x ||
+        resolve_height > destination.height - destination.y || destination.endian > 3 ||
+        (destination.buffer_offset & 3) || destination.buffer_offset > UINT32_MAX ||
+        resolve_width > UINT32_MAX / 4 || size_t(resolve_width) > SIZE_MAX / 4 ||
+        size_t(resolve_height) > SIZE_MAX / (size_t(resolve_width) * 4)) {
+      return reject_and_drain("invalid tiled resolve rectangle, surface, buffer, or endian");
+    }
+
+    id<MTLBuffer> destination_buffer = (id<MTLBuffer>)destination.metal_buffer;
+    uint64_t aligned_destination_pitch = (uint64_t(destination.pitch) + 31u) & ~uint64_t(31u);
+    uint64_t aligned_destination_height = (uint64_t(destination.height) + 31u) & ~uint64_t(31u);
+    if (aligned_destination_pitch > uint64_t(UINT32_MAX / 4) / aligned_destination_height) {
+      return reject_and_drain("tiled resolve surface byte extent exceeds 32-bit addressing");
+    }
+    uint32_t tiled_surface_extent =
+        GetTiledRgba8UpperBound(destination.pitch, destination.height, destination.pitch);
+    uint64_t destination_end = uint64_t(destination.buffer_offset) + tiled_surface_extent;
+    if ([destination_buffer storageMode] != MTLStorageModeShared || !tiled_surface_extent ||
+        destination_end > [destination_buffer length] || destination_end > UINT32_MAX) {
+      return reject_and_drain(
+          "tiled resolve destination is not a sufficiently large shared Metal buffer");
+    }
+
+    std::string setup_error;
+    if (!EnsureTiledResolvePipelineState(context, &setup_error)) {
+      return reject_and_drain(setup_error);
+    }
+    size_t row_pitch = (size_t(resolve_width) * 4 + 255) & ~size_t(255);
+    id<MTLBuffer> staging_buffer =
+        EnsureProbeReadbackBuffer(context, width, height, row_pitch, resolve_height, &setup_error);
+    if (!staging_buffer) {
+      return reject_and_drain(setup_error);
+    }
+
+    // Commit render work without waiting. The blit and compute command buffer is
+    // on the same queue, so waiting for it completes every earlier submission.
+    std::string finalize_error;
+    if (!FinalizeOpenPipelineProbeCommandBuffer(context, &finalize_error)) {
+      return reject_and_drain(finalize_error.empty()
+                                  ? "failed to finalize pending render work for tiled resolve"
+                                  : finalize_error);
+    }
+    id<MTLCommandBuffer> command_buffer = [context->command_queue commandBuffer];
+    if (!command_buffer) {
+      return reject_and_drain("failed to create tiled resolve command buffer");
+    }
+    id<MTLBlitCommandEncoder> blit_encoder = [command_buffer blitCommandEncoder];
+    if (!blit_encoder) {
+      return reject_and_drain("failed to create tiled resolve blit encoder");
+    }
+    [blit_encoder copyFromTexture:context->render_texture
+                      sourceSlice:0
+                      sourceLevel:0
+                     sourceOrigin:MTLOriginMake(source_x, source_y, 0)
+                       sourceSize:MTLSizeMake(resolve_width, resolve_height, 1)
+                         toBuffer:staging_buffer
+                destinationOffset:0
+           destinationBytesPerRow:row_pitch
+         destinationBytesPerImage:row_pitch * resolve_height];
+    [blit_encoder endEncoding];
+
+    id<MTLComputeCommandEncoder> compute_encoder = [command_buffer computeCommandEncoder];
+    if (!compute_encoder) {
+      return reject_and_drain("failed to create tiled resolve compute encoder");
+    }
+    TiledResolveConstants constants = {
+        uint32_t(row_pitch), uint32_t(destination.buffer_offset),
+        destination.pitch,   destination.x,
+        destination.y,       resolve_width,
+        resolve_height,      destination.endian,
+    };
+    id<MTLComputePipelineState> pipeline_state = context->tiled_resolve_pipeline_state;
+    [compute_encoder setComputePipelineState:pipeline_state];
+    [compute_encoder setBuffer:staging_buffer offset:0 atIndex:0];
+    [compute_encoder setBuffer:destination_buffer offset:0 atIndex:1];
+    [compute_encoder setBytes:&constants length:sizeof(constants) atIndex:2];
+    NSUInteger thread_width = std::max<NSUInteger>(
+        1, std::min<NSUInteger>(resolve_width, [pipeline_state threadExecutionWidth]));
+    NSUInteger max_threads = [pipeline_state maxTotalThreadsPerThreadgroup];
+    NSUInteger thread_height =
+        std::max<NSUInteger>(1, std::min<NSUInteger>(resolve_height, max_threads / thread_width));
+    [compute_encoder dispatchThreads:MTLSizeMake(resolve_width, resolve_height, 1)
+               threadsPerThreadgroup:MTLSizeMake(thread_width, thread_height, 1)];
+    [compute_encoder endEncoding];
+    [command_buffer commit];
+    [command_buffer waitUntilCompleted];
+
+    std::string prior_error;
+    bool prior_commands_succeeded = ConsumeCompletedPipelineProbeCommands(context, &prior_error);
+    bool resolve_succeeded = [command_buffer status] == MTLCommandBufferStatusCompleted;
+    if (!prior_commands_succeeded || !resolve_succeeded) {
+      if (error_out) {
+        error_out->clear();
+        if (!prior_commands_succeeded) {
+          error_out->append("prior render work failed: ");
+          error_out->append(prior_error);
+        }
+        if (!resolve_succeeded) {
+          if (!error_out->empty()) {
+            error_out->append("; ");
+          }
+          NSError* command_error = [command_buffer error];
+          const char* description =
+              command_error ? [[command_error localizedDescription] UTF8String] : nullptr;
+          error_out->append(description ? description : "tiled resolve blit or compute failed");
+        }
+      }
+      return false;
+    }
+
+    if (bgra_out) {
+      size_t tight_row_pitch = size_t(resolve_width) * 4;
+      bgra_out->resize(tight_row_pitch * resolve_height);
+      const uint8_t* source = static_cast<const uint8_t*>([staging_buffer contents]);
+      if (row_pitch == tight_row_pitch) {
+        std::memcpy(bgra_out->data(), source, tight_row_pitch * resolve_height);
+      } else {
+        for (uint32_t row = 0; row < resolve_height; ++row) {
+          std::memcpy(bgra_out->data() + size_t(row) * tight_row_pitch,
+                      source + size_t(row) * row_pitch, tight_row_pitch);
+        }
+      }
+    }
     return true;
   }
 }

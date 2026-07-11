@@ -73,10 +73,11 @@ single-layer `texture2d_array`, expands a four-vertex fan through a six-entry in
 scissor delivery, verifies the title's source-alpha blend mode, and validates Xenos-to-Metal
 per-channel write-mask mapping. It also verifies ordered draws across queued command buffers, the
 64-draw command-buffer boundary, four retained batches, the 256-draw safety drain, explicit waits,
-and synchronization during shared/private regional readback, queued clear, resize, and context
-release. It protects the resource, fixed-function, and asynchronous-lifetime contracts used by
-translated producer draws. It does not replace title-level validation of texture-cache uploads,
-resolve coherence, or sustained execution.
+reusable upload-arena lifetime across command-buffer completion, and synchronization during
+shared/private regional readback, queued clear, resize, and context release. It protects the
+resource, fixed-function, and asynchronous-lifetime contracts used by translated producer draws.
+It does not replace title-level validation of texture-cache uploads, resolve coherence, or
+sustained execution.
 
 Run the Metal test with API validation enabled after changing submission or resource ownership:
 
@@ -93,12 +94,17 @@ cmake --preset macos-arm64-release -DREXGLUE_BUILD_PPC_TESTS=ON
 
 ## Runtime and Metal diagnostics
 
-Diagnostics are opt-in so normal runs do not write files or substitute success criteria.
+File-producing and execution-changing diagnostics are opt-in so normal runs do not write files or
+substitute success criteria. The presenter FPS overlay is the default-on exception and may be
+hidden without changing execution.
 
 | Environment variable | Effect |
 | --- | --- |
 | `GOLDENEYE_AUTO_START=1` | Hold Start during the initial input window to skip startup screens |
-| `GOLDENEYE_AUTO_START=periodic` | Keep the initial hold, then issue short Start retries separated by release gaps for unattended title/menu runs |
+| `GOLDENEYE_AUTO_START=periodic` | Use monotonic-time startup input followed by recurring Start pulses for unattended title/menu traversal |
+| `GOLDENEYE_AUTO_START=menu` | Use the periodic schedule until 19 seconds, then stop before the 20-second retry so it does not immediately leave a newly reached dossier menu |
+| `REX_METAL_SHOW_FPS=false` | Hide the default-on presenter FPS overlay; its value counts guest front-buffer deliveries, not host repaints |
+| `GOLDENEYE_METAL_GPU_TILED_RESOLVE=1` | Enable the experimental GPU tiled-write resolve path; it is off by default because it has not beaten the CPU path |
 | `GOLDENEYE_METAL_DUMP_SHADERS=1` | Write translated/failed MSL and selected microcode dumps under `/tmp` |
 | `GOLDENEYE_METAL_DUMP_FRAMES=1` or `all` | Write all selected BGRA frame stages as PPM files under `/tmp` |
 | `GOLDENEYE_METAL_DUMP_FRAMES=N` | Write only presenter frame number `N`; this avoids the decoded-texture inspection used by an all-stage dump |
@@ -110,11 +116,21 @@ Diagnostics are opt-in so normal runs do not write files or substitute success c
 | `GOLDENEYE_METAL_HOST_RT_SOLID_TEST=1` | Run the controlled solid render-target test |
 | `GOLDENEYE_METAL_MAGENTA_RESOLVE=1` | Run the controlled resolve visibility test |
 
-`GOLDENEYE_AUTO_START=periodic` changes input only: it preserves the initial Start hold, then emits
-short retries after full release intervals so unattended runs can cross title gates. It does not
-replace rendering or presentation. Pair it with a numeric `GOLDENEYE_METAL_DUMP_FRAMES` value when
+The `periodic` and `menu` auto-start modes use `steady_clock`, so renderer speed and input polling
+frequency do not move the injected Start edges. They hold Start from 200 ms until 1200 ms, release
+until 2000 ms, then emit a 250 ms pulse every 6000 ms. `periodic` continues that schedule;
+`menu` stops all injection at 19 seconds, before the fourth pulse would begin at 20 seconds, so a
+reached dossier menu gets an unforced capture and profiling window. The title may still leave an
+idle menu on its own; this diagnostic only controls the injected input.
+Both modes change input only: they do not replace rendering, alter PM4, force presentation, or
+bypass resolves. Pair either mode with a numeric `GOLDENEYE_METAL_DUMP_FRAMES` value when
 collecting one known presenter checkpoint, or use `1`/`all` only when every diagnostic stage is
 needed. Keep all resulting game-content captures outside the repository.
+
+The Metal presenter draws `FPS` by default after each completed guest front-buffer update. It
+counts guest-delivered frames over a monotonic interval rather than CAMetalLayer paint events, so
+window expose or repaint traffic cannot inflate the value. Set `REX_METAL_SHOW_FPS=false` to
+disable the overlay.
 
 Other host-pixel and fallback flags in the code are experiments. Results produced with them must be
 labelled as diagnostics and must not be reported as strict-path rendering success.
@@ -146,6 +162,25 @@ cache, and the final byte comparison catches writes that bypass normal tracking.
 and dirty-range commits use the true tiled-address upper bound rather than a linear
 `pitch * height * 4` estimate; the latter is too small for the bottom of a 1280x720 tiled surface.
 
+Coarse guest-memory invalidation may cover 256 KiB even when the resident texture bytes did not
+change. The texture cache therefore fingerprints the synchronized source span before decoding and
+uploading it again. An unchanged fingerprint re-arms tracking without another CPU untile or Metal
+`replaceRegion`; a changed source still follows the normal replacement path.
+
+MSL resource reflection is computed once after a translation's final source sanitization. Buffer
+indices, texture-fetch mappings, interpolator locations, memory-export state, and void-fragment
+state are then read from the immutable translation record instead of rescanning MSL for every
+draw. Per-draw constants, CPU vertex data, and nonresident index data are suballocated from
+reusable upload arenas associated with their command buffer. Arenas are recycled only after GPU
+completion, preserving asynchronous resource lifetime without allocating a Metal buffer for every
+binding.
+
+`GOLDENEYE_METAL_GPU_TILED_RESOLVE=1` selects an experimental compute path that writes the Xenos
+tiled destination directly. Byte-exact coverage includes full and partial rectangles across all
+four 128-bit endian modes. The option remains off by default because current measurements did not
+show an improvement over the optimized CPU tiler; strict performance runs should record whether it
+was enabled.
+
 The title-facing GPU-wait hook determines completion from one atomic primary-ring snapshot. A ring
 is drained only when it is configured, has a valid write pointer, and has no pending commands;
 this also handles a valid wrapped write pointer of zero without mistaking it for an uninitialized
@@ -155,11 +190,14 @@ Rate-limited `IssueSwap` output includes cumulative asynchronous submission, wai
 and maximum-pending counters. Use those counters with a fixed swap checkpoint when comparing
 pacing, and leave frame/shader dumps and verbose diagnostics disabled during timing runs.
 
-On the current Apple Silicon test system, a representative fixed early checkpoint improved from
-14.43 seconds on the original per-draw-wait path to approximately 10.5 seconds after the bounded
-submission and resolve/swap work, roughly 27%. Startup and periodic-input timing varies between
-runs, so treat this as directional evidence rather than a stable benchmark. Reaching and animating
-the later menu is still far from a playable frame rate.
+The POSIX host tick count is represented in nanoseconds. Its frequency is therefore fixed at one
+billion ticks per second rather than derived from `clock_getres`, which reports the timer's
+precision rather than the unit of the returned count. The former calculation scaled guest time and
+the FPS display by the host timer quantum on macOS. With the corrected clock and performance
+optimizations above, verified 1280x720 captures on an Apple M3 Ultra reached the dossier menu and
+reported 30.0 and 59.9 guest-delivered frames per second in different short intervals. This is a
+major pacing improvement, but it is not a sustained-60-FPS claim. Gameplay has not been reached
+and is not confirmed correct or performant.
 
 ## Debugging guardrails
 

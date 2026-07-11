@@ -47,6 +47,13 @@ class MetalSharedMemory final : public SharedMemory {
   // would mark the Metal copy valid without actually updating its bytes.
   bool CommitGuestCpuWriteAsGpu(uint32_t start, uint32_t length);
 
+  // Publishes a completed GPU write already present in the Metal buffer back
+  // to the guest physical mapping. The caller must have waited for the Metal
+  // command that produced the bytes and must serialize guest writers from the
+  // preceding RequestRange through this call. Unlike CommitGuestCpuWriteAsGpu,
+  // this copies Metal -> guest and does not copy the same bytes back again.
+  bool CommitGpuBufferWriteToGuest(uint32_t start, uint32_t length);
+
  protected:
   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
 

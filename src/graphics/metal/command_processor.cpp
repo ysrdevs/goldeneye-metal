@@ -12,6 +12,10 @@
 #include <memory>
 #include <unordered_set>
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#endif
+
 #include <sys/stat.h>
 
 #include <rex/graphics/flags.h>
@@ -58,6 +62,22 @@ inline uint32_t GetTiledRgba8Offset(uint32_t x, uint32_t y, uint32_t row_base) {
   uint32_t offset = row_base + macro + ((micro & ~0xFu) << 1) + (micro & 0xFu);
   return ((offset & ~0x1FFu) << 3) + ((offset & 0x1C0u) << 2) + (offset & 0x3Fu) + ((y & 16) << 7) +
          (((((y & 8) >> 2) + (x >> 3)) & 3) << 6);
+}
+
+inline void PackFourBgraPixelsToGuestRgba(uint8_t* target, const uint8_t* source) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+  const uint8x16_t bgra_to_rgba = {2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15};
+  vst1q_u8(target, vqtbl1q_u8(vld1q_u8(source), bgra_to_rgba));
+#else
+  for (uint32_t pixel = 0; pixel < 4; ++pixel) {
+    const uint8_t* source_pixel = source + size_t(pixel) * 4;
+    uint8_t* target_pixel = target + size_t(pixel) * 4;
+    target_pixel[0] = source_pixel[2];
+    target_pixel[1] = source_pixel[1];
+    target_pixel[2] = source_pixel[0];
+    target_pixel[3] = source_pixel[3];
+  }
+#endif
 }
 
 class MetalPrimitiveProcessor final : public PrimitiveProcessor {
@@ -271,26 +291,34 @@ bool EnvEnabled(const char* name) {
 }
 
 bool DebugFrameDumpEnabled() {
-  return EnvEnabled("GOLDENEYE_METAL_DUMP_FRAMES");
+  static const bool enabled = EnvEnabled("GOLDENEYE_METAL_DUMP_FRAMES");
+  return enabled;
 }
 
 bool DebugAllFrameDumpsEnabled() {
-  const char* value = std::getenv("GOLDENEYE_METAL_DUMP_FRAMES");
-  return value && (!std::strcmp(value, "1") || !std::strcmp(value, "all"));
+  static const bool enabled = []() {
+    const char* value = std::getenv("GOLDENEYE_METAL_DUMP_FRAMES");
+    return value && (!std::strcmp(value, "1") || !std::strcmp(value, "all"));
+  }();
+  return enabled;
 }
 
 uint32_t DebugPresenterFrameDumpIndex() {
-  const char* value = std::getenv("GOLDENEYE_METAL_DUMP_FRAMES");
-  if (!value || !value[0] || !std::strcmp(value, "1") || !std::strcmp(value, "all")) {
-    return 0;
-  }
-  char* end = nullptr;
-  unsigned long index = std::strtoul(value, &end, 10);
-  return end && !*end && index <= UINT32_MAX ? uint32_t(index) : 0;
+  static const uint32_t index = []() {
+    const char* value = std::getenv("GOLDENEYE_METAL_DUMP_FRAMES");
+    if (!value || !value[0] || !std::strcmp(value, "1") || !std::strcmp(value, "all")) {
+      return UINT32_C(0);
+    }
+    char* end = nullptr;
+    unsigned long parsed_index = std::strtoul(value, &end, 10);
+    return end && !*end && parsed_index <= UINT32_MAX ? uint32_t(parsed_index) : UINT32_C(0);
+  }();
+  return index;
 }
 
 bool MetalShaderDumpEnabled() {
-  return EnvEnabled("GOLDENEYE_METAL_DUMP_SHADERS");
+  static const bool enabled = EnvEnabled("GOLDENEYE_METAL_DUMP_SHADERS");
+  return enabled;
 }
 
 void DumpBgraFrameAsPpm(const char* label, uint32_t index, const std::vector<uint8_t>& bgra,
@@ -769,49 +797,66 @@ constexpr uint32_t kMaxHostPixelDrawsPerShaderPerSwap = 24;
 constexpr uint32_t kMaxHostFallbackPixelDrawsPerSwap = 256;
 
 bool MetalPipelineProbesEnabled() {
-  return EnvEnabled("GOLDENEYE_METAL_PIPELINE_PROBE");
+  static const bool enabled = EnvEnabled("GOLDENEYE_METAL_PIPELINE_PROBE");
+  return enabled;
 }
 
 bool MetalVerboseDiagnosticsEnabled() {
-  return EnvEnabled("GOLDENEYE_METAL_VERBOSE_DIAGNOSTICS");
+  static const bool enabled = EnvEnabled("GOLDENEYE_METAL_VERBOSE_DIAGNOSTICS");
+  return enabled;
 }
 
 bool MetalHostRenderTargetDebugEnabled() {
-  return EnvEnabled("GOLDENEYE_METAL_HOST_RT_DEBUG") ||
-         EnvEnabled("GOLDENEYE_METAL_HOST_RT_DEBUG_PRESENT");
+  static const bool enabled = EnvEnabled("GOLDENEYE_METAL_HOST_RT_DEBUG") ||
+                              EnvEnabled("GOLDENEYE_METAL_HOST_RT_DEBUG_PRESENT");
+  return enabled;
 }
 
 bool MetalHostRenderTargetDebugPresentEnabled() {
-  return EnvEnabled("GOLDENEYE_METAL_HOST_RT_DEBUG_PRESENT");
+  static const bool enabled = EnvEnabled("GOLDENEYE_METAL_HOST_RT_DEBUG_PRESENT");
+  return enabled;
 }
 
 bool MetalHostRenderTargetSolidTestEnabled() {
-  return EnvEnabled("GOLDENEYE_METAL_HOST_RT_SOLID_TEST");
+  static const bool enabled = EnvEnabled("GOLDENEYE_METAL_HOST_RT_SOLID_TEST");
+  return enabled;
 }
 
 bool MetalHostRenderTargetTextureAliasEnabled() {
-  return EnvEnabled("GOLDENEYE_METAL_HOST_RT_TEXTURE_ALIAS");
+  static const bool enabled = EnvEnabled("GOLDENEYE_METAL_HOST_RT_TEXTURE_ALIAS");
+  return enabled;
 }
 
 bool MetalFullscreenProbeEnabled() {
-  return EnvEnabled("GOLDENEYE_METAL_FULLSCREEN_PROBE");
+  static const bool enabled = EnvEnabled("GOLDENEYE_METAL_FULLSCREEN_PROBE");
+  return enabled;
 }
 
 bool MetalHeuristicPresentationEnabled() {
-  return EnvEnabled("GOLDENEYE_METAL_HEURISTIC_PRESENT");
+  static const bool enabled = EnvEnabled("GOLDENEYE_METAL_HEURISTIC_PRESENT");
+  return enabled;
 }
 
 bool MetalFallbackResolveEnabled() {
-  return EnvEnabled("GOLDENEYE_METAL_FALLBACK_RESOLVE");
+  static const bool enabled = EnvEnabled("GOLDENEYE_METAL_FALLBACK_RESOLVE");
+  return enabled;
+}
+
+bool MetalGpuTiledResolveEnabled() {
+  static const bool enabled = EnvEnabled("GOLDENEYE_METAL_GPU_TILED_RESOLVE");
+  return enabled;
 }
 
 bool MetalHostPixelDiagnosticsEnabled() {
-  return MetalHeuristicPresentationEnabled() || MetalFallbackResolveEnabled() ||
-         EnvEnabled("GOLDENEYE_METAL_HOST_PIXEL_DIAGNOSTICS");
+  static const bool enabled = MetalHeuristicPresentationEnabled() ||
+                              MetalFallbackResolveEnabled() ||
+                              EnvEnabled("GOLDENEYE_METAL_HOST_PIXEL_DIAGNOSTICS");
+  return enabled;
 }
 
 bool MetalMagentaResolveEnabled() {
-  return EnvEnabled("GOLDENEYE_METAL_MAGENTA_RESOLVE");
+  static const bool enabled = EnvEnabled("GOLDENEYE_METAL_MAGENTA_RESOLVE");
+  return enabled;
 }
 
 bool IsKnownUnsafeHostPixelShader(uint64_t pixel_shader_hash) {
@@ -820,7 +865,7 @@ bool IsKnownUnsafeHostPixelShader(uint64_t pixel_shader_hash) {
 
 bool IsVoidFragmentMsl(const MetalShader::MetalTranslation* translation) {
   return translation && translation->shader().type() == xenos::ShaderType::kPixel &&
-         translation->msl_source().find("fragment void main0") != std::string::npos;
+         translation->msl_reflection().is_void_fragment;
 }
 
 bool ShouldUseHostFallbackPixelShader(uint64_t pixel_shader_hash,
@@ -1016,55 +1061,14 @@ struct HostPixelProbeVertex {
   std::array<std::array<float, 4>, VertexExportSink::kInterpolatorCount> interpolators = {};
 };
 
-std::array<uint32_t, VertexExportSink::kInterpolatorCount> GetMslPixelInterpolatorByLocation(
-    const std::string& source) {
-  std::array<uint32_t, VertexExportSink::kInterpolatorCount> interpolator_by_location = {};
-  for (uint32_t i = 0; i < VertexExportSink::kInterpolatorCount; ++i) {
-    interpolator_by_location[i] = i;
-  }
-  constexpr const char* kInterpolatorPrefix = "xe_in_interpolator_";
-  constexpr const char* kUserLocationPrefix = "[[user(locn";
-  size_t search_pos = 0;
-  while (true) {
-    size_t name_pos = source.find(kInterpolatorPrefix, search_pos);
-    if (name_pos == std::string::npos) {
-      break;
-    }
-    size_t interpolator_pos = name_pos + std::strlen(kInterpolatorPrefix);
-    uint32_t interpolator_index = 0;
-    bool saw_interpolator_digit = false;
-    while (interpolator_pos < source.size() && source[interpolator_pos] >= '0' &&
-           source[interpolator_pos] <= '9') {
-      saw_interpolator_digit = true;
-      interpolator_index = interpolator_index * 10 + uint32_t(source[interpolator_pos] - '0');
-      ++interpolator_pos;
-    }
-    if (!saw_interpolator_digit || interpolator_index >= VertexExportSink::kInterpolatorCount) {
-      search_pos = interpolator_pos;
-      continue;
-    }
-    size_t attribute_pos = source.find(kUserLocationPrefix, interpolator_pos);
-    size_t next_interpolator_pos = source.find(kInterpolatorPrefix, interpolator_pos);
-    if (attribute_pos == std::string::npos ||
-        (next_interpolator_pos != std::string::npos && attribute_pos > next_interpolator_pos)) {
-      search_pos = interpolator_pos;
-      continue;
-    }
-    attribute_pos += std::strlen(kUserLocationPrefix);
-    uint32_t location = 0;
-    bool saw_location_digit = false;
-    while (attribute_pos < source.size() && source[attribute_pos] >= '0' &&
-           source[attribute_pos] <= '9') {
-      saw_location_digit = true;
-      location = location * 10 + uint32_t(source[attribute_pos] - '0');
-      ++attribute_pos;
-    }
-    if (saw_location_digit && location < VertexExportSink::kInterpolatorCount) {
-      interpolator_by_location[location] = interpolator_index;
-    }
-    search_pos = interpolator_pos;
-  }
-  return interpolator_by_location;
+const std::array<uint32_t, VertexExportSink::kInterpolatorCount>& GetMslPixelInterpolatorByLocation(
+    const MetalShader::MetalTranslation* translation) {
+  static_assert(VertexExportSink::kInterpolatorCount ==
+                MetalShader::MetalTranslation::kMslInterpolatorCount);
+  static constexpr std::array<uint32_t, VertexExportSink::kInterpolatorCount>
+      kIdentityInterpolators = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+  return translation ? translation->msl_reflection().pixel_interpolators_by_location
+                     : kIdentityInterpolators;
 }
 
 bool LooksLikeNormalizedColor(const float* color) {
@@ -1208,34 +1212,7 @@ fragment float4 main0() {
 }
 
 bool MslWritesSharedMemory(const MetalShader::MetalTranslation* translation) {
-  if (!translation) {
-    return false;
-  }
-  const std::string& msl_source = translation->msl_source();
-  if (msl_source.find("atomic_fetch_") != std::string::npos) {
-    return true;
-  }
-  constexpr const char* kSharedMemoryAccess = "xe_shared_memory[";
-  constexpr const char* kWrappedSharedMemoryAccess = "xe_shared_memory.shared_memory[";
-  size_t search_offset = 0;
-  while (true) {
-    size_t access_offset = msl_source.find(kSharedMemoryAccess, search_offset);
-    if (access_offset == std::string::npos) {
-      access_offset = msl_source.find(kWrappedSharedMemoryAccess, search_offset);
-    }
-    if (access_offset == std::string::npos) {
-      return false;
-    }
-    size_t bracket_offset = msl_source.find(']', access_offset);
-    if (bracket_offset == std::string::npos) {
-      return false;
-    }
-    size_t operator_offset = msl_source.find_first_not_of(" \t\r\n", bracket_offset + 1);
-    if (operator_offset != std::string::npos && msl_source[operator_offset] == '=') {
-      return true;
-    }
-    search_offset = bracket_offset + 1;
-  }
+  return translation && translation->msl_reflection().writes_shared_memory;
 }
 
 bool HasMemExportSideEffects(const MetalShader& shader,
@@ -1243,77 +1220,11 @@ bool HasMemExportSideEffects(const MetalShader& shader,
   return shader.memexport_eM_written() || MslWritesSharedMemory(translation);
 }
 
-uint32_t FindMslBufferIndex(const std::string& source, const char* parameter_name) {
-  size_t parameter_pos = source.find(parameter_name);
-  if (parameter_pos == std::string::npos) {
-    return UINT32_MAX;
-  }
-  size_t buffer_pos = source.find("[[buffer(", parameter_pos);
-  if (buffer_pos == std::string::npos) {
-    return UINT32_MAX;
-  }
-  buffer_pos += std::strlen("[[buffer(");
-  uint32_t index = 0;
-  bool saw_digit = false;
-  while (buffer_pos < source.size() && source[buffer_pos] >= '0' && source[buffer_pos] <= '9') {
-    saw_digit = true;
-    index = index * 10 + uint32_t(source[buffer_pos] - '0');
-    ++buffer_pos;
-  }
-  return saw_digit ? index : UINT32_MAX;
-}
-
-std::vector<uint32_t> GetMslTextureFetchConstantsByBindingIndex(const std::string& source) {
-  std::vector<uint32_t> fetch_constants_by_binding_index;
-  constexpr const char* kTexturePrefix = "xe_texture";
-  constexpr const char* kTextureAttribute = "[[texture(";
-  size_t search_pos = 0;
-  while (true) {
-    size_t texture_name_pos = source.find(kTexturePrefix, search_pos);
-    if (texture_name_pos == std::string::npos) {
-      break;
-    }
-    size_t fetch_pos = texture_name_pos + std::strlen(kTexturePrefix);
-    uint32_t fetch_constant = 0;
-    bool saw_fetch_digit = false;
-    while (fetch_pos < source.size() && source[fetch_pos] >= '0' && source[fetch_pos] <= '9') {
-      saw_fetch_digit = true;
-      fetch_constant = fetch_constant * 10 + uint32_t(source[fetch_pos] - '0');
-      ++fetch_pos;
-    }
-    if (!saw_fetch_digit) {
-      search_pos = fetch_pos;
-      continue;
-    }
-    size_t attribute_pos = source.find(kTextureAttribute, fetch_pos);
-    size_t next_parameter_pos = source.find("xe_texture", fetch_pos);
-    if (attribute_pos == std::string::npos ||
-        (next_parameter_pos != std::string::npos && attribute_pos > next_parameter_pos)) {
-      search_pos = fetch_pos;
-      continue;
-    }
-    attribute_pos += std::strlen(kTextureAttribute);
-    uint32_t binding_index = 0;
-    bool saw_binding_digit = false;
-    while (attribute_pos < source.size() && source[attribute_pos] >= '0' &&
-           source[attribute_pos] <= '9') {
-      saw_binding_digit = true;
-      binding_index = binding_index * 10 + uint32_t(source[attribute_pos] - '0');
-      ++attribute_pos;
-    }
-    if (saw_binding_digit) {
-      if (binding_index >= fetch_constants_by_binding_index.size()) {
-        fetch_constants_by_binding_index.resize(size_t(binding_index) + 1, UINT32_MAX);
-      }
-      fetch_constants_by_binding_index[binding_index] = fetch_constant;
-    }
-    search_pos = fetch_pos;
-  }
-  while (!fetch_constants_by_binding_index.empty() &&
-         fetch_constants_by_binding_index.back() == UINT32_MAX) {
-    fetch_constants_by_binding_index.pop_back();
-  }
-  return fetch_constants_by_binding_index;
+const std::vector<uint32_t>& GetMslTextureFetchConstantsByBindingIndex(
+    const MetalShader::MetalTranslation* translation) {
+  static const std::vector<uint32_t> kNoTextureFetchConstants;
+  return translation ? translation->msl_reflection().texture_fetch_constants_by_binding_index
+                     : kNoTextureFetchConstants;
 }
 
 struct VertexMslBufferBindings {
@@ -1329,11 +1240,11 @@ VertexMslBufferBindings GetVertexMslBufferBindings(
   if (!translation) {
     return bindings;
   }
-  const std::string& source = translation->msl_source();
-  bindings.shared_memory = FindMslBufferIndex(source, "xe_shared_memory");
-  bindings.float_constants = FindMslBufferIndex(source, "xe_uniform_float_constants");
-  bindings.bool_loop_constants = FindMslBufferIndex(source, "xe_uniform_bool_loop_constants");
-  bindings.fetch_constants = FindMslBufferIndex(source, "xe_uniform_fetch_constants");
+  const auto& reflection = translation->msl_reflection();
+  bindings.shared_memory = reflection.shared_memory_buffer_index;
+  bindings.float_constants = reflection.float_constants_buffer_index;
+  bindings.bool_loop_constants = reflection.bool_loop_constants_buffer_index;
+  bindings.fetch_constants = reflection.fetch_constants_buffer_index;
   return bindings;
 }
 
@@ -1448,11 +1359,14 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                  frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
     std::fprintf(stderr,
                  "[metal] async probe summary#%u submitted=%llu waits=%llu waited=%llu "
-                 "max_pending=%u\n",
+                 "max_pending=%u gpu_tiled_resolves=%llu pixels=%llu fallbacks=%llu\n",
                  metal_swap_index, static_cast<unsigned long long>(async_probe_submission_count_),
                  static_cast<unsigned long long>(async_probe_wait_count_),
                  static_cast<unsigned long long>(async_probe_waited_submission_count_),
-                 async_probe_max_pending_submission_count_);
+                 async_probe_max_pending_submission_count_,
+                 static_cast<unsigned long long>(gpu_tiled_resolve_count_),
+                 static_cast<unsigned long long>(gpu_tiled_resolve_pixel_count_),
+                 static_cast<unsigned long long>(gpu_tiled_resolve_fallback_count_));
     std::fflush(stderr);
   }
   if (metal_swap_index <= 32 || (metal_swap_index & 0x3F) == 0) {
@@ -1875,7 +1789,7 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                                  decoded_height);
             }
             metal_presenter->UpdateGuestFrontbuffer(decoded_width, decoded_height,
-                                                    decoded_bgra.data(), size_t(decoded_width) * 4);
+                                                    std::move(decoded_bgra));
           } else {
             const uint8_t* frontbuffer =
                 memory_->TranslatePhysical<const uint8_t*>(frontbuffer_ptr);
@@ -2384,9 +2298,8 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                    : 0.0f;
       };
       uint32_t bdc_float_buffer_index =
-          pixel_translation
-              ? FindMslBufferIndex(pixel_translation->msl_source(), "xe_uniform_float_constants")
-              : UINT32_MAX;
+          pixel_translation ? pixel_translation->msl_reflection().float_constants_buffer_index
+                            : UINT32_MAX;
       uint32_t normalized_color_mask =
           draw_util::GetNormalizedColorMask(*register_file_, pixel_shader->writes_color_targets());
       std::fprintf(
@@ -4620,7 +4533,9 @@ bool MetalCommandProcessor::IssueCopy() {
     uint32_t resolve_height = fallback_output_height_;
     bool refreshed_host_rt = false;
     bool regional_host_rt_readback = false;
+    bool gpu_tiled_resolve = false;
     std::vector<uint8_t> regional_host_rt_bgra;
+    std::vector<uint8_t> gpu_tiled_resolve_bgra;
     bool log_resolve_gate =
         MetalVerboseDiagnosticsEnabled() &&
         (RangesOverlap(resolve_info.copy_dest_base, resolve_info.copy_dest_extent_length,
@@ -4690,7 +4605,96 @@ bool MetalCommandProcessor::IssueCopy() {
       }
       uint32_t copy_width = std::min(rect_width, source_rect_width);
       uint32_t copy_height = std::min(rect_height, source_rect_height);
-      if (resolve_host_rt_context && copy_width && copy_height &&
+      uint32_t write_dest_base = resolve_info.copy_dest_base;
+      uint32_t write_dest_y = rect_y;
+      if (source_rect_y && dest_pitch) {
+        uint64_t anchor_offset = uint64_t(source_rect_y) * dest_pitch * 4;
+        if (resolve_info.copy_dest_base >= anchor_offset) {
+          write_dest_base = uint32_t(resolve_info.copy_dest_base - anchor_offset);
+          write_dest_y = source_rect_y;
+          dest_height = std::max(dest_height, write_dest_y + copy_height);
+        }
+      }
+      if (MetalGpuTiledResolveEnabled() && resolve_host_rt_context && shared_memory_ &&
+          shared_memory_->buffer() && copy_width && copy_height &&
+          pending_readback_resolve_slices_.empty() && host_source_rect_x <= resolve_width &&
+          host_source_rect_y <= resolve_height &&
+          copy_width <= resolve_width - host_source_rect_x &&
+          copy_height <= resolve_height - host_source_rect_y) {
+        uint32_t dirty_offset_start =
+            texture_util::GetTiledAddressLowerBound2D(rect_x, write_dest_y, dest_pitch, 2);
+        uint32_t dirty_offset_end = texture_util::GetTiledAddressUpperBound2D(
+            rect_x + copy_width, write_dest_y + copy_height, dest_pitch, 2);
+        uint64_t dirty_start_unclamped = uint64_t(write_dest_base) + dirty_offset_start;
+        uint64_t dirty_end_unclamped = uint64_t(write_dest_base) + dirty_offset_end;
+        bool dirty_range_valid = dirty_end_unclamped > dirty_start_unclamped &&
+                                 dirty_end_unclamped <= SharedMemory::kBufferSize;
+        uint32_t dirty_start = dirty_range_valid ? uint32_t(dirty_start_unclamped) : 0;
+        uint32_t dirty_length =
+            dirty_range_valid ? uint32_t(dirty_end_unclamped - dirty_start_unclamped) : 0;
+        bool exact_cache_candidate = !rect_x && !write_dest_y && copy_width == dest_pitch &&
+                                     copy_height >= fallback_output_height_;
+        std::string gpu_resolve_error;
+        ProbeTiledResolveTarget gpu_destination = {
+            shared_memory_->buffer(),
+            write_dest_base,
+            dest_pitch,
+            dest_height,
+            rect_x,
+            write_dest_y,
+            uint32_t(resolve_info.copy_dest_info.copy_dest_endian)};
+        bool gpu_resolve_ready =
+            dirty_length &&
+            WaitForPipelineProbeSubmissions("resolve-buffer-writer", resolve_host_rt_context) &&
+            shared_memory_->RequestRange(dirty_start, dirty_length);
+        bool gpu_resolve_completed = false;
+        if (gpu_resolve_ready) {
+          gpu_resolve_completed = ResolvePipelineProbeContextToXenosTiled(
+              resolve_host_rt_context, resolve_width, resolve_height, host_source_rect_x,
+              host_source_rect_y, copy_width, copy_height, gpu_destination,
+              exact_cache_candidate || MetalVerboseDiagnosticsEnabled() ? &gpu_tiled_resolve_bgra
+                                                                        : nullptr,
+              &gpu_resolve_error);
+          if (gpu_resolve_completed &&
+              !shared_memory_->CommitGpuBufferWriteToGuest(dirty_start, dirty_length)) {
+            gpu_resolve_completed = false;
+            gpu_resolve_error = "failed to publish GPU tiled resolve to guest memory";
+          }
+        }
+        if (gpu_resolve_completed) {
+          gpu_tiled_resolve = true;
+          refreshed_host_rt = true;
+          ++gpu_tiled_resolve_count_;
+          gpu_tiled_resolve_pixel_count_ += uint64_t(copy_width) * copy_height;
+          InvalidateExactResolvedSurfaceCache(
+              write_dest_base,
+              texture_util::GetTiledAddressUpperBound2D(dest_pitch, dest_height, dest_pitch, 2));
+          if (exact_cache_candidate && !gpu_tiled_resolve_bgra.empty()) {
+            UpdateExactResolvedSurfaceCache(write_dest_base, dest_pitch, dest_height,
+                                            gpu_tiled_resolve_bgra, copy_width, copy_height, 0, 0,
+                                            rect_x, write_dest_y, copy_width, copy_height,
+                                            resolve_info.copy_dest_info.copy_dest_endian);
+          }
+        } else if (gpu_resolve_ready) {
+          // The compute command may have partially modified the shared Metal
+          // buffer even when it reports failure. Publication may also fail
+          // after a successful compute. In either case, don't leave the old
+          // CPU-backed range marked valid while falling back to the CPU path.
+          // A successful CPU fallback republishes the complete dirty range;
+          // otherwise the next RequestRange restores it from guest memory.
+          shared_memory_->MemoryInvalidationCallback(dirty_start, dirty_length, true);
+          ++gpu_tiled_resolve_fallback_count_;
+          static std::atomic<uint32_t> gpu_tiled_resolve_failure_logs{0};
+          uint32_t failure_index =
+              gpu_tiled_resolve_failure_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+          if (!gpu_resolve_error.empty() && (failure_index <= 8 || (failure_index & 0x3F) == 0)) {
+            std::fprintf(stderr, "[metal] GPU tiled resolve failed#%u: %s\n", failure_index,
+                         gpu_resolve_error.c_str());
+            std::fflush(stderr);
+          }
+        }
+      }
+      if (!gpu_tiled_resolve && resolve_host_rt_context && copy_width && copy_height &&
           host_source_rect_x <= resolve_width && host_source_rect_y <= resolve_height &&
           copy_width <= resolve_width - host_source_rect_x &&
           copy_height <= resolve_height - host_source_rect_y) {
@@ -4710,25 +4714,30 @@ bool MetalCommandProcessor::IssueCopy() {
         uint32_t gate_index =
             readback_resolve_gate_logs.fetch_add(1, std::memory_order_relaxed) + 1;
         if (gate_index <= 32 || (gate_index & 0xFF) == 0) {
-          std::fprintf(stderr,
-                       "[metal] readback resolve gate#%u copy=%u dest=0x%08x "
-                       "extent=0x%08x+0x%x refreshed=%u regional=%u rt=%u "
-                       "owner=%u context=%u latest=%ux%u bytes=%zu\n",
-                       gate_index, metal_copy_index, resolve_info.copy_dest_base,
-                       resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
-                       refreshed_host_rt ? 1u : 0u, regional_host_rt_readback ? 1u : 0u,
-                       uint32_t(active_copy_control.copy_src_select), resolve_host_rt ? 1u : 0u,
-                       resolve_host_rt_context ? 1u : 0u,
-                       regional_host_rt_readback ? copy_width : latest_host_render_target_width_,
-                       regional_host_rt_readback ? copy_height : latest_host_render_target_height_,
-                       regional_host_rt_readback ? regional_host_rt_bgra.size()
-                                                 : latest_host_render_target_bgra_.size());
+          std::fprintf(
+              stderr,
+              "[metal] readback resolve gate#%u copy=%u dest=0x%08x "
+              "extent=0x%08x+0x%x refreshed=%u regional=%u rt=%u "
+              "gpu_tiled=%u owner=%u context=%u latest=%ux%u bytes=%zu\n",
+              gate_index, metal_copy_index, resolve_info.copy_dest_base,
+              resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
+              refreshed_host_rt ? 1u : 0u, regional_host_rt_readback ? 1u : 0u,
+              uint32_t(active_copy_control.copy_src_select), gpu_tiled_resolve ? 1u : 0u,
+              resolve_host_rt ? 1u : 0u, resolve_host_rt_context ? 1u : 0u,
+              (gpu_tiled_resolve || regional_host_rt_readback) ? copy_width
+                                                               : latest_host_render_target_width_,
+              (gpu_tiled_resolve || regional_host_rt_readback) ? copy_height
+                                                               : latest_host_render_target_height_,
+              gpu_tiled_resolve
+                  ? gpu_tiled_resolve_bgra.size()
+                  : (regional_host_rt_readback ? regional_host_rt_bgra.size()
+                                               : latest_host_render_target_bgra_.size()));
           std::fflush(stderr);
         }
       }
       if (refreshed_host_rt) {
         bool can_resolve_directly_from_host_rt =
-            regional_host_rt_readback ||
+            gpu_tiled_resolve || regional_host_rt_readback ||
             (resolve_host_rt && host_source_rect_x <= latest_host_render_target_width_ &&
              host_source_rect_y <= latest_host_render_target_height_ &&
              copy_width <= latest_host_render_target_width_ - host_source_rect_x &&
@@ -4761,16 +4770,6 @@ bool MetalCommandProcessor::IssueCopy() {
             std::fflush(stderr);
           }
         }
-        uint32_t write_dest_base = resolve_info.copy_dest_base;
-        uint32_t write_dest_y = rect_y;
-        if (source_rect_y && dest_pitch) {
-          uint64_t anchor_offset = uint64_t(source_rect_y) * dest_pitch * 4;
-          if (resolve_info.copy_dest_base >= anchor_offset) {
-            write_dest_base = uint32_t(resolve_info.copy_dest_base - anchor_offset);
-            write_dest_y = source_rect_y;
-            dest_height = std::max(dest_height, write_dest_y + copy_height);
-          }
-        }
         if (write_dest_base != resolve_info.copy_dest_base) {
           for (auto it = pending_readback_resolve_slices_.begin();
                it != pending_readback_resolve_slices_.end();) {
@@ -4800,23 +4799,33 @@ bool MetalCommandProcessor::IssueCopy() {
           }
         }
         const std::vector<uint8_t>& resolve_source_bgra =
-            used_edram_resolve ? edram_resolved_bgra
-                               : (regional_host_rt_readback ? regional_host_rt_bgra
-                                                            : latest_host_render_target_bgra_);
-        uint32_t resolve_source_width = (used_edram_resolve || regional_host_rt_readback)
-                                            ? copy_width
-                                            : latest_host_render_target_width_;
-        uint32_t resolve_source_height = (used_edram_resolve || regional_host_rt_readback)
-                                             ? copy_height
-                                             : latest_host_render_target_height_;
+            gpu_tiled_resolve ? gpu_tiled_resolve_bgra
+                              : (used_edram_resolve ? edram_resolved_bgra
+                                                    : (regional_host_rt_readback
+                                                           ? regional_host_rt_bgra
+                                                           : latest_host_render_target_bgra_));
+        uint32_t resolve_source_width =
+            (gpu_tiled_resolve || used_edram_resolve || regional_host_rt_readback)
+                ? copy_width
+                : latest_host_render_target_width_;
+        uint32_t resolve_source_height =
+            (gpu_tiled_resolve || used_edram_resolve || regional_host_rt_readback)
+                ? copy_height
+                : latest_host_render_target_height_;
         uint32_t resolve_source_x =
-            (used_edram_resolve || regional_host_rt_readback) ? 0 : host_source_rect_x;
+            (gpu_tiled_resolve || used_edram_resolve || regional_host_rt_readback)
+                ? 0
+                : host_source_rect_x;
         uint32_t resolve_source_y =
-            (used_edram_resolve || regional_host_rt_readback) ? 0 : host_source_rect_y;
-        bool wrote_host_rt_resolve = WriteBgraToTiledResolveRegion(
-            write_dest_base, dest_pitch, dest_height, resolve_source_bgra, resolve_source_width,
-            resolve_source_height, resolve_source_x, resolve_source_y, rect_x, write_dest_y,
-            copy_width, copy_height, resolve_info.copy_dest_info.copy_dest_endian);
+            (gpu_tiled_resolve || used_edram_resolve || regional_host_rt_readback)
+                ? 0
+                : host_source_rect_y;
+        bool wrote_host_rt_resolve =
+            gpu_tiled_resolve ||
+            WriteBgraToTiledResolveRegion(
+                write_dest_base, dest_pitch, dest_height, resolve_source_bgra, resolve_source_width,
+                resolve_source_height, resolve_source_x, resolve_source_y, rect_x, write_dest_y,
+                copy_width, copy_height, resolve_info.copy_dest_info.copy_dest_endian);
         if (wrote_host_rt_resolve) {
           wrote_source_resolve = true;
           static std::atomic<uint32_t> host_rt_resolve_logs{0};
@@ -4856,10 +4865,12 @@ bool MetalCommandProcessor::IssueCopy() {
             uint8_t clear_g = uint8_t(clear_rgba >> 8);
             uint8_t clear_b = uint8_t(clear_rgba);
             uint8_t clear_a = uint8_t(clear_rgba >> 24);
-            uint32_t clear_target_width =
-                regional_host_rt_readback ? resolve_width : latest_host_render_target_width_;
-            uint32_t clear_target_height =
-                regional_host_rt_readback ? resolve_height : latest_host_render_target_height_;
+            uint32_t clear_target_width = (gpu_tiled_resolve || regional_host_rt_readback)
+                                              ? resolve_width
+                                              : latest_host_render_target_width_;
+            uint32_t clear_target_height = (gpu_tiled_resolve || regional_host_rt_readback)
+                                               ? resolve_height
+                                               : latest_host_render_target_height_;
             uint32_t clear_x = std::min(host_source_rect_x, clear_target_width);
             uint32_t clear_y = std::min(host_source_rect_y, clear_target_height);
             uint32_t clear_width = std::min(copy_width, clear_target_width - clear_x);
@@ -4870,7 +4881,7 @@ bool MetalCommandProcessor::IssueCopy() {
                     clear_y, clear_width, clear_height, double(clear_r) / 255.0,
                     double(clear_g) / 255.0, double(clear_b) / 255.0, double(clear_a) / 255.0,
                     &clear_error)) {
-              if (regional_host_rt_readback) {
+              if (gpu_tiled_resolve || regional_host_rt_readback) {
                 // A rectangular read is exact only inside its source region. Do
                 // not publish the zero-filled staging image as a full CPU mirror.
                 resolve_host_rt->bgra.clear();
@@ -5469,7 +5480,7 @@ bool MetalCommandProcessor::WriteBgraToTiledResolveRegion(
     return false;
   }
   uint32_t aligned_pitch = rex::align(pitch, xenos::kTextureTileWidthHeight);
-  auto write_tiled_pixels = [&](auto&& pack_pixel) {
+  auto write_tiled_pixels = [&](auto&& pack_pixel, auto&& pack_four_pixels) {
     for (uint32_t y = 0; y < write_height; ++y) {
       uint32_t resolved_source_y = source_y + y;
       uint32_t resolved_dest_y = dest_y + y;
@@ -5497,10 +5508,8 @@ bool MetalCommandProcessor::WriteBgraToTiledResolveRegion(
         uint8_t* target_first = dest + tiled_offset;
         uint8_t* target_second = target_first + 32;
         const uint8_t* source = source_row + size_t(resolved_source_x) * 4;
-        for (uint32_t pixel = 0; pixel < 4; ++pixel) {
-          pack_pixel(target_first + size_t(pixel) * 4, source + size_t(pixel) * 4);
-          pack_pixel(target_second + size_t(pixel) * 4, source + size_t(pixel + 4) * 4);
-        }
+        pack_four_pixels(target_first, source);
+        pack_four_pixels(target_second, source + 16);
         x += 8;
       }
       while (x < write_width) {
@@ -5509,39 +5518,59 @@ bool MetalCommandProcessor::WriteBgraToTiledResolveRegion(
     }
   };
   switch (dest_endian) {
-    case xenos::Endian128::k8in16:
-      write_tiled_pixels([](uint8_t* target, const uint8_t* source) {
+    case xenos::Endian128::k8in16: {
+      auto pack_pixel = [](uint8_t* target, const uint8_t* source) {
         target[0] = source[1];
         target[1] = source[2];
         target[2] = source[3];
         target[3] = source[0];
+      };
+      write_tiled_pixels(pack_pixel, [&pack_pixel](uint8_t* target, const uint8_t* source) {
+        for (uint32_t pixel = 0; pixel < 4; ++pixel) {
+          pack_pixel(target + size_t(pixel) * 4, source + size_t(pixel) * 4);
+        }
       });
       break;
-    case xenos::Endian128::k8in32:
-      write_tiled_pixels([](uint8_t* target, const uint8_t* source) {
+    }
+    case xenos::Endian128::k8in32: {
+      auto pack_pixel = [](uint8_t* target, const uint8_t* source) {
         target[0] = source[3];
         target[1] = source[0];
         target[2] = source[1];
         target[3] = source[2];
+      };
+      write_tiled_pixels(pack_pixel, [&pack_pixel](uint8_t* target, const uint8_t* source) {
+        for (uint32_t pixel = 0; pixel < 4; ++pixel) {
+          pack_pixel(target + size_t(pixel) * 4, source + size_t(pixel) * 4);
+        }
       });
       break;
-    case xenos::Endian128::k16in32:
-      write_tiled_pixels([](uint8_t* target, const uint8_t* source) {
+    }
+    case xenos::Endian128::k16in32: {
+      auto pack_pixel = [](uint8_t* target, const uint8_t* source) {
         target[0] = source[0];
         target[1] = source[3];
         target[2] = source[2];
         target[3] = source[1];
+      };
+      write_tiled_pixels(pack_pixel, [&pack_pixel](uint8_t* target, const uint8_t* source) {
+        for (uint32_t pixel = 0; pixel < 4; ++pixel) {
+          pack_pixel(target + size_t(pixel) * 4, source + size_t(pixel) * 4);
+        }
       });
       break;
+    }
     case xenos::Endian128::kNone:
-    default:
-      write_tiled_pixels([](uint8_t* target, const uint8_t* source) {
+    default: {
+      auto pack_pixel = [](uint8_t* target, const uint8_t* source) {
         target[0] = source[2];
         target[1] = source[1];
         target[2] = source[0];
         target[3] = source[3];
-      });
+      };
+      write_tiled_pixels(pack_pixel, PackFourBgraPixelsToGuestRgba);
       break;
+    }
   }
   if (shared_memory_) {
     uint32_t dirty_offset_start =
@@ -5789,7 +5818,8 @@ bool MetalCommandProcessor::CompositeVisibleToResolvedColorBacking(const std::ve
   return copied_pixels != 0;
 }
 
-bool MetalCommandProcessor::WaitForPipelineProbeSubmissions(const char* reason) {
+bool MetalCommandProcessor::WaitForPipelineProbeSubmissions(const char* reason,
+                                                            void* ordered_context) {
   std::unordered_set<void*> contexts;
   auto add_context = [&](void* context) {
     if (context) {
@@ -5809,6 +5839,9 @@ bool MetalCommandProcessor::WaitForPipelineProbeSubmissions(const char* reason) 
   uint32_t pending_context_count = 0;
   std::string first_error;
   for (void* context : contexts) {
+    if (context == ordered_context) {
+      continue;
+    }
     uint32_t pending_submission_count = GetPipelineProbeContextPendingSubmissionCount(context);
     if (!pending_submission_count) {
       continue;
@@ -6487,7 +6520,6 @@ void MetalCommandProcessor::UpdateExactResolvedSurfaceCache(
     uint32_t dest_y, uint32_t write_width, uint32_t write_height, xenos::Endian128 dest_endian) {
   uint32_t tiled_extent =
       texture_util::GetTiledAddressUpperBound2D(pitch, surface_height, pitch, 2);
-  InvalidateExactResolvedSurfaceCache(dest_base, tiled_extent);
 
   // A top-origin, full-pitch write is independently complete for every row it
   // contains. Narrow and offset writes remain on the strict guest decode path.
@@ -6496,31 +6528,44 @@ void MetalCommandProcessor::UpdateExactResolvedSurfaceCache(
       source_y > source_height || pitch > width - source_x ||
       write_height > source_height - source_y || dest_base >= SharedMemory::kBufferSize ||
       tiled_extent > SharedMemory::kBufferSize - dest_base) {
+    InvalidateExactResolvedSurfaceCache(dest_base, tiled_extent);
     return;
   }
   const uint8_t* guest_tiled = memory_->TranslatePhysical<const uint8_t*>(dest_base);
   if (!guest_tiled) {
+    InvalidateExactResolvedSurfaceCache(dest_base, tiled_extent);
     return;
   }
 
-  ExactResolvedSurface candidate;
+  // Reuse the two large allocations across frames. The title writes several
+  // partial bands before its complete resolve, so discarding capacity on every
+  // invalidation causes avoidable multi-megabyte allocator churn.
+  ExactResolvedSurface& candidate = exact_resolved_surface_;
+  candidate.valid = false;
   candidate.base = dest_base;
   candidate.pitch = pitch;
   candidate.bgra_height = write_height;
   candidate.surface_height = surface_height;
   candidate.endian = dest_endian;
   candidate.bgra.resize(size_t(pitch) * write_height * 4);
-  for (uint32_t y = 0; y < write_height; ++y) {
-    const uint8_t* source = bgra.data() + (size_t(source_y + y) * width + source_x) * 4;
-    std::memcpy(candidate.bgra.data() + size_t(y) * pitch * 4, source, size_t(pitch) * 4);
+  size_t packed_row_pitch = size_t(pitch) * 4;
+  if (!source_x && width == pitch) {
+    std::memcpy(candidate.bgra.data(), bgra.data() + size_t(source_y) * packed_row_pitch,
+                packed_row_pitch * write_height);
+  } else {
+    for (uint32_t y = 0; y < write_height; ++y) {
+      const uint8_t* source = bgra.data() + (size_t(source_y + y) * width + source_x) * 4;
+      std::memcpy(candidate.bgra.data() + size_t(y) * packed_row_pitch, source, packed_row_pitch);
+    }
   }
-  candidate.guest_tiled_bytes.assign(guest_tiled, guest_tiled + tiled_extent);
-  exact_resolved_surface_ = std::move(candidate);
+  candidate.guest_tiled_bytes.resize(tiled_extent);
+  std::memcpy(candidate.guest_tiled_bytes.data(), guest_tiled, tiled_extent);
+  candidate.valid = true;
 }
 
 void MetalCommandProcessor::InvalidateExactResolvedSurfaceCache(uint32_t base_physical,
                                                                 uint32_t length) {
-  if (!length || exact_resolved_surface_.guest_tiled_bytes.empty()) {
+  if (!length || !exact_resolved_surface_.valid) {
     return;
   }
   uint64_t write_start = base_physical;
@@ -6530,7 +6575,7 @@ void MetalCommandProcessor::InvalidateExactResolvedSurfaceCache(uint32_t base_ph
   if (write_start >= cache_end || write_end <= cache_start) {
     return;
   }
-  exact_resolved_surface_ = {};
+  exact_resolved_surface_.valid = false;
 }
 
 MetalShader* MetalCommandProcessor::LoadShaderFromCache(xenos::ShaderType shader_type,
@@ -7089,16 +7134,8 @@ bool MetalCommandProcessor::RenderFullscreenPixelShader(MetalShader& pixel_shade
 
   std::vector<std::vector<uint8_t>> texture_storage;
   std::vector<ProbeTextureSlot> texture_slots;
-  std::vector<uint32_t> texture_fetches_by_binding_index =
-      pixel_translation ? GetMslTextureFetchConstantsByBindingIndex(pixel_translation->msl_source())
-                        : std::vector<uint32_t>();
-  if (texture_fetches_by_binding_index.empty()) {
-    const auto& bindings = pixel_shader.GetTextureBindingsAfterTranslation();
-    texture_fetches_by_binding_index.resize(bindings.size(), UINT32_MAX);
-    for (size_t i = 0; i < bindings.size(); ++i) {
-      texture_fetches_by_binding_index[i] = bindings[i].fetch_constant;
-    }
-  }
+  const std::vector<uint32_t>& texture_fetches_by_binding_index =
+      GetMslTextureFetchConstantsByBindingIndex(pixel_translation);
 
   SpirvShaderTranslator::SystemConstants fullscreen_system_constants = system_constants_;
   if (texture_cache_) {
@@ -7215,17 +7252,14 @@ bool MetalCommandProcessor::RenderFullscreenPixelShader(MetalShader& pixel_shade
   }
 
   uint32_t fragment_float_constants_buffer_index =
-      pixel_translation
-          ? FindMslBufferIndex(pixel_translation->msl_source(), "xe_uniform_float_constants")
-          : UINT32_MAX;
+      pixel_translation ? pixel_translation->msl_reflection().float_constants_buffer_index
+                        : UINT32_MAX;
   uint32_t fragment_fetch_constants_buffer_index =
-      pixel_translation
-          ? FindMslBufferIndex(pixel_translation->msl_source(), "xe_uniform_fetch_constants")
-          : UINT32_MAX;
+      pixel_translation ? pixel_translation->msl_reflection().fetch_constants_buffer_index
+                        : UINT32_MAX;
   uint32_t fragment_bool_loop_constants_buffer_index =
-      pixel_translation
-          ? FindMslBufferIndex(pixel_translation->msl_source(), "xe_uniform_bool_loop_constants")
-          : UINT32_MAX;
+      pixel_translation ? pixel_translation->msl_reflection().bool_loop_constants_buffer_index
+                        : UINT32_MAX;
   std::vector<uint32_t> fragment_float_constants =
       PackFloatConstantsForShader(*register_file_, pixel_shader);
   const void* fragment_float_constants_data =
@@ -7371,9 +7405,7 @@ bool MetalCommandProcessor::RenderHostPixelShader(MetalShader& pixel_shader,
   std::vector<HostPixelProbeVertex> probe_vertices;
   probe_vertices.reserve(host_vertex_count);
   bool has_texture_binding = !pixel_shader.GetTextureBindingsAfterTranslation().empty();
-  std::array<uint32_t, VertexExportSink::kInterpolatorCount> interpolator_by_location =
-      pixel_translation ? GetMslPixelInterpolatorByLocation(pixel_translation->msl_source())
-                        : GetMslPixelInterpolatorByLocation(std::string());
+  const auto& interpolator_by_location = GetMslPixelInterpolatorByLocation(pixel_translation);
   for (size_t i = 0; i < host_vertex_count; ++i) {
     const MetalHostVertex& host_vertex = host_vertices[host_vertex_start + i];
     HostPixelProbeVertex& probe_vertex = probe_vertices.emplace_back();
@@ -7413,17 +7445,9 @@ bool MetalCommandProcessor::RenderHostPixelShader(MetalShader& pixel_shader,
 
   std::vector<std::vector<uint8_t>> texture_storage;
   std::vector<ProbeTextureSlot> texture_slots;
-  std::vector<uint32_t> texture_fetches_by_binding_index =
-      !use_host_vertex_color_fragment && !use_fallback_fragment && pixel_translation
-          ? GetMslTextureFetchConstantsByBindingIndex(pixel_translation->msl_source())
-          : std::vector<uint32_t>();
-  if (texture_fetches_by_binding_index.empty()) {
-    const auto& bindings = pixel_shader.GetTextureBindingsAfterTranslation();
-    texture_fetches_by_binding_index.resize(bindings.size(), UINT32_MAX);
-    for (size_t i = 0; i < bindings.size(); ++i) {
-      texture_fetches_by_binding_index[i] = bindings[i].fetch_constant;
-    }
-  }
+  const std::vector<uint32_t>& texture_fetches_by_binding_index =
+      GetMslTextureFetchConstantsByBindingIndex(
+          !use_host_vertex_color_fragment && !use_fallback_fragment ? pixel_translation : nullptr);
 
   SpirvShaderTranslator::SystemConstants host_system_constants = system_constants_;
   if (!use_host_vertex_color_fragment && !use_fallback_fragment && texture_cache_) {
@@ -7524,17 +7548,14 @@ bool MetalCommandProcessor::RenderHostPixelShader(MetalShader& pixel_shader,
   }
 
   uint32_t fragment_float_constants_buffer_index =
-      pixel_translation
-          ? FindMslBufferIndex(pixel_translation->msl_source(), "xe_uniform_float_constants")
-          : UINT32_MAX;
+      pixel_translation ? pixel_translation->msl_reflection().float_constants_buffer_index
+                        : UINT32_MAX;
   uint32_t fragment_fetch_constants_buffer_index =
-      pixel_translation
-          ? FindMslBufferIndex(pixel_translation->msl_source(), "xe_uniform_fetch_constants")
-          : UINT32_MAX;
+      pixel_translation ? pixel_translation->msl_reflection().fetch_constants_buffer_index
+                        : UINT32_MAX;
   uint32_t fragment_bool_loop_constants_buffer_index =
-      pixel_translation
-          ? FindMslBufferIndex(pixel_translation->msl_source(), "xe_uniform_bool_loop_constants")
-          : UINT32_MAX;
+      pixel_translation ? pixel_translation->msl_reflection().bool_loop_constants_buffer_index
+                        : UINT32_MAX;
   std::vector<uint32_t> fragment_float_constants =
       (use_host_vertex_color_fragment || use_fallback_fragment)
           ? std::vector<uint32_t>()
@@ -8326,16 +8347,8 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
         shader.type() == xenos::ShaderType::kVertex ? vertex_modification : pixel_modification;
     auto* translation =
         static_cast<MetalShader::MetalTranslation*>(shader.GetTranslation(shader_modification));
-    std::vector<uint32_t> texture_fetches_by_binding_index =
-        translation ? GetMslTextureFetchConstantsByBindingIndex(translation->msl_source())
-                    : std::vector<uint32_t>();
-    if (texture_fetches_by_binding_index.empty()) {
-      const auto& bindings = shader.GetTextureBindingsAfterTranslation();
-      texture_fetches_by_binding_index.resize(bindings.size(), UINT32_MAX);
-      for (size_t i = 0; i < bindings.size(); ++i) {
-        texture_fetches_by_binding_index[i] = bindings[i].fetch_constant;
-      }
-    }
+    const std::vector<uint32_t>& texture_fetches_by_binding_index =
+        GetMslTextureFetchConstantsByBindingIndex(translation);
     storage.clear();
     slots.clear();
     storage.resize(texture_fetches_by_binding_index.size());
@@ -8480,16 +8493,16 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
   }
   uint32_t fragment_float_constants_buffer_index =
       pixel_shader_translation
-          ? FindMslBufferIndex(pixel_shader_translation->msl_source(), "xe_uniform_float_constants")
+          ? pixel_shader_translation->msl_reflection().float_constants_buffer_index
           : UINT32_MAX;
   uint32_t fragment_fetch_constants_buffer_index =
       pixel_shader_translation
-          ? FindMslBufferIndex(pixel_shader_translation->msl_source(), "xe_uniform_fetch_constants")
+          ? pixel_shader_translation->msl_reflection().fetch_constants_buffer_index
           : UINT32_MAX;
   uint32_t fragment_bool_loop_constants_buffer_index =
-      pixel_shader_translation ? FindMslBufferIndex(pixel_shader_translation->msl_source(),
-                                                    "xe_uniform_bool_loop_constants")
-                               : UINT32_MAX;
+      pixel_shader_translation
+          ? pixel_shader_translation->msl_reflection().bool_loop_constants_buffer_index
+          : UINT32_MAX;
   std::vector<uint32_t> vertex_float_constants =
       PackFloatConstantsForShader(*register_file_, vertex_shader);
   std::vector<uint32_t> fragment_float_constants =
@@ -9499,11 +9512,11 @@ bool MetalCommandProcessor::DecodeSwapTextureToBgra(uint32_t fallback_frontbuffe
   const uint8_t* exact_guest =
       exact.base ? memory_->TranslatePhysical<const uint8_t*>(exact.base) : nullptr;
   bool exact_cache_hit =
-      fetch.tiled && fetch_pitch >= width && exact_guest && base_physical == exact.base &&
-      last_copy_dest_base_ == exact.base && fetch_pitch == exact.pitch &&
-      uint32_t(fetch.endianness) == uint32_t(exact.endian) && exact.bgra_height >= height &&
-      exact.bgra.size() >= size_t(exact.pitch) * height * 4 && required_tiled_extent &&
-      exact.guest_tiled_bytes.size() >= required_tiled_extent &&
+      exact.valid && fetch.tiled && fetch_pitch >= width && exact_guest &&
+      base_physical == exact.base && last_copy_dest_base_ == exact.base &&
+      fetch_pitch == exact.pitch && uint32_t(fetch.endianness) == uint32_t(exact.endian) &&
+      exact.bgra_height >= height && exact.bgra.size() >= size_t(exact.pitch) * height * 4 &&
+      required_tiled_extent && exact.guest_tiled_bytes.size() >= required_tiled_extent &&
       std::memcmp(exact_guest, exact.guest_tiled_bytes.data(), required_tiled_extent) == 0;
   if (exact_cache_hit) {
     bgra_out.resize(size_t(width) * height * 4);

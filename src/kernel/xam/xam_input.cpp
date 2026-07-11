@@ -19,6 +19,8 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xtypes.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -40,15 +42,30 @@ constexpr uint32_t XINPUT_FLAG_ANY_USER = 1 << 30;
 
 bool IsGoldenEyeAutoStartPressed(const char* mode, uint32_t state_call) {
   // Preserve the original startup hold used to clear the legal screens. The
-  // periodic diagnostic adds short, edge-triggered retries after a release
-  // gap so an unattended run can leave the title's attract loop.
-  if (state_call >= 20 && state_call < 600) {
+  // periodic diagnostic uses wall-clock windows so renderer performance does
+  // not change when Start edges occur during an unattended run.
+  bool periodic = std::strcmp(mode, "periodic") == 0;
+  bool menu = std::strcmp(mode, "menu") == 0;
+  if (!periodic && !menu) {
+    return state_call >= 20 && state_call < 600;
+  }
+  static const auto started_at = std::chrono::steady_clock::now();
+  uint64_t elapsed_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - started_at)
+                                     .count());
+  if (elapsed_ms >= 200 && elapsed_ms < 1200) {
     return true;
   }
-  if (std::strcmp(mode, "periodic") != 0 || state_call < 720) {
+  if (elapsed_ms < 2000) {
     return false;
   }
-  return ((state_call - 720) % 600) < 20;
+  // The third retry ends at 14.25 seconds. Stop the menu diagnostic before the
+  // fourth retry at 20 seconds, which can immediately leave a fast-loading
+  // dossier menu after the clock and renderer performance fixes.
+  if (menu && elapsed_ms >= 19000) {
+    return false;
+  }
+  return ((elapsed_ms - 2000) % 6000) < 250;
 }
 
 rex::input::InputSystem* input_system() {
@@ -132,16 +149,15 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
   X_RESULT result = is->GetState(actual_user_index, input_state);
   const char* auto_start_mode = std::getenv("GOLDENEYE_AUTO_START");
   if (result == X_ERROR_SUCCESS && input_state && auto_start_mode) {
-    static uint32_t auto_start_state_calls = 0;
-    ++auto_start_state_calls;
-    if (IsGoldenEyeAutoStartPressed(auto_start_mode, auto_start_state_calls)) {
-      input_state->gamepad.buttons = uint16_t(input_state->gamepad.buttons) |
-                                     uint16_t(rex::input::X_INPUT_GAMEPAD_START);
-      static bool logged_auto_start = false;
-      if (!logged_auto_start) {
-        logged_auto_start = true;
-        std::fprintf(stderr,
-                     "[xam] GOLDENEYE_AUTO_START=%s injecting Start via XamInputGetState\n",
+    static std::atomic<uint32_t> auto_start_state_calls{0};
+    uint32_t state_call = auto_start_state_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (IsGoldenEyeAutoStartPressed(auto_start_mode, state_call)) {
+      input_state->gamepad.buttons =
+          uint16_t(input_state->gamepad.buttons) | uint16_t(rex::input::X_INPUT_GAMEPAD_START);
+      static std::atomic<bool> logged_auto_start{false};
+      bool expected = false;
+      if (logged_auto_start.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+        std::fprintf(stderr, "[xam] GOLDENEYE_AUTO_START=%s injecting Start via XamInputGetState\n",
                      auto_start_mode);
         std::fflush(stderr);
       }

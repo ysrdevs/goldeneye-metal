@@ -176,4 +176,33 @@ bool MetalSharedMemory::CommitGuestCpuWriteAsGpu(uint32_t start, uint32_t length
   return true;
 }
 
+bool MetalSharedMemory::CommitGpuBufferWriteToGuest(uint32_t start, uint32_t length) {
+  if (!length || start >= kBufferSize || !buffer_) {
+    return false;
+  }
+  length = std::min(length, kBufferSize - start);
+
+  uint8_t* guest_destination = memory().TranslatePhysical<uint8_t*>(start);
+  id<MTLBuffer> gpu_buffer = (id<MTLBuffer>)buffer_;
+  const uint8_t* buffer_contents = reinterpret_cast<const uint8_t*>([gpu_buffer contents]);
+  if (!guest_destination || !buffer_contents) {
+    return false;
+  }
+
+  // The producer helper waits for its command buffer before reaching here.
+  // Drain every other context that may still reference shared memory before
+  // publishing the new bytes and invalidating its cached consumers.
+  if (!SynchronizeBeforeHostResourceMutation()) {
+    return false;
+  }
+
+  // Publish and protect before copying. TranslatePhysical returns the physical
+  // bypass mapping, so this host memcpy does not trip the guest write watch;
+  // a concurrent guest write through a virtual alias does and leaves the
+  // shared range invalid for the next RequestRange.
+  RangeWrittenByGpu(start, length);
+  std::memcpy(guest_destination, buffer_contents + start, length);
+  return true;
+}
+
 }  // namespace rex::graphics::metal

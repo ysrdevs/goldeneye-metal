@@ -7,9 +7,9 @@ backend, and game integration in one tree.
 > [!WARNING]
 > The macOS build is not playable yet. The native title path now runs continuously and presents
 > a recognizable main menu through the real Metal draw, resolve, and swap path, but interactive
-> gameplay and complete fixed-function fidelity have not been verified. Startup is measurably
-> faster than the original synchronous path, but later title and menu pacing remains far below a
-> playable frame rate.
+> gameplay and complete fixed-function fidelity have not been verified. Corrected-clock 1280x720
+> captures on an Apple M3 Ultra showed 30.0 and 59.9 guest frames per second at the dossier menu;
+> those are short menu-path samples, not evidence of sustained 60 FPS or performant gameplay.
 
 ## Project status
 
@@ -34,13 +34,23 @@ queues instead of blocking the CPU after every draw: each command buffer carries
 with at most four retained batches and a 256-draw safety drain. Regional private-texture readback,
 ordered queued clears, and an exact resolved-surface swap cache reduce avoidable synchronization
 and transfer work while preserving guest-memory validation and the true tiled surface extent.
-Explicit fences still protect readback, resolves, shared-resource mutation, swaps, and teardown.
-Those fixes produce a clean classification screen, the complete gun-barrel sequence, a shaded
-animated gold RARE logo, and a recognizable dossier-style main menu. A representative fixed early
-checkpoint improved from 14.43 seconds to approximately 10.5 seconds, about 27%, although runtime
-timings vary and the later menu remains far from playable. The next known gaps are culling,
-depth/stencil, true guest MSAA behavior, native macOS input, and sustained pacing on the route to
-first playable output.
+Texture-source fingerprints avoid redundant decode and upload work after coarse guest-memory
+invalidations, immutable MSL reflection removes repeated shader-source scans from draw delivery,
+and reusable Metal upload arenas replace per-draw constant and vertex-buffer allocation. Explicit
+fences still protect readback, resolves, shared-resource mutation, swaps, and teardown. The macOS
+clock now reports the same nanosecond unit used by its tick counter, so guest time and the native
+FPS overlay are no longer scaled by the timer's hardware resolution. Those fixes produce a clean
+classification screen, the complete gun-barrel sequence, a shaded animated gold RARE logo, and a
+recognizable dossier-style main menu. On an Apple M3 Ultra, corrected-clock 1280x720 menu captures
+reported 30.0 and 59.9 guest-delivered frames per second in different short intervals. The next
+known gaps are culling, depth/stencil, true guest MSAA behavior, native macOS input, and validation
+of correct, sustained performance through the menu and after entering gameplay.
+
+The presenter FPS overlay is enabled by default and measures completed guest front-buffer
+deliveries, not host window repaints. Set `REX_METAL_SHOW_FPS=false` to hide it. An experimental
+GPU tiled-resolve path is available for investigation with
+`GOLDENEYE_METAL_GPU_TILED_RESOLVE=1`, but remains disabled by default because it has not
+outperformed the current CPU path.
 
 See [the native Metal status report](docs/GOLDENEYE_NATIVE_METAL_PROJECT_STATUS.md) for the exact
 milestones, evidence, and next development priority.

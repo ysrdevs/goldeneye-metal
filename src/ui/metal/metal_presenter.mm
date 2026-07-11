@@ -4,17 +4,23 @@
 #import <QuartzCore/CAMetalLayer.h>
 
 #include <rex/cvar.h>
+#include <rex/chrono/clock.h>
 #include <rex/logging.h>
 #include <rex/ui/surface.h>
 #include <rex/ui/surface_macos.h>
 
 #include <algorithm>
+#include <array>
+#include <cstdio>
 #include <cstring>
+#include <limits>
 #include <utility>
 
 REXCVAR_DEFINE_BOOL(metal_presenter_clear_test, false, "UI/Metal",
                     "Submit a simple Metal clear/present command for presentation smoke testing")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(metal_show_fps, true, "UI/Metal",
+                    "Show the guest frame rate in the Metal output");
 
 namespace rex::ui::metal {
 namespace {
@@ -47,6 +53,58 @@ fragment float4 guest_present_ps(VertexOut in [[stage_in]],
   return guest_texture.sample(guest_sampler, in.uv);
 }
 )";
+
+constexpr std::array<uint8_t, 7> kFpsGlyphSpace = {};
+constexpr std::array<uint8_t, 7> kFpsGlyphDot = {0b00000, 0b00000, 0b00000, 0b00000,
+                                                 0b00000, 0b00110, 0b00110};
+constexpr std::array<uint8_t, 7> kFpsGlyphF = {0b11111, 0b10000, 0b10000, 0b11110,
+                                               0b10000, 0b10000, 0b10000};
+constexpr std::array<uint8_t, 7> kFpsGlyphP = {0b11110, 0b10001, 0b10001, 0b11110,
+                                               0b10000, 0b10000, 0b10000};
+constexpr std::array<uint8_t, 7> kFpsGlyphS = {0b01111, 0b10000, 0b10000, 0b01110,
+                                               0b00001, 0b00001, 0b11110};
+constexpr std::array<std::array<uint8_t, 7>, 10> kFpsDigitGlyphs = {{
+    {0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110},
+    {0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110},
+    {0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111},
+    {0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110},
+    {0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010},
+    {0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110},
+    {0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110},
+    {0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000},
+    {0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110},
+    {0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110},
+}};
+
+const std::array<uint8_t, 7>& GetFpsGlyph(char character) {
+  if (character >= '0' && character <= '9') {
+    return kFpsDigitGlyphs[size_t(character - '0')];
+  }
+  switch (character) {
+    case 'F':
+      return kFpsGlyphF;
+    case 'P':
+      return kFpsGlyphP;
+    case 'S':
+      return kFpsGlyphS;
+    case '.':
+      return kFpsGlyphDot;
+    default:
+      return kFpsGlyphSpace;
+  }
+}
+
+bool GetPackedBgraLayout(uint32_t width, uint32_t height, size_t& row_pitch_out, size_t& size_out) {
+  if (!width || !height) {
+    return false;
+  }
+  row_pitch_out = size_t(width) * 4;
+  if (size_t(height) > std::numeric_limits<size_t>::max() / row_pitch_out) {
+    return false;
+  }
+  size_out = row_pitch_out * height;
+  return true;
+}
 
 class MetalGuestOutputRefreshContext final : public Presenter::GuestOutputRefreshContext {
  public:
@@ -105,19 +163,129 @@ bool MetalPresenter::CaptureGuestOutput(RawImage& image_out) {
 
 void MetalPresenter::UpdateGuestFrontbuffer(uint32_t width, uint32_t height, const void* pixels,
                                             size_t row_pitch) {
-  if (!width || !height || !pixels || row_pitch < size_t(width) * 4) {
+  size_t packed_pitch = 0;
+  size_t packed_size = 0;
+  if (!pixels || !GetPackedBgraLayout(width, height, packed_pitch, packed_size) ||
+      row_pitch < packed_pitch) {
     return;
   }
 
   std::lock_guard<std::mutex> lock(guest_frame_mutex_);
   guest_frame_width_ = width;
   guest_frame_height_ = height;
-  size_t packed_pitch = size_t(width) * 4;
-  guest_frame_bgra_.resize(packed_pitch * height);
+  guest_frame_bgra_.resize(packed_size);
   auto* dst = guest_frame_bgra_.data();
   auto* src = static_cast<const uint8_t*>(pixels);
   for (uint32_t y = 0; y < height; ++y) {
     std::memcpy(dst + size_t(y) * packed_pitch, src + size_t(y) * row_pitch, packed_pitch);
+  }
+  FinalizeGuestFrameLocked();
+}
+
+void MetalPresenter::UpdateGuestFrontbuffer(uint32_t width, uint32_t height,
+                                            std::vector<uint8_t>&& packed_bgra) {
+  size_t packed_pitch = 0;
+  size_t packed_size = 0;
+  if (!GetPackedBgraLayout(width, height, packed_pitch, packed_size) ||
+      packed_bgra.size() < packed_size) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(guest_frame_mutex_);
+  guest_frame_bgra_ = std::move(packed_bgra);
+  guest_frame_bgra_.resize(packed_size);
+  guest_frame_width_ = width;
+  guest_frame_height_ = height;
+  FinalizeGuestFrameLocked();
+}
+
+void MetalPresenter::FinalizeGuestFrameLocked() {
+  uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+  uint64_t tick_frequency = rex::chrono::Clock::QueryHostTickFrequency();
+  if (!guest_fps_sample_start_tick_ || now < guest_fps_sample_start_tick_) {
+    guest_fps_sample_start_tick_ = now;
+    guest_fps_sample_frame_count_ = 0;
+  } else {
+    ++guest_fps_sample_frame_count_;
+    uint64_t elapsed = now - guest_fps_sample_start_tick_;
+    if (tick_frequency && elapsed >= tick_frequency / 2) {
+      guest_fps_ = double(guest_fps_sample_frame_count_) * double(tick_frequency) / double(elapsed);
+      guest_fps_sample_start_tick_ = now;
+      guest_fps_sample_frame_count_ = 0;
+    }
+  }
+
+  if (REXCVAR_GET(metal_show_fps)) {
+    DrawGuestFpsOverlayLocked();
+  }
+  ++guest_frame_generation_;
+}
+
+void MetalPresenter::DrawGuestFpsOverlayLocked() {
+  if (!guest_frame_width_ || !guest_frame_height_ ||
+      guest_frame_bgra_.size() < size_t(guest_frame_width_) * guest_frame_height_ * 4) {
+    return;
+  }
+
+  char label[16];
+  double displayed_fps = std::min(guest_fps_, 999.9);
+  int label_length = std::snprintf(label, sizeof(label), "FPS %.1f", displayed_fps);
+  if (label_length <= 0) {
+    return;
+  }
+  size_t character_count = std::min<size_t>(size_t(label_length), sizeof(label) - 1);
+  uint32_t scale = guest_frame_width_ >= 960 && guest_frame_height_ >= 540
+                       ? 3
+                       : (guest_frame_width_ >= 480 && guest_frame_height_ >= 270 ? 2 : 1);
+  constexpr uint32_t kGlyphWidth = 5;
+  constexpr uint32_t kGlyphHeight = 7;
+  uint32_t padding = scale * 2;
+  uint32_t character_advance = (kGlyphWidth + 1) * scale;
+  uint32_t label_width =
+      character_count ? uint32_t(character_count) * character_advance - scale : 0;
+  uint32_t box_width = label_width + padding * 2;
+  uint32_t box_height = kGlyphHeight * scale + padding * 2;
+  if (box_width > guest_frame_width_ || box_height > guest_frame_height_) {
+    return;
+  }
+  uint32_t box_x =
+      guest_frame_width_ - box_width - std::min(padding, guest_frame_width_ - box_width);
+  uint32_t box_y = std::min(padding, guest_frame_height_ - box_height);
+
+  for (uint32_t y = box_y; y < box_y + box_height; ++y) {
+    uint8_t* row = guest_frame_bgra_.data() + size_t(y) * guest_frame_width_ * 4;
+    for (uint32_t x = box_x; x < box_x + box_width; ++x) {
+      uint8_t* pixel = row + size_t(x) * 4;
+      pixel[0] = uint8_t(uint32_t(pixel[0]) * 3 / 10);
+      pixel[1] = uint8_t(uint32_t(pixel[1]) * 3 / 10);
+      pixel[2] = uint8_t(uint32_t(pixel[2]) * 3 / 10);
+      pixel[3] = 0xFF;
+    }
+  }
+
+  uint32_t text_x = box_x + padding;
+  uint32_t text_y = box_y + padding;
+  for (size_t character_index = 0; character_index < character_count; ++character_index) {
+    const auto& glyph = GetFpsGlyph(label[character_index]);
+    uint32_t glyph_x = text_x + uint32_t(character_index) * character_advance;
+    for (uint32_t glyph_y = 0; glyph_y < kGlyphHeight; ++glyph_y) {
+      for (uint32_t glyph_x_offset = 0; glyph_x_offset < kGlyphWidth; ++glyph_x_offset) {
+        if (!(glyph[glyph_y] & (1u << (kGlyphWidth - 1 - glyph_x_offset)))) {
+          continue;
+        }
+        for (uint32_t scale_y = 0; scale_y < scale; ++scale_y) {
+          uint8_t* row = guest_frame_bgra_.data() +
+                         size_t(text_y + glyph_y * scale + scale_y) * guest_frame_width_ * 4;
+          for (uint32_t scale_x = 0; scale_x < scale; ++scale_x) {
+            uint8_t* pixel = row + size_t(glyph_x + glyph_x_offset * scale + scale_x) * 4;
+            pixel[0] = 0xFF;
+            pixel[1] = 0xFF;
+            pixel[2] = 0xFF;
+            pixel[3] = 0xFF;
+          }
+        }
+      }
+    }
   }
 }
 
@@ -246,13 +414,15 @@ Presenter::PaintResult MetalPresenter::PaintAndPresentImpl(bool execute_ui_drawe
           guest_texture_ = [(id<MTLDevice>)metal_device_ newTextureWithDescriptor:texture_desc];
           guest_texture_width_ = guest_frame_width_;
           guest_texture_height_ = guest_frame_height_;
+          guest_texture_generation_ = 0;
         }
-        if (guest_texture_) {
+        if (guest_texture_ && guest_texture_generation_ != guest_frame_generation_) {
           MTLRegion region = MTLRegionMake2D(0, 0, guest_frame_width_, guest_frame_height_);
           [(id<MTLTexture>)guest_texture_ replaceRegion:region
                                             mipmapLevel:0
                                               withBytes:guest_frame_bgra_.data()
                                             bytesPerRow:size_t(guest_frame_width_) * 4];
+          guest_texture_generation_ = guest_frame_generation_;
         }
       }
     }

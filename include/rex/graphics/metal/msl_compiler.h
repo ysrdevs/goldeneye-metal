@@ -59,6 +59,29 @@ struct ProbeColorTargetState {
   uint32_t blend_control = 0x00010001;
 };
 
+struct ProbeTiledResolveTarget {
+  // Existing caller-owned id<MTLBuffer>. The helper does not retain it after
+  // returning, and the buffer must use CPU-visible shared storage if the caller
+  // intends to consume the resolved bytes on the CPU.
+  void* metal_buffer = nullptr;
+  // Byte offset of the start of the tiled surface in metal_buffer.
+  size_t buffer_offset = 0;
+  uint32_t pitch = 0;
+  uint32_t height = 0;
+  uint32_t x = 0;
+  uint32_t y = 0;
+  // xenos::Endian128 values supported by 32bpp resolves: kNone, k8in16,
+  // k8in32, and k16in32 (0 through 3).
+  uint32_t endian = 0;
+};
+
+struct PipelineProbeUploadStats {
+  uint64_t buffer_allocation_count = 0;
+  uint64_t buffer_allocation_bytes = 0;
+  uint64_t suballocation_count = 0;
+  uint64_t suballocation_bytes = 0;
+};
+
 void* CreateMslLibrary(void* metal_device, const std::string& source, std::string* error_out);
 void ReleaseMslLibrary(void* metal_library);
 bool ValidateMslSource(void* metal_device, const std::string& source, std::string* error_out);
@@ -80,6 +103,9 @@ bool WaitPipelineProbeContext(void* context, std::string* error_out,
 // Counts encoded draw submissions, including draws in the currently open
 // encoder and metadata for committed command buffers (not command-buffer count).
 uint32_t GetPipelineProbeContextPendingSubmissionCount(void* context);
+// Returns cumulative statistics for the reusable per-command-buffer upload
+// arenas used by persistent draws. Primarily useful for diagnostics and tests.
+bool GetPipelineProbeContextUploadStats(void* context, PipelineProbeUploadStats* stats_out);
 bool ClearPipelineProbeContext(void* context, uint32_t width, uint32_t height, double red,
                                double green, double blue, double alpha, std::string* error_out);
 bool ClearPipelineProbeContextRect(void* context, uint32_t width, uint32_t height, uint32_t x,
@@ -121,6 +147,21 @@ bool ReadPipelineProbeContext(void* context, uint32_t width, uint32_t height,
 bool ReadPipelineProbeContextRect(void* context, uint32_t width, uint32_t height, uint32_t x,
                                   uint32_t y, uint32_t read_width, uint32_t read_height,
                                   std::vector<uint8_t>& bgra_out, std::string* error_out);
+// Resolves a BGRA8 rectangle from the persistent render texture into an
+// externally owned MTLBuffer using the exact Xenos 32bpp tiled layout. Pending
+// render work, the texture-to-staging blit, and the compute conversion are
+// ordered on the context's queue and completed with one CPU wait. Like Read,
+// this is a fence even when metadata or bounds are invalid. If bgra_out is not
+// null, it receives the same rectangle as tightly packed raw BGRA bytes;
+// otherwise no CPU-side output vector is allocated or copied. If a submitted
+// Metal command fails, the destination may be partially modified even though
+// this returns false, so callers must invalidate or restore the target range.
+bool ResolvePipelineProbeContextToXenosTiled(void* context, uint32_t width, uint32_t height,
+                                             uint32_t source_x, uint32_t source_y,
+                                             uint32_t resolve_width, uint32_t resolve_height,
+                                             const ProbeTiledResolveTarget& destination,
+                                             std::vector<uint8_t>* bgra_out,
+                                             std::string* error_out);
 bool RenderPipelineProbe(
     void* metal_device, void* pipeline_state, const void* system_constants,
     size_t system_constants_size, const void* float_constants, size_t float_constants_size,

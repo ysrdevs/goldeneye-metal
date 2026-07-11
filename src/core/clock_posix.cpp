@@ -16,6 +16,8 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 
 namespace rex::chrono {
 
+constexpr uint64_t kNanosecondsPerSecond = 1000000000ull;
+
 #if defined(CLOCK_MONOTONIC_RAW)
 constexpr clockid_t kHostMonotonicClock = CLOCK_MONOTONIC_RAW;
 #else
@@ -23,13 +25,11 @@ constexpr clockid_t kHostMonotonicClock = CLOCK_MONOTONIC;
 #endif
 
 uint64_t Clock::host_tick_frequency_platform() {
-  timespec res;
-  int error = clock_getres(kHostMonotonicClock, &res);
-  assert_zero(error);
-  assert_zero(res.tv_sec);  // Sub second resolution is required.
-
-  // Convert nano seconds to hertz. Resolution is 1ns on most systems.
-  return 1000000000ull / res.tv_nsec;
+  // host_tick_count_platform returns an absolute count expressed in
+  // nanoseconds. clock_getres describes the clock's precision, not the units
+  // of that count; using it as the frequency under-reports time by 42x on
+  // current macOS, where CLOCK_MONOTONIC_RAW has 42 ns resolution.
+  return kNanosecondsPerSecond;
 }
 
 uint64_t Clock::host_tick_count_platform() {
@@ -37,7 +37,7 @@ uint64_t Clock::host_tick_count_platform() {
   int error = clock_gettime(kHostMonotonicClock, &tp);
   assert_zero(error);
 
-  return tp.tv_nsec + tp.tv_sec * 1000000000ull;
+  return tp.tv_nsec + tp.tv_sec * kNanosecondsPerSecond;
 }
 
 uint64_t Clock::QueryHostSystemTime() {

@@ -76,7 +76,10 @@ class MetalCommandProcessor final : public CommandProcessor {
       xenos::PrimitiveType prim_type, uint32_t index_count, bool host_render_target_debug = false,
       const PrimitiveProcessor::ProcessingResult* primitive_processing_result = nullptr);
   struct HostRenderTarget;
-  bool WaitForPipelineProbeSubmissions(const char* reason);
+  // Drains every persistent context except ordered_context. Work on the
+  // excluded context may be followed by a same-queue operation that provides
+  // the required ordering and completion fence itself.
+  bool WaitForPipelineProbeSubmissions(const char* reason, void* ordered_context = nullptr);
   void* GetActiveHostRenderTargetContext() const {
     return host_render_target_context_override_ ? host_render_target_context_override_
                                                 : host_render_target_context_;
@@ -233,6 +236,10 @@ class MetalCommandProcessor final : public CommandProcessor {
   struct ExactResolvedSurface {
     std::vector<uint8_t> bgra;
     std::vector<uint8_t> guest_tiled_bytes;
+    // Invalidation keeps the allocations so the title's repeated partial-band
+    // writes don't free and reallocate roughly 7.5 MiB before every complete
+    // resolve. Only a fully republished surface may be used by swap.
+    bool valid = false;
     uint32_t base = 0;
     uint32_t pitch = 0;
     uint32_t bgra_height = 0;
@@ -317,6 +324,9 @@ class MetalCommandProcessor final : public CommandProcessor {
   uint64_t async_probe_submission_count_ = 0;
   uint64_t async_probe_wait_count_ = 0;
   uint64_t async_probe_waited_submission_count_ = 0;
+  uint64_t gpu_tiled_resolve_count_ = 0;
+  uint64_t gpu_tiled_resolve_pixel_count_ = 0;
+  uint64_t gpu_tiled_resolve_fallback_count_ = 0;
   uint32_t host_pixel_draws_this_swap_ = 0;
   uint32_t host_fallback_pixel_draws_this_swap_ = 0;
   uint32_t host_pixel_skipped_vertices_this_swap_ = 0;

@@ -21,6 +21,7 @@ class MetalPresenter final : public Presenter {
   bool CaptureGuestOutput(RawImage& image_out) override;
   void UpdateGuestFrontbuffer(uint32_t width, uint32_t height, const void* pixels,
                               size_t row_pitch);
+  void UpdateGuestFrontbuffer(uint32_t width, uint32_t height, std::vector<uint8_t>&& packed_bgra);
 
  private:
   MetalPresenter(void* metal_device, HostGpuLossCallback host_gpu_loss_callback);
@@ -35,6 +36,8 @@ class MetalPresenter final : public Presenter {
                               bool& is_8bpc_out_ref) override;
   PaintResult PaintAndPresentImpl(bool execute_ui_drawers) override;
   bool EnsureGuestPipeline();
+  void FinalizeGuestFrameLocked();
+  void DrawGuestFpsOverlayLocked();
 
   void* metal_device_ = nullptr;
   void* command_queue_ = nullptr;
@@ -47,6 +50,11 @@ class MetalPresenter final : public Presenter {
   std::vector<uint8_t> guest_frame_bgra_;
   uint32_t guest_frame_width_ = 0;
   uint32_t guest_frame_height_ = 0;
+  uint64_t guest_frame_generation_ = 0;
+  uint64_t guest_texture_generation_ = 0;
+  uint64_t guest_fps_sample_start_tick_ = 0;
+  uint32_t guest_fps_sample_frame_count_ = 0;
+  double guest_fps_ = 0.0;
 };
 
 }  // namespace rex::ui::metal

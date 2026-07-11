@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -767,9 +768,10 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
     // rexglue CP worker thread -- which is the very thread that must advance the
     // ring read pointer / swap counter to satisfy (a)/(b). Result: the fence
     // never advances, the spin never exits = freeze (visual stops, audio thread
-    // keeps running on its own core). Yield here while still waiting so the CP
-    // worker reliably gets CPU and can finish the frame.
-    std::this_thread::yield();
+    // keeps running on its own core). Back off briefly while still waiting so
+    // the CP worker reliably gets CPU without millions of scheduler yields per
+    // second. The requested 50 us interval is far below a frame interval.
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
   }
 
   // The title owns its presented counter and device skip bits. The command
@@ -1542,15 +1544,29 @@ constexpr uint16_t BTN_DPAD_UP = 0x0001, BTN_DPAD_DOWN = 0x0002, BTN_DPAD_LEFT =
 
 bool ge_auto_start_pressed(const char* mode, uint32_t input_poll) {
   // Keep the existing startup hold intact. In periodic mode, follow it with
-  // short retries separated by a full release interval so the title observes
-  // fresh Start edges while cycling through its attract sequence.
-  if (input_poll >= 20 && input_poll < 600) {
+  // monotonic-time retries so renderer speed cannot shift the input edges.
+  bool periodic = std::strcmp(mode, "periodic") == 0;
+  bool menu = std::strcmp(mode, "menu") == 0;
+  if (!periodic && !menu) {
+    return input_poll >= 20 && input_poll < 600;
+  }
+  static const auto started_at = std::chrono::steady_clock::now();
+  uint64_t elapsed_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - started_at)
+                                     .count());
+  if (elapsed_ms >= 200 && elapsed_ms < 1200) {
     return true;
   }
-  if (std::strcmp(mode, "periodic") != 0 || input_poll < 720) {
+  if (elapsed_ms < 2000) {
     return false;
   }
-  return ((input_poll - 720) % 600) < 20;
+  // The third retry ends at 14.25 seconds. Stop the menu diagnostic before the
+  // fourth retry at 20 seconds, which can immediately leave a fast-loading
+  // dossier menu after the clock and renderer performance fixes.
+  if (menu && elapsed_ms >= 19000) {
+    return false;
+  }
+  return ((elapsed_ms - 2000) % 6000) < 250;
 }
 
 bool ge_input_active() {  // keyboard counts only when focused + not in the menu
@@ -1665,15 +1681,15 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   if (REXCVAR_GET(ge_mouselook_enable))
     ge_mouse_camera(base);
 
-  static uint32_t auto_start_poll = 0;
+  static std::atomic<uint32_t> auto_start_poll{0};
   const char* auto_start_mode = std::getenv("GOLDENEYE_AUTO_START");
   if (auto_start_mode) {
-    ++auto_start_poll;
-    if (ge_auto_start_pressed(auto_start_mode, auto_start_poll)) {
+    uint32_t input_poll = auto_start_poll.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (ge_auto_start_pressed(auto_start_mode, input_poll)) {
       ST16(base, GE_PAD0 + 0, LD16(base, GE_PAD0 + 0) | BTN_START);
-      static bool logged_auto_start = false;
-      if (!logged_auto_start) {
-        logged_auto_start = true;
+      static std::atomic<bool> logged_auto_start{false};
+      bool expected = false;
+      if (logged_auto_start.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
         std::fprintf(stderr, "[ge] GOLDENEYE_AUTO_START=%s injecting Start\n", auto_start_mode);
         std::fflush(stderr);
       }

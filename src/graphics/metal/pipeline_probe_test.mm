@@ -29,11 +29,14 @@ using rex::graphics::metal::CreateMslLibrary;
 using rex::graphics::metal::CreatePipelineProbeContext;
 using rex::graphics::metal::CreateRenderPipelineState;
 using rex::graphics::metal::GetPipelineProbeContextPendingSubmissionCount;
+using rex::graphics::metal::GetPipelineProbeContextUploadStats;
+using rex::graphics::metal::PipelineProbeUploadStats;
 using rex::graphics::metal::ProbeColorTargetState;
 using rex::graphics::metal::ProbeIndexBuffer;
 using rex::graphics::metal::ProbeRasterizationState;
 using rex::graphics::metal::ProbeSamplerSlot;
 using rex::graphics::metal::ProbeTextureSlot;
+using rex::graphics::metal::ProbeTiledResolveTarget;
 using rex::graphics::metal::QueuePipelineProbeContextClearRect;
 using rex::graphics::metal::ReadPipelineProbeContext;
 using rex::graphics::metal::ReadPipelineProbeContextRect;
@@ -42,6 +45,7 @@ using rex::graphics::metal::ReleasePipelineProbeContext;
 using rex::graphics::metal::ReleaseRenderPipelineState;
 using rex::graphics::metal::RenderPipelineProbeToContext;
 using rex::graphics::metal::ResetPipelineProbeContext;
+using rex::graphics::metal::ResolvePipelineProbeContextToXenosTiled;
 using rex::graphics::metal::WaitPipelineProbeContext;
 
 constexpr uint32_t kWidth = 40;
@@ -86,6 +90,64 @@ bool PixelNear(const uint8_t* bgra, const std::array<uint8_t, 4>& expected, uint
     int difference = int(bgra[i]) - int(expected[i]);
     if (difference < -int(tolerance) || difference > int(tolerance)) {
       return false;
+    }
+  }
+  return true;
+}
+
+void StoreExpectedTiledPixel(uint8_t* destination, const uint8_t* bgra, uint32_t endian) {
+  switch (endian) {
+    case 1:
+      destination[0] = bgra[1];
+      destination[1] = bgra[2];
+      destination[2] = bgra[3];
+      destination[3] = bgra[0];
+      break;
+    case 2:
+      destination[0] = bgra[3];
+      destination[1] = bgra[0];
+      destination[2] = bgra[1];
+      destination[3] = bgra[2];
+      break;
+    case 3:
+      destination[0] = bgra[0];
+      destination[1] = bgra[3];
+      destination[2] = bgra[2];
+      destination[3] = bgra[1];
+      break;
+    default:
+      destination[0] = bgra[2];
+      destination[1] = bgra[1];
+      destination[2] = bgra[0];
+      destination[3] = bgra[3];
+      break;
+  }
+}
+
+uint32_t GetExpectedTiledRgba8Offset(uint32_t x, uint32_t y, uint32_t pitch) {
+  pitch = (pitch + 31u) & ~31u;
+  uint32_t macro = ((x >> 5u) + (y >> 5u) * (pitch >> 5u)) << 9u;
+  uint32_t micro = ((x & 7u) + ((y & 14u) << 2u)) << 2u;
+  uint32_t offset = macro + ((micro & ~15u) << 1u) + (micro & 15u) + ((y & 1u) << 4u);
+  return ((offset & ~511u) << 3u) + ((y & 16u) << 7u) + ((offset & 448u) << 2u) +
+         (((((y & 8u) >> 2u) + (x >> 3u)) & 3u) << 6u) + (offset & 63u);
+}
+
+bool ApplyExpectedTiledRect(std::vector<uint8_t>& expected, size_t buffer_offset,
+                            uint32_t destination_pitch, uint32_t destination_x,
+                            uint32_t destination_y, const uint8_t* source_bgra,
+                            uint32_t source_width, uint32_t copy_width, uint32_t copy_height,
+                            uint32_t endian) {
+  for (uint32_t y = 0; y < copy_height; ++y) {
+    for (uint32_t x = 0; x < copy_width; ++x) {
+      uint32_t tiled_offset =
+          GetExpectedTiledRgba8Offset(destination_x + x, destination_y + y, destination_pitch);
+      size_t target_offset = buffer_offset + tiled_offset;
+      if (target_offset > expected.size() || expected.size() - target_offset < 4) {
+        return false;
+      }
+      const uint8_t* source = source_bgra + (size_t(y) * source_width + x) * 4;
+      StoreExpectedTiledPixel(expected.data() + target_offset, source, endian);
     }
   }
   return true;
@@ -409,6 +471,15 @@ int RunPipelineProbeTest() {
       return render_indexed_fan_to_context(context, draw_pipeline_state, draw_texture, kWidth,
                                            kHeight);
     };
+    auto render_uploaded_indexed_fan = [&](const std::array<float, 8>& positions) {
+      return RenderPipelineProbeToContext(
+          context, pipeline_state, kUnusedSystemConstants.data(), sizeof(kUnusedSystemConstants),
+          nullptr, 0, nullptr, 0, nullptr, 0, nullptr, nullptr, 0, 0, &texture, 1, 1,
+          /*primitive_type=TriangleList=*/4, uint32_t(kFanIndices.size()), kWidth, kHeight, &error,
+          /*vertex_shared_memory_buffer_index=*/UINT32_MAX, UINT32_MAX, UINT32_MAX, nullptr, 0,
+          UINT32_MAX, UINT32_MAX, nullptr, &sampler, positions.data(), sizeof(positions),
+          /*vertex_data_buffer_index=*/3, nullptr, 0, UINT32_MAX, UINT32_MAX, &fan_index_buffer);
+    };
 
     // Host render targets use private Metal storage. Their regional readback
     // must enqueue the blit behind pending draws and fence both with one wait.
@@ -428,13 +499,132 @@ int RunPipelineProbeTest() {
     for (size_t pixel = 0; pixel < 16 && private_region_ok; ++pixel) {
       private_region_ok = PixelNear(private_region_bgra.data() + pixel * 4, kExpectedBgra);
     }
+
+    // Resolve the private render target directly into an external shared Metal
+    // buffer. Compare the entire buffer, not just written texels, so source and
+    // destination origins, Xenos tiled addressing, every endian mapping, and
+    // untouched-byte preservation are all checked together.
+    constexpr uint32_t kTiledPitch = 64;
+    constexpr uint32_t kTiledHeight = 64;
+    constexpr size_t kTiledBufferSize = 32 * 1024;
+    constexpr size_t kFullTiledBufferOffset = 512;
+    constexpr size_t kPartialTiledBufferOffset = 256;
+    id<MTLBuffer> tiled_buffer = [device newBufferWithLength:kTiledBufferSize
+                                                     options:MTLResourceStorageModeShared];
+    bool tiled_rendered =
+        private_region_ok && tiled_buffer &&
+        render_indexed_fan_to_context(private_context, pipeline_state, &texture, kWidth, kHeight);
+    uint32_t tiled_pending_before = GetPipelineProbeContextPendingSubmissionCount(private_context);
+    uint32_t tiled_pending_after_first = UINT32_MAX;
+    uint32_t tiled_case_count = 0;
+    bool tiled_resolve_ok = tiled_rendered && tiled_pending_before == 1;
+    for (uint32_t endian = 0; endian < 4 && tiled_resolve_ok; ++endian) {
+      uint8_t full_sentinel = uint8_t(0xC0 + endian);
+      std::memset([tiled_buffer contents], full_sentinel, kTiledBufferSize);
+      ProbeTiledResolveTarget full_target;
+      full_target.metal_buffer = tiled_buffer;
+      full_target.buffer_offset = kFullTiledBufferOffset;
+      full_target.pitch = kTiledPitch;
+      full_target.height = kTiledHeight;
+      full_target.endian = endian;
+      std::vector<uint8_t> full_bgra;
+      bool full_resolved = ResolvePipelineProbeContextToXenosTiled(
+          private_context, kWidth, kHeight, 0, 0, kWidth, kHeight, full_target, &full_bgra, &error);
+      if (endian == 0) {
+        tiled_pending_after_first = GetPipelineProbeContextPendingSubmissionCount(private_context);
+      }
+      std::vector<uint8_t> full_expected(kTiledBufferSize, full_sentinel);
+      bool full_expected_valid =
+          full_resolved && full_bgra == indexed_bgra &&
+          ApplyExpectedTiledRect(full_expected, kFullTiledBufferOffset, kTiledPitch, 0, 0,
+                                 full_bgra.data(), kWidth, kWidth, kHeight, endian);
+      bool full_matches =
+          full_expected_valid &&
+          std::memcmp([tiled_buffer contents], full_expected.data(), kTiledBufferSize) == 0;
+
+      uint8_t partial_sentinel = uint8_t(0xA0 + endian);
+      std::memset([tiled_buffer contents], partial_sentinel, kTiledBufferSize);
+      ProbeTiledResolveTarget partial_target;
+      partial_target.metal_buffer = tiled_buffer;
+      partial_target.buffer_offset = kPartialTiledBufferOffset;
+      partial_target.pitch = kTiledPitch;
+      partial_target.height = kTiledHeight;
+      partial_target.x = 7;
+      partial_target.y = 9;
+      partial_target.endian = endian;
+      bool partial_resolved = ResolvePipelineProbeContextToXenosTiled(
+          private_context, kWidth, kHeight, 18, 18, 4, 4, partial_target,
+          /*bgra_out=*/nullptr, &error);
+      std::vector<uint8_t> partial_expected(kTiledBufferSize, partial_sentinel);
+      const uint8_t* partial_source = indexed_bgra.data() + (size_t(18) * kWidth + 18) * 4;
+      bool partial_expected_valid =
+          partial_resolved &&
+          ApplyExpectedTiledRect(partial_expected, kPartialTiledBufferOffset, kTiledPitch, 7, 9,
+                                 partial_source, kWidth, 4, 4, endian);
+      bool partial_matches =
+          partial_expected_valid &&
+          std::memcmp([tiled_buffer contents], partial_expected.data(), kTiledBufferSize) == 0;
+      tiled_resolve_ok = full_matches && partial_matches;
+      tiled_case_count += full_matches ? 1 : 0;
+      tiled_case_count += partial_matches ? 1 : 0;
+    }
+    tiled_resolve_ok = tiled_resolve_ok && tiled_pending_after_first == 0 && tiled_case_count == 8;
+
+    // Invalid metadata is still a synchronization boundary: pending render
+    // work must retire without changing the destination or returning stale CPU
+    // output.
+    bool invalid_tiled_rendered =
+        tiled_resolve_ok &&
+        render_indexed_fan_to_context(private_context, pipeline_state, &texture, kWidth, kHeight);
+    uint32_t invalid_tiled_pending_before =
+        GetPipelineProbeContextPendingSubmissionCount(private_context);
+    constexpr uint8_t kInvalidTiledSentinel = 0x7D;
+    if (tiled_buffer) {
+      std::memset([tiled_buffer contents], kInvalidTiledSentinel, kTiledBufferSize);
+    }
+    ProbeTiledResolveTarget invalid_target;
+    invalid_target.metal_buffer = tiled_buffer;
+    invalid_target.buffer_offset = kPartialTiledBufferOffset;
+    invalid_target.pitch = kTiledPitch;
+    invalid_target.height = kTiledHeight;
+    invalid_target.x = kTiledPitch - 1;
+    std::vector<uint8_t> invalid_tiled_bgra(16, 0xFF);
+    std::string invalid_tiled_error;
+    bool invalid_tiled_rejected =
+        invalid_tiled_rendered && !ResolvePipelineProbeContextToXenosTiled(
+                                      private_context, kWidth, kHeight, 18, 18, 4, 4,
+                                      invalid_target, &invalid_tiled_bgra, &invalid_tiled_error);
+    uint32_t invalid_tiled_pending_after =
+        GetPipelineProbeContextPendingSubmissionCount(private_context);
+    const uint8_t* invalid_tiled_bytes =
+        tiled_buffer ? static_cast<const uint8_t*>([tiled_buffer contents]) : nullptr;
+    bool invalid_tiled_unchanged = invalid_tiled_bytes != nullptr;
+    for (size_t i = 0; i < kTiledBufferSize && invalid_tiled_unchanged; ++i) {
+      invalid_tiled_unchanged = invalid_tiled_bytes[i] == kInvalidTiledSentinel;
+    }
+    bool invalid_tiled_ok = invalid_tiled_rendered && invalid_tiled_pending_before == 1 &&
+                            invalid_tiled_rejected && invalid_tiled_pending_after == 0 &&
+                            invalid_tiled_bgra.empty() && !invalid_tiled_error.empty() &&
+                            invalid_tiled_unchanged;
+    tiled_resolve_ok = tiled_resolve_ok && invalid_tiled_ok;
+    if (tiled_buffer) {
+      [tiled_buffer release];
+    }
     ReleasePipelineProbeContext(private_context);
-    if (!private_region_ok) {
+    if (!private_region_ok || !tiled_resolve_ok) {
       std::fprintf(stderr,
                    "[metal_pipeline_probe_test] FAIL: private regional readback rendered=%d "
-                   "pending=%u read=%d pending_after=%u bytes=%zu: %s\n",
+                   "pending=%u read=%d pending_after=%u bytes=%zu; "
+                   "tiled=(rendered=%d pending=%u pending_after=%u cases=%u) "
+                   "invalid=(rendered=%d pending=%u rejected=%d pending_after=%u bytes=%zu "
+                   "unchanged=%d error=%s): %s\n",
                    int(private_rendered), private_pending_before, int(private_region_read),
-                   private_pending_after, private_region_bgra.size(), error.c_str());
+                   private_pending_after, private_region_bgra.size(), int(tiled_rendered),
+                   tiled_pending_before, tiled_pending_after_first, tiled_case_count,
+                   int(invalid_tiled_rendered), invalid_tiled_pending_before,
+                   int(invalid_tiled_rejected), invalid_tiled_pending_after,
+                   invalid_tiled_bgra.size(), int(invalid_tiled_unchanged),
+                   invalid_tiled_error.c_str(), error.c_str());
       [fan_metal_index_buffer release];
       [fan_position_buffer release];
       ReleasePipelineProbeContext(context);
@@ -525,34 +715,68 @@ int RunPipelineProbeTest() {
 
     // Draw 64 closes the first shared encoder / command buffer without losing
     // submission metadata. Four committed 64-draw buffers (256 draws total)
-    // trigger the bounded drain.
-    bool cap_submissions_ok = clear_drain_ok;
+    // trigger the bounded drain. Positions and indices are supplied as CPU
+    // data here, exercising three upload-arena suballocations per draw (system
+    // constants, vertices, indices). Each command buffer draws a different
+    // quadrant so recycling an arena before GPU completion is visible.
+    constexpr std::array<std::array<float, 8>, 4> kUploadQuadrants = {{
+        {-0.9f, -0.9f, -0.1f, -0.9f, -0.1f, -0.1f, -0.9f, -0.1f},
+        {0.1f, -0.9f, 0.9f, -0.9f, 0.9f, -0.1f, 0.1f, -0.1f},
+        {-0.9f, 0.1f, -0.1f, 0.1f, -0.1f, 0.9f, -0.9f, 0.9f},
+        {0.1f, 0.1f, 0.9f, 0.1f, 0.9f, 0.9f, 0.1f, 0.9f},
+    }};
+    PipelineProbeUploadStats upload_stats_before;
+    bool upload_stats_before_ok = GetPipelineProbeContextUploadStats(context, &upload_stats_before);
+    bool cap_submissions_ok = clear_drain_ok && upload_stats_before_ok;
     for (uint32_t i = 0; i < 63 && cap_submissions_ok; ++i) {
-      cap_submissions_ok = render_indexed_fan(pipeline_state, &texture);
+      cap_submissions_ok = render_uploaded_indexed_fan(kUploadQuadrants[0]);
     }
     uint32_t pending_after_63 = GetPipelineProbeContextPendingSubmissionCount(context);
-    bool submission_64_ok = cap_submissions_ok && render_indexed_fan(pipeline_state, &texture);
+    bool submission_64_ok = cap_submissions_ok && render_uploaded_indexed_fan(kUploadQuadrants[0]);
     uint32_t pending_after_64 = GetPipelineProbeContextPendingSubmissionCount(context);
-    bool submission_65_ok = submission_64_ok && render_indexed_fan(pipeline_state, &texture);
+    bool submission_65_ok = submission_64_ok && render_uploaded_indexed_fan(kUploadQuadrants[1]);
     uint32_t pending_after_65 = GetPipelineProbeContextPendingSubmissionCount(context);
     bool submissions_to_255_ok = submission_65_ok;
     for (uint32_t submitted = 65; submitted < 255 && submissions_to_255_ok; ++submitted) {
-      submissions_to_255_ok = render_indexed_fan(pipeline_state, &texture);
+      submissions_to_255_ok = render_uploaded_indexed_fan(kUploadQuadrants[submitted / 64]);
     }
     uint32_t pending_after_255 = GetPipelineProbeContextPendingSubmissionCount(context);
-    bool submission_256_ok = submissions_to_255_ok && render_indexed_fan(pipeline_state, &texture);
+    bool submission_256_ok =
+        submissions_to_255_ok && render_uploaded_indexed_fan(kUploadQuadrants[3]);
     uint32_t pending_after_256 = GetPipelineProbeContextPendingSubmissionCount(context);
-    bool submission_257_ok = submission_256_ok && render_indexed_fan(pipeline_state, &texture);
+    std::vector<uint8_t> upload_quadrants_bgra;
+    bool upload_quadrants_read =
+        submission_256_ok &&
+        ReadPipelineProbeContext(context, kWidth, kHeight, upload_quadrants_bgra, &error);
+    bool upload_quadrants_ok =
+        upload_quadrants_read && upload_quadrants_bgra.size() == size_t(kWidth) * kHeight * 4;
+    for (uint32_t y : {uint32_t(10), uint32_t(30)}) {
+      for (uint32_t x : {uint32_t(10), uint32_t(30)}) {
+        upload_quadrants_ok =
+            upload_quadrants_ok &&
+            PixelNear(upload_quadrants_bgra.data() + (size_t(y) * kWidth + x) * 4, kExpectedBgra);
+      }
+    }
+    bool submission_257_ok = upload_quadrants_ok && render_uploaded_indexed_fan(kFanPositions);
     uint32_t pending_after_257 = GetPipelineProbeContextPendingSubmissionCount(context);
     uint32_t explicitly_waited = UINT32_MAX;
     bool explicit_wait_ok =
         submission_257_ok && WaitPipelineProbeContext(context, &error, &explicitly_waited);
     uint32_t pending_after_explicit_wait = GetPipelineProbeContextPendingSubmissionCount(context);
+    PipelineProbeUploadStats upload_stats_after;
+    bool upload_stats_after_ok = GetPipelineProbeContextUploadStats(context, &upload_stats_after);
+    uint64_t upload_buffer_allocation_delta =
+        upload_stats_after.buffer_allocation_count - upload_stats_before.buffer_allocation_count;
+    uint64_t upload_suballocation_delta =
+        upload_stats_after.suballocation_count - upload_stats_before.suballocation_count;
+    bool upload_reuse_ok = upload_stats_after_ok && upload_buffer_allocation_delta <= 4 &&
+                           upload_suballocation_delta == 257 * 3;
     bool cap_ok = cap_submissions_ok && pending_after_63 == 63 && submission_64_ok &&
                   pending_after_64 == 64 && submission_65_ok && pending_after_65 == 65 &&
                   submissions_to_255_ok && pending_after_255 == 255 && submission_256_ok &&
                   pending_after_256 == 0 && submission_257_ok && pending_after_257 == 1 &&
-                  explicit_wait_ok && explicitly_waited == 1 && pending_after_explicit_wait == 0;
+                  explicit_wait_ok && explicitly_waited == 1 && pending_after_explicit_wait == 0 &&
+                  upload_quadrants_ok && upload_reuse_ok;
 
     // Read is a fence even when its requested size is wrong and no pixels can
     // be returned. This catches validation-before-drain ordering regressions.
@@ -656,6 +880,7 @@ int RunPipelineProbeTest() {
           "[metal_pipeline_probe_test] FAIL: async lifecycle: %s "
           "clear=(%d,%u,%d,%u) batch=(%d,%u,%d,%u,%d,%u) "
           "cap=(%d,%u,%d,%u,%d,%u,%d,%u,%u) "
+          "upload=(quadrants=%d reuse=%d buffers=%llu suballocations=%llu) "
           "invalid_read=(%d,%u,%d,%u,%s) "
           "resize=(%d,%u,%d,%u,%d,%u) release=(%d,%u,%s) null_wait=(%d,%u,%s)\n",
           error.c_str(), int(clear_drain_rendered), clear_pending_before, int(clear_drain_cleared),
@@ -663,11 +888,14 @@ int RunPipelineProbeTest() {
           pending_after_64, int(submission_65_ok), pending_after_65, int(submissions_to_255_ok),
           pending_after_255, int(submission_256_ok), pending_after_256, int(submission_257_ok),
           pending_after_257, int(explicit_wait_ok), explicitly_waited, pending_after_explicit_wait,
-          int(invalid_read_rendered), invalid_read_pending_before, int(invalid_read_rejected),
-          invalid_read_pending_after, invalid_read_error.c_str(), int(resize_old_rendered),
-          resize_old_pending, int(resize_new_rendered), resize_new_pending, int(resize_read),
-          resize_pending_after_read, int(release_rendered), release_pending,
-          release_context_error.c_str(), int(null_wait_ok), null_waited, null_wait_error.c_str());
+          int(upload_quadrants_ok), int(upload_reuse_ok),
+          static_cast<unsigned long long>(upload_buffer_allocation_delta),
+          static_cast<unsigned long long>(upload_suballocation_delta), int(invalid_read_rendered),
+          invalid_read_pending_before, int(invalid_read_rejected), invalid_read_pending_after,
+          invalid_read_error.c_str(), int(resize_old_rendered), resize_old_pending,
+          int(resize_new_rendered), resize_new_pending, int(resize_read), resize_pending_after_read,
+          int(release_rendered), release_pending, release_context_error.c_str(), int(null_wait_ok),
+          null_waited, null_wait_error.c_str());
       return 1;
     }
 
@@ -675,8 +903,12 @@ int RunPipelineProbeTest() {
                  "[metal_pipeline_probe_test] PASS: external MTLBuffer rasterized %zu sentinel "
                  "pixels; indexed fan remap rasterized %zu; scissor clipped its right half "
                  "(%zu clear); ordered multi-draw batch, R/B write mask, 64-draw command buffers, "
-                 "256-draw drain cap, resize, explicit wait, and release drains matched\n",
-                 textured_pixels, indexed_textured_pixels, clear_pixels);
+                 "256-draw drain cap, four upload-arena lifetimes, %llu reusable buffers for "
+                 "%llu suballocations, resize, explicit wait, and release drains matched; "
+                 "%u GPU tiled resolve cases plus invalid-input fencing matched\n",
+                 textured_pixels, indexed_textured_pixels, clear_pixels,
+                 static_cast<unsigned long long>(upload_buffer_allocation_delta),
+                 static_cast<unsigned long long>(upload_suballocation_delta), tiled_case_count);
     return 0;
   }
 }
