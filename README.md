@@ -6,7 +6,8 @@ backend, and game integration in one tree.
 
 > [!WARNING]
 > The macOS build is not playable yet. The native title path now runs continuously and presents
-> a recognizable animated RARE splash, but it has not reached a correct menu or playable game.
+> a recognizable main menu through the real Metal draw, resolve, and swap path, but interactive
+> gameplay and complete fixed-function fidelity have not been verified.
 
 ## Project status
 
@@ -26,16 +27,17 @@ place. Metal now consumes guest DMA, converted, and built-in index buffers throu
 draws, preserves the guest alpha test, and applies live viewport, scissor, blend, blend-constant,
 and per-channel color-write state. Current single-sample host contexts assemble the observed title
 sequence's three resolve bands described by its 4xMSAA layout through the normal `IssueCopy` and
-`IssueSwap` route. Those fixes produce a clean classification screen and shaded, animated gold
-RARE logo. The next known fidelity gaps are culling, depth/stencil, and true guest MSAA behavior;
-the incomplete post-RARE splash still needs focused diagnosis.
+`IssueSwap` route. Those fixes produce a clean classification screen, the complete gun-barrel
+sequence, a shaded animated gold RARE logo, and a recognizable dossier-style main menu. The next
+known fidelity gaps are culling, depth/stencil, true guest MSAA behavior, native macOS input, and
+submission performance on the route to first playable output.
 
 See [the native Metal status report](docs/GOLDENEYE_NATIVE_METAL_PROJECT_STATUS.md) for the exact
 milestones, evidence, and next development priority.
 
 | Platform | Status |
 | --- | --- |
-| macOS on Apple Silicon | Active development; builds and diagnostics work, game rendering is not playable |
+| macOS on Apple Silicon | Active development; strict Metal rendering reaches the main menu, but gameplay is not verified |
 | Windows | Existing backend code is present; this repository's current changes are not verified there |
 | Linux | Existing backend code is present; this repository's current changes are not verified there |
 
@@ -110,8 +112,13 @@ and the companion title data:
   --gpu metal
 ```
 
-These commands build the current prototype; they do not imply playable output. More diagnostics,
-test targets, and troubleshooting notes are in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+The macOS window backend does not yet forward keyboard events to the guest. Add
+`--input_backend sdl` when testing with a compatible controller; use the opt-in unattended input
+diagnostic documented in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for repeatable menu captures.
+
+These commands build the current menu-reaching prototype; they do not imply playable output. More
+diagnostics, test targets, and troubleshooting notes are in
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ## Game-data policy
 
@@ -121,10 +128,10 @@ is responsible for supplying compatible files they are legally authorized to use
 
 ## Contributing
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change. The immediate priority is a
-correct title/menu frame with faithful depth/stencil, culling, and MSAA state: no synthetic
-geometry, replacement shaders, guessed command buffers, or heuristic presentation may count as
-completion evidence.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change. The immediate priority is stable
+interactive menu navigation and first gameplay with faithful culling, depth/stencil, and MSAA
+state: no synthetic geometry, replacement shaders, guessed command buffers, or heuristic
+presentation may count as completion evidence.
 
 ## Licensing and trademarks
 

@@ -55,13 +55,20 @@ to the CP.
 
 In bounded runs with scavenging, replay, forced presentation, and replacement rendering disabled,
 WPTR progressed beyond 1088, the Metal primary-ring worker passed batch 192, and normal
-`IssueSwap` reached at least 320. The same path produces the classification screen and animated
-RARE splash from real title shaders, vertex and index data, textures, constants, resolves, and
-swaps. The classification screen is readable across the full 1280x720 output, and the later gold
-RARE logo is shaded, animated, and presented from the current live render target. This is no longer
-dependent on retaining a stale nonzero CPU readback. It does not yet satisfy the full
-strict-success definition because culling, depth/stencil, and guest MSAA fidelity remain
-incomplete, and it is not yet the target menu.
+`IssueSwap` reached at least 1408. The same path now produces the classification screen, complete
+gun-barrel sequence, animated RARE splash, and dossier-style main menu from real title shaders,
+vertex and index data, textures, constants, resolves, and swaps. The classification screen is
+readable across the full 1280x720 output, the gold RARE logo is shaded and animated, and presenter
+frame 1344 is a recognizable main menu with the portrait, crest, numbered options, selected row,
+help text, and page treatment intact. These frames come from the current live render target rather
+than a retained stale readback.
+
+The menu proving run used `GOLDENEYE_AUTO_START=periodic`, an input-only diagnostic that injects
+ordinary guest Start-button edges after release gaps. It does not replace graphics, alter PM4,
+force presentation, or bypass resolves. The captured menu therefore satisfies the strict rendering
+provenance requirements for the first target milestone. It does not establish playable output:
+culling, depth/stencil, and guest MSAA fidelity remain incomplete, normal macOS keyboard delivery
+is absent, and navigation into gameplay has not been verified.
 
 The decisive geometry fault was discarded index delivery. A four-vertex title triangle fan was
 converted correctly by `PrimitiveProcessor` to the six indices `(1,2,0,2,3,0)`, but Metal issued
@@ -88,6 +95,12 @@ R/B write mask. With those states enabled, swap 5 is a clean readable classifica
 swaps 64, 128, and 192 show successive views of the gold rotating RARE logo through current-context
 copies.
 
+The former post-RARE visual blocker was not a corrupt frame: the paired white discs are authored
+geometry that opens the gun-barrel sequence. Bounded captures follow the discs across the screen,
+show the barrel artwork and walking character, complete the red fade, rotate through the RARE
+splash, and reach the main menu after a later Start edge. The first menu milestone is therefore no
+longer blocked on that sequence.
+
 ### Working foundations
 
 - Native macOS window, Metal layer, device, presenter, and swap integration
@@ -105,6 +118,8 @@ copies.
 - Standalone `metal_pipeline_probe_test` for external-buffer and array-texture delivery
 - Indexed fan-remap, scissor, source-alpha blend, and partial-write-mask regression coverage in
   `metal_pipeline_probe_test`
+- Recognizable main-menu presentation through real title draws, guest-visible resolves, and normal
+  `IssueSwap`
 
 ### Milestones
 
@@ -112,10 +127,10 @@ copies.
 | --- | --- | --- |
 | A. Controlled resolve diagnostic | Passed | Magenta resolve reaches the destination and presentation path |
 | B. Controlled render-target diagnostic | Passed | A solid Metal render target survives readback and resolve |
-| C. Real producer content | Recognizable partial result | Real title shaders and resources produce a readable classification screen and shaded animated RARE logo; depth/stencil and culling remain incomplete |
+| C. Real producer content | Passed for the first menu target | Real title shaders and resources produce the classification, gun-barrel and RARE sequences, then a recognizable main menu; depth/stencil and culling remain incomplete |
 | D. Guest-visible resolve | Passed for current producer | Nonzero producer output reaches the guest buffer and normal presenter |
-| E. Recognizable menu | Not reached | A recognizable title-driven splash is working, but no correct menu frame has been produced |
-| F. Sustained title execution | Passed | WPTR >1088 and normal `IssueSwap` 320 without scavenging or replay |
+| E. Recognizable menu | Passed | Presenter frame 1344 contains the real dossier-style main menu through the strict draw/resolve/swap path |
+| F. Sustained title execution | Passed | WPTR >1088 and normal `IssueSwap` at least 1408 without scavenging, replay, or forced presentation |
 
 ## Primary blocker
 
@@ -124,28 +139,34 @@ and pixel stages agree on interpolator locations, packed float/bool/fetch consta
 array textures and samplers are bound, processed indices are consumed, and the title splash is
 recognizable.
 
-The remaining blocker is the next layer of fixed-function fidelity. Live viewport/scissor, current
-host-context ownership, the observed banded copy sequence, the title's two blend modes, blend
-constants, and per-channel write masks are now active and verified within the current producer
-path. Culling/front-face selection, shared depth/stencil ownership, and true guest MSAA behavior
-are still absent. The title advances past the classification screen and through the RARE animation;
-the next splash begins, but its current output is incomplete and the target menu has not been
-reached. Those missing states are the next known fidelity gaps, not yet a proven singular cause of
-the splash failure. Missing game data remains a separate launch problem and must not be diagnosed
-as a renderer failure.
+The first-menu rendering blocker is resolved. The next boundary is stable, interactive navigation
+from that menu into the first gameplay scene. The current macOS window backend does not forward
+keyboard key-down/key-up events to the guest, so unattended verification uses the opt-in periodic
+Start diagnostic and normal users need a supported controller backend. That is sufficient for a
+rendering proof, but not for a usable application.
+
+The remaining graphics risk is the next layer of fixed-function fidelity. Live viewport/scissor,
+current host-context ownership, the observed banded copy sequence, the title's two blend modes,
+blend constants, and per-channel write masks are active and verified. Culling/front-face selection,
+shared depth/stencil ownership, and true guest MSAA behavior are still absent and are likely to
+matter more in gameplay than in the mostly layered 2D menu. The Metal probe path also submits and
+waits one command buffer per draw, making long validation runs much slower than the guest's intended
+pacing. Missing game data remains a separate launch problem and must not be diagnosed as a renderer
+failure.
 
 ## Next development priority
 
 Work in this order:
 
-1. Apply guest cull/front-face state and add focused regression coverage.
-2. Build shared depth/stencil ownership and depth/stencil clear behavior for persistent Metal
+1. Wire normal macOS keyboard events into the input path or validate the SDL controller route, then
+   navigate the real menu into the first mission without automated selection.
+2. Apply guest cull/front-face state and add focused regression coverage before judging 3D scenes.
+3. Build shared depth/stencil ownership and depth/stencil clear behavior for persistent Metal
    render targets.
-3. Replace the current single-sample host approximation with faithful guest MSAA ownership and
+4. Replace the current single-sample host approximation with faithful guest MSAA ownership and
    resolve behavior.
-4. Diagnose the incomplete post-RARE splash, then advance to a correct title/menu frame through the
-   normal `IssueCopy` and `IssueSwap` path.
-5. Audit pacing, input, and long-run stability once the frame is visually correct.
+5. Batch Metal probe submissions safely, with synchronization at readback and shared-resource
+   mutation boundaries, then audit pacing and long-run stability.
 
 Do not restore heuristic command scavenging or direct presentation shortcuts. The real ring and
 normal `XE_SWAP` path now provide the authoritative evidence needed to debug production.

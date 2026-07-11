@@ -1413,6 +1413,19 @@ constexpr uint16_t BTN_DPAD_UP = 0x0001, BTN_DPAD_DOWN = 0x0002, BTN_DPAD_LEFT =
                    BTN_RSHOULDER = 0x0200, BTN_A = 0x1000, BTN_B = 0x2000, BTN_X = 0x4000,
                    BTN_Y = 0x8000;
 
+bool ge_auto_start_pressed(const char* mode, uint32_t input_poll) {
+  // Keep the existing startup hold intact. In periodic mode, follow it with
+  // short retries separated by a full release interval so the title observes
+  // fresh Start edges while cycling through its attract sequence.
+  if (input_poll >= 20 && input_poll < 600) {
+    return true;
+  }
+  if (std::strcmp(mode, "periodic") != 0 || input_poll < 720) {
+    return false;
+  }
+  return ((input_poll - 720) % 600) < 20;
+}
+
 bool ge_input_active() {  // keyboard counts only when focused + not in the menu
   return !g_mouselook_suppressed.load(std::memory_order_relaxed) && ge_game_has_focus();
 }
@@ -1518,14 +1531,16 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   if (REXCVAR_GET(ge_mouselook_enable)) ge_mouse_camera(base);
 
   static uint32_t auto_start_poll = 0;
-  if (std::getenv("GOLDENEYE_AUTO_START")) {
+  const char* auto_start_mode = std::getenv("GOLDENEYE_AUTO_START");
+  if (auto_start_mode) {
     ++auto_start_poll;
-    if (auto_start_poll >= 20 && auto_start_poll < 600) {
+    if (ge_auto_start_pressed(auto_start_mode, auto_start_poll)) {
       ST16(base, GE_PAD0 + 0, LD16(base, GE_PAD0 + 0) | BTN_START);
       static bool logged_auto_start = false;
       if (!logged_auto_start) {
         logged_auto_start = true;
-        std::fprintf(stderr, "[ge] GOLDENEYE_AUTO_START pulsing Start\n");
+        std::fprintf(stderr, "[ge] GOLDENEYE_AUTO_START=%s injecting Start\n",
+                     auto_start_mode);
         std::fflush(stderr);
       }
     }

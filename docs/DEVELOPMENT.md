@@ -82,12 +82,14 @@ require an external `powerpc-none-elf` binutils toolchain. Enable them explicitl
 cmake --preset macos-arm64-release -DREXGLUE_BUILD_PPC_TESTS=ON
 ```
 
-## Metal diagnostics
+## Runtime and Metal diagnostics
 
 Diagnostics are opt-in so normal runs do not write files or substitute success criteria.
 
 | Environment variable | Effect |
 | --- | --- |
+| `GOLDENEYE_AUTO_START=1` | Hold Start during the initial input window to skip startup screens |
+| `GOLDENEYE_AUTO_START=periodic` | Keep the initial hold, then issue short Start retries separated by release gaps for unattended title/menu runs |
 | `GOLDENEYE_METAL_DUMP_SHADERS=1` | Write translated/failed MSL and selected microcode dumps under `/tmp` |
 | `GOLDENEYE_METAL_DUMP_FRAMES=1` | Write selected BGRA frame stages as PPM files under `/tmp` |
 | `GOLDENEYE_METAL_SUBMISSION_DIAGNOSTICS=1` | Log rate-limited kickoff, flush, and VdSwap metadata without replaying it |
@@ -96,6 +98,11 @@ Diagnostics are opt-in so normal runs do not write files or substitute success c
 | `GOLDENEYE_METAL_PIPELINE_PROBE=1` | Exercise pipeline-probe diagnostics |
 | `GOLDENEYE_METAL_HOST_RT_SOLID_TEST=1` | Run the controlled solid render-target test |
 | `GOLDENEYE_METAL_MAGENTA_RESOLVE=1` | Run the controlled resolve visibility test |
+
+`GOLDENEYE_AUTO_START=periodic` changes input only: it preserves the initial Start hold, then emits
+short retries after full release intervals so unattended runs can cross title gates. It does not
+replace rendering or presentation. Pair it with `GOLDENEYE_METAL_DUMP_FRAMES=1` when collecting a
+menu checkpoint, and keep all resulting game-content captures outside the repository.
 
 Other host-pixel and fallback flags in the code are experiments. Results produced with them must be
 labelled as diagnostics and must not be reported as strict-path rendering success.

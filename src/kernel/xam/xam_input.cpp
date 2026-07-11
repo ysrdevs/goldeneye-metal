@@ -21,6 +21,7 @@
 
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
@@ -36,6 +37,19 @@ using rex::input::X_INPUT_VIBRATION;
 
 constexpr uint32_t XINPUT_FLAG_GAMEPAD = 0x01;
 constexpr uint32_t XINPUT_FLAG_ANY_USER = 1 << 30;
+
+bool IsGoldenEyeAutoStartPressed(const char* mode, uint32_t state_call) {
+  // Preserve the original startup hold used to clear the legal screens. The
+  // periodic diagnostic adds short, edge-triggered retries after a release
+  // gap so an unattended run can leave the title's attract loop.
+  if (state_call >= 20 && state_call < 600) {
+    return true;
+  }
+  if (std::strcmp(mode, "periodic") != 0 || state_call < 720) {
+    return false;
+  }
+  return ((state_call - 720) % 600) < 20;
+}
 
 rex::input::InputSystem* input_system() {
   return static_cast<rex::input::InputSystem*>(REX_KERNEL_STATE()->emulator()->input_system());
@@ -116,16 +130,19 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
 
   auto* is = input_system();
   X_RESULT result = is->GetState(actual_user_index, input_state);
-  if (result == X_ERROR_SUCCESS && input_state && std::getenv("GOLDENEYE_AUTO_START")) {
+  const char* auto_start_mode = std::getenv("GOLDENEYE_AUTO_START");
+  if (result == X_ERROR_SUCCESS && input_state && auto_start_mode) {
     static uint32_t auto_start_state_calls = 0;
     ++auto_start_state_calls;
-    if (auto_start_state_calls >= 20 && auto_start_state_calls < 600) {
+    if (IsGoldenEyeAutoStartPressed(auto_start_mode, auto_start_state_calls)) {
       input_state->gamepad.buttons = uint16_t(input_state->gamepad.buttons) |
                                      uint16_t(rex::input::X_INPUT_GAMEPAD_START);
       static bool logged_auto_start = false;
       if (!logged_auto_start) {
         logged_auto_start = true;
-        std::fprintf(stderr, "[xam] GOLDENEYE_AUTO_START pulsing Start via XamInputGetState\n");
+        std::fprintf(stderr,
+                     "[xam] GOLDENEYE_AUTO_START=%s injecting Start via XamInputGetState\n",
+                     auto_start_mode);
         std::fflush(stderr);
       }
     }
