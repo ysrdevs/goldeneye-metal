@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <vector>
 
 #include <rex/graphics/shared_memory.h>
@@ -10,6 +11,8 @@ namespace rex::graphics::metal {
 
 class MetalSharedMemory final : public SharedMemory {
  public:
+  using HostResourceMutationCallback = std::function<bool()>;
+
   // trace_writer records every uploaded guest page range into the GPU trace
   // (mirrors VulkanSharedMemory). Without it a Metal-captured trace omits the
   // vertex/texture backing memory the draws fetch, poisoning replay.
@@ -32,6 +35,12 @@ class MetalSharedMemory final : public SharedMemory {
   // VulkanSharedMemory::buffer() / D3D12SharedMemory::GetBuffer().
   void* buffer() const { return buffer_; }
 
+  // Installs the command-processor synchronization callback used before the
+  // CPU reads or mutates resources that may still be referenced by Metal
+  // command buffers. With no callback installed, synchronization is a no-op.
+  void SetHostResourceMutationCallback(HostResourceMutationCallback callback);
+  bool SynchronizeBeforeHostResourceMutation();
+
   // Commits bytes written through the guest CPU mapping to the separate Metal
   // shared-memory buffer, then publishes the range as GPU-produced data. This
   // is used by the current CPU readback/resolve path: RangeWrittenByGpu alone
@@ -45,6 +54,7 @@ class MetalSharedMemory final : public SharedMemory {
   TraceWriter& trace_writer_;     // Records uploaded ranges into the GPU trace.
   void* metal_device_ = nullptr;  // Non-owning id<MTLDevice>.
   void* buffer_ = nullptr;        // Owned id<MTLBuffer>, MTLStorageModeShared.
+  HostResourceMutationCallback host_resource_mutation_callback_;
 };
 
 }  // namespace rex::graphics::metal

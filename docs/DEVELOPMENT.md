@@ -71,9 +71,18 @@ kernel, and compares GPU output against a CPU reference byte for byte.
 `metal_pipeline_probe_test` renders through an externally owned Metal vertex buffer, samples a
 single-layer `texture2d_array`, expands a four-vertex fan through a six-entry index buffer, checks
 scissor delivery, verifies the title's source-alpha blend mode, and validates Xenos-to-Metal
-per-channel write-mask mapping. It protects the resource and fixed-function contract used by
-translated producer draws. It does not replace title-level validation of texture-cache uploads or
-resolve coherence.
+per-channel write-mask mapping. It also verifies ordered draws across queued command buffers, the
+64-draw command-buffer boundary, four retained batches, the 256-draw safety drain, explicit waits,
+and synchronization during shared/private regional readback, queued clear, resize, and context
+release. It protects the resource, fixed-function, and asynchronous-lifetime contracts used by
+translated producer draws. It does not replace title-level validation of texture-cache uploads,
+resolve coherence, or sustained execution.
+
+Run the Metal test with API validation enabled after changing submission or resource ownership:
+
+```sh
+MTL_DEBUG_LAYER=1 ./out/macos-arm64/metal_pipeline_probe_test
+```
 
 Unit tests are enabled by the Apple Silicon preset. PPC assembly tests are disabled by default and
 require an external `powerpc-none-elf` binutils toolchain. Enable them explicitly with:
@@ -91,8 +100,10 @@ Diagnostics are opt-in so normal runs do not write files or substitute success c
 | `GOLDENEYE_AUTO_START=1` | Hold Start during the initial input window to skip startup screens |
 | `GOLDENEYE_AUTO_START=periodic` | Keep the initial hold, then issue short Start retries separated by release gaps for unattended title/menu runs |
 | `GOLDENEYE_METAL_DUMP_SHADERS=1` | Write translated/failed MSL and selected microcode dumps under `/tmp` |
-| `GOLDENEYE_METAL_DUMP_FRAMES=1` | Write selected BGRA frame stages as PPM files under `/tmp` |
+| `GOLDENEYE_METAL_DUMP_FRAMES=1` or `all` | Write all selected BGRA frame stages as PPM files under `/tmp` |
+| `GOLDENEYE_METAL_DUMP_FRAMES=N` | Write only presenter frame number `N`; this avoids the decoded-texture inspection used by an all-stage dump |
 | `GOLDENEYE_METAL_SUBMISSION_DIAGNOSTICS=1` | Log rate-limited kickoff, flush, and VdSwap metadata without replaying it |
+| `GOLDENEYE_METAL_VERBOSE_DIAGNOSTICS=1` | Restore high-volume renderer diagnostics that are suppressed during normal performance runs |
 | `GOLDENEYE_METAL_VDSWAP_SCAVENGE=1` | Enable the legacy heuristic VdSwap packet scavenger; this changes execution and is not a strict-path result |
 | `GOLDENEYE_METAL_IM_LOAD_DIAGNOSTICS=1` | Inspect words beyond pointer-based shader extents for boundary diagnosis |
 | `GOLDENEYE_METAL_PIPELINE_PROBE=1` | Exercise pipeline-probe diagnostics |
@@ -101,11 +112,54 @@ Diagnostics are opt-in so normal runs do not write files or substitute success c
 
 `GOLDENEYE_AUTO_START=periodic` changes input only: it preserves the initial Start hold, then emits
 short retries after full release intervals so unattended runs can cross title gates. It does not
-replace rendering or presentation. Pair it with `GOLDENEYE_METAL_DUMP_FRAMES=1` when collecting a
-menu checkpoint, and keep all resulting game-content captures outside the repository.
+replace rendering or presentation. Pair it with a numeric `GOLDENEYE_METAL_DUMP_FRAMES` value when
+collecting one known presenter checkpoint, or use `1`/`all` only when every diagnostic stage is
+needed. Keep all resulting game-content captures outside the repository.
 
 Other host-pixel and fallback flags in the code are experiments. Results produced with them must be
 labelled as diagnostics and must not be reported as strict-path rendering success.
+
+## Metal submission and synchronization
+
+Persistent producer draws use bounded asynchronous command-buffer submission. A probe context
+batches up to 64 draws in each Metal command buffer and retains at most four committed batches,
+giving each context a 256-draw safety bound. Normal ordering on a context's Metal command queue
+preserves successive draws and clears to the same target without a CPU wait between them.
+
+Synchronization remains mandatory before a result is read or a resource may change underneath
+queued GPU work. The runtime therefore drains pending contexts before readback, clear, target
+resize or release, resolve/swap, cache clear, and shutdown. Shared-memory uploads, guest CPU/GPU
+write commits, texture replacement, and shaders with memory-export side effects also fence through
+the command processor. Do not remove one of these boundaries to improve a microbenchmark; validate
+ownership first.
+
+Private render-target reads use a reusable staging buffer and copy only the requested rectangle.
+The observed title frame's three resolve bands therefore transfer 256, 256, and 208 rows rather
+than independently reading the full 720-line target; the sequence's remaining full-frame readback
+stays 1280x720. Clear operations needed by the same sequence are queued in order on the context
+instead of forcing a separate CPU wait.
+
+Complete, top-origin, full-width resolves can populate an exact resolved-surface cache. A swap may
+reuse its host BGRA pixels only when the fetch base, pitch, dimensions, endian mode, and live guest
+tiled bytes still match. External guest writes and overlapping resolve writes invalidate the
+cache, and the final byte comparison catches writes that bypass normal tracking. Both the mirror
+and dirty-range commits use the true tiled-address upper bound rather than a linear
+`pitch * height * 4` estimate; the latter is too small for the bottom of a 1280x720 tiled surface.
+
+The title-facing GPU-wait hook determines completion from one atomic primary-ring snapshot. A ring
+is drained only when it is configured, has a valid write pointer, and has no pending commands;
+this also handles a valid wrapped write pointer of zero without mistaking it for an uninitialized
+ring.
+
+Rate-limited `IssueSwap` output includes cumulative asynchronous submission, wait, waited-command,
+and maximum-pending counters. Use those counters with a fixed swap checkpoint when comparing
+pacing, and leave frame/shader dumps and verbose diagnostics disabled during timing runs.
+
+On the current Apple Silicon test system, a representative fixed early checkpoint improved from
+14.43 seconds on the original per-draw-wait path to approximately 10.5 seconds after the bounded
+submission and resolve/swap work, roughly 27%. Startup and periodic-input timing varies between
+runs, so treat this as directional evidence rather than a stable benchmark. Reaching and animating
+the later menu is still far from a playable frame rate.
 
 ## Debugging guardrails
 

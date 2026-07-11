@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 
 namespace rex::graphics::metal {
 namespace {
@@ -31,6 +32,14 @@ MetalSharedMemory::MetalSharedMemory(memory::Memory& memory, TraceWriter& trace_
 
 MetalSharedMemory::~MetalSharedMemory() {
   Shutdown(true);
+}
+
+void MetalSharedMemory::SetHostResourceMutationCallback(HostResourceMutationCallback callback) {
+  host_resource_mutation_callback_ = std::move(callback);
+}
+
+bool MetalSharedMemory::SynchronizeBeforeHostResourceMutation() {
+  return !host_resource_mutation_callback_ || host_resource_mutation_callback_();
 }
 
 bool MetalSharedMemory::Initialize(void* metal_device) {
@@ -77,6 +86,10 @@ bool MetalSharedMemory::UploadRanges(
     return true;
   }
   if (!buffer_) {
+    return false;
+  }
+
+  if (!SynchronizeBeforeHostResourceMutation()) {
     return false;
   }
 
@@ -146,6 +159,10 @@ bool MetalSharedMemory::CommitGuestCpuWriteAsGpu(uint32_t start, uint32_t length
   id<MTLBuffer> gpu_buffer = (id<MTLBuffer>)buffer_;
   uint8_t* buffer_contents = reinterpret_cast<uint8_t*>([gpu_buffer contents]);
   if (!guest_source || !buffer_contents) {
+    return false;
+  }
+
+  if (!SynchronizeBeforeHostResourceMutation()) {
     return false;
   }
 

@@ -92,6 +92,11 @@ class CommandProcessor {
   void increment_swap_counter() { swap_counter_.fetch_add(1, std::memory_order_acq_rel); }
   uint32_t read_ptr_index() const { return ring_state_.GetSnapshot().read_pointer; }
   uint32_t write_ptr_index() const { return ring_state_.GetSnapshot().write_pointer; }
+  bool primary_ring_drained() const {
+    const CommandRingState::Snapshot snapshot = ring_state_.GetSnapshot();
+    return snapshot.configured && snapshot.write_pointer_valid() &&
+           !snapshot.has_pending_commands();
+  }
 
   Shader* active_vertex_shader() const { return active_vertex_shader_; }
   Shader* active_pixel_shader() const { return active_pixel_shader_; }

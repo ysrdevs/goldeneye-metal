@@ -7,7 +7,9 @@ backend, and game integration in one tree.
 > [!WARNING]
 > The macOS build is not playable yet. The native title path now runs continuously and presents
 > a recognizable main menu through the real Metal draw, resolve, and swap path, but interactive
-> gameplay and complete fixed-function fidelity have not been verified.
+> gameplay and complete fixed-function fidelity have not been verified. Startup is measurably
+> faster than the original synchronous path, but later title and menu pacing remains far below a
+> playable frame rate.
 
 ## Project status
 
@@ -27,10 +29,18 @@ place. Metal now consumes guest DMA, converted, and built-in index buffers throu
 draws, preserves the guest alpha test, and applies live viewport, scissor, blend, blend-constant,
 and per-channel color-write state. Current single-sample host contexts assemble the observed title
 sequence's three resolve bands described by its 4xMSAA layout through the normal `IssueCopy` and
-`IssueSwap` route. Those fixes produce a clean classification screen, the complete gun-barrel
-sequence, a shaded animated gold RARE logo, and a recognizable dossier-style main menu. The next
-known fidelity gaps are culling, depth/stencil, true guest MSAA behavior, native macOS input, and
-submission performance on the route to first playable output.
+`IssueSwap` route. Ordinary persistent Metal draws are now submitted asynchronously in bounded
+queues instead of blocking the CPU after every draw: each command buffer carries up to 64 draws,
+with at most four retained batches and a 256-draw safety drain. Regional private-texture readback,
+ordered queued clears, and an exact resolved-surface swap cache reduce avoidable synchronization
+and transfer work while preserving guest-memory validation and the true tiled surface extent.
+Explicit fences still protect readback, resolves, shared-resource mutation, swaps, and teardown.
+Those fixes produce a clean classification screen, the complete gun-barrel sequence, a shaded
+animated gold RARE logo, and a recognizable dossier-style main menu. A representative fixed early
+checkpoint improved from 14.43 seconds to approximately 10.5 seconds, about 27%, although runtime
+timings vary and the later menu remains far from playable. The next known gaps are culling,
+depth/stencil, true guest MSAA behavior, native macOS input, and sustained pacing on the route to
+first playable output.
 
 See [the native Metal status report](docs/GOLDENEYE_NATIVE_METAL_PROJECT_STATUS.md) for the exact
 milestones, evidence, and next development priority.

@@ -76,6 +76,11 @@ class MetalCommandProcessor final : public CommandProcessor {
       xenos::PrimitiveType prim_type, uint32_t index_count, bool host_render_target_debug = false,
       const PrimitiveProcessor::ProcessingResult* primitive_processing_result = nullptr);
   struct HostRenderTarget;
+  bool WaitForPipelineProbeSubmissions(const char* reason);
+  void* GetActiveHostRenderTargetContext() const {
+    return host_render_target_context_override_ ? host_render_target_context_override_
+                                                : host_render_target_context_;
+  }
   bool RefreshPipelineProbeBacking(uint32_t width, uint32_t height);
   bool RefreshHostRenderTargetBacking(uint32_t width, uint32_t height);
   bool EnsureEdramBgraBacking();
@@ -140,6 +145,12 @@ class MetalCommandProcessor final : public CommandProcessor {
   void RetainResolvedFrameForBase(uint32_t base_physical, const std::vector<uint8_t>& bgra,
                                   uint32_t width, uint32_t height, const char* label);
   void InvalidateRetainedResolvedFrames(uint32_t base_physical, uint32_t length);
+  void UpdateExactResolvedSurfaceCache(uint32_t dest_base, uint32_t pitch, uint32_t surface_height,
+                                       const std::vector<uint8_t>& bgra, uint32_t width,
+                                       uint32_t source_height, uint32_t source_x, uint32_t source_y,
+                                       uint32_t dest_x, uint32_t dest_y, uint32_t write_width,
+                                       uint32_t write_height, xenos::Endian128 dest_endian);
+  void InvalidateExactResolvedSurfaceCache(uint32_t base_physical, uint32_t length);
   bool DecodeTextureFetchToRgba(const xenos::xe_gpu_texture_fetch_t& fetch,
                                 uint32_t fallback_base_physical,
                                 uint32_t decode_base_override_physical,
@@ -176,7 +187,10 @@ class MetalCommandProcessor final : public CommandProcessor {
   void* solid_fragment_library_ = nullptr;
   void* pipeline_probe_context_ = nullptr;
   void* host_pixel_probe_context_ = nullptr;
+  // The standalone debug context remains immutable so a temporary per-target
+  // routing override can never hide it from a global synchronization pass.
   void* host_render_target_context_ = nullptr;
+  void* host_render_target_context_override_ = nullptr;
   std::unordered_map<uint64_t, void*> render_pipeline_states_;
   std::unordered_map<uint64_t, void*> fullscreen_pixel_pipeline_states_;
   std::unordered_map<uint64_t, void*> host_pixel_pipeline_states_;
@@ -212,6 +226,19 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint64_t score = 0;
     uint32_t draw_count = 0;
   };
+  // Unlike the score-based diagnostic frame retention above, this is an exact
+  // mirror of a complete top-origin tiled resolve write. The guest byte mirror
+  // is compared before reuse so unobserved CPU writes can only cause a cache
+  // miss, never stale presentation.
+  struct ExactResolvedSurface {
+    std::vector<uint8_t> bgra;
+    std::vector<uint8_t> guest_tiled_bytes;
+    uint32_t base = 0;
+    uint32_t pitch = 0;
+    uint32_t bgra_height = 0;
+    uint32_t surface_height = 0;
+    xenos::Endian128 endian = xenos::Endian128::kNone;
+  };
   struct HostRenderTarget {
     void* context = nullptr;
     std::vector<uint8_t> bgra;
@@ -226,6 +253,7 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint32_t pitch = 0;
     uint32_t source_x = 0;
     uint32_t source_y = 0;
+    uint32_t dest_x = 0;
     uint32_t dest_y = 0;
     uint32_t width = 0;
     uint32_t height = 0;
@@ -235,6 +263,7 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint32_t bgra_height = 0;
   };
   std::unordered_map<uint32_t, RetainedResolvedFrame> retained_resolve_frames_by_base_;
+  ExactResolvedSurface exact_resolved_surface_;
   std::unordered_map<uint64_t, HostRenderTarget> host_render_targets_;
   std::vector<PendingReadbackResolveSlice> pending_readback_resolve_slices_;
   uint32_t latest_pipeline_probe_width_ = 0;
@@ -283,6 +312,11 @@ class MetalCommandProcessor final : public CommandProcessor {
   uint32_t pipeline_probe_failure_count_ = 0;
   uint32_t pipeline_probe_draws_this_swap_ = 0;
   uint32_t pipeline_probe_skipped_this_swap_ = 0;
+  uint32_t async_probe_submissions_since_global_wait_ = 0;
+  uint32_t async_probe_max_pending_submission_count_ = 0;
+  uint64_t async_probe_submission_count_ = 0;
+  uint64_t async_probe_wait_count_ = 0;
+  uint64_t async_probe_waited_submission_count_ = 0;
   uint32_t host_pixel_draws_this_swap_ = 0;
   uint32_t host_fallback_pixel_draws_this_swap_ = 0;
   uint32_t host_pixel_skipped_vertices_this_swap_ = 0;

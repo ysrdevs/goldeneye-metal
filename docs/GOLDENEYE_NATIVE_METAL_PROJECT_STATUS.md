@@ -51,7 +51,9 @@ title's submission routine saw that bit and returned before writing WPTR for kic
 The recovery also published a sampled RPTR into command-processor-owned writeback memory. The hook
 now holds the title wait until the CP swap counter advances or the ring drains, yields while
 waiting, never changes the title's skip bits or presented counter, and leaves RPTR writeback solely
-to the CP.
+to the CP. Ring completion is evaluated from one atomic snapshot: the ring must be configured, its
+write pointer must be valid, and no commands may be pending. This also treats a wrapped write
+pointer of zero as a valid drained state instead of confusing it with an uninitialized ring.
 
 In bounded runs with scavenging, replay, forced presentation, and replacement rendering disabled,
 WPTR progressed beyond 1088, the Metal primary-ring worker passed batch 192, and normal
@@ -69,6 +71,32 @@ force presentation, or bypass resolves. The captured menu therefore satisfies th
 provenance requirements for the first target milestone. It does not establish playable output:
 culling, depth/stencil, and guest MSAA fidelity remain incomplete, normal macOS keyboard delivery
 is absent, and navigation into gameplay has not been verified.
+
+The dominant host-side pacing fault after reaching the menu was a synchronous Metal wait after
+every persistent producer draw. Those draws now use bounded asynchronous command-buffer queues:
+each Metal command buffer carries up to 64 draws, with at most four retained batches and a
+256-draw safety drain. Queue ordering preserves dependent draws and queued clears to the same
+target, while explicit fences drain work before readback, target replacement or release,
+resolve/swap, cache teardown, shared-memory or cached-texture mutation, and shaders with
+memory-export side effects. The standalone pipeline-probe test covers ordered queued blending,
+the batch and draw limits, explicit waits, resize, queued clear, shared/private regional readback,
+and release behavior. Metal API validation remains clean for that isolated path.
+
+Resolve and swap work no longer force a full private-texture readback for every title band. The
+first three observed copies read only their 256, 256, and 208 source rows through one reusable
+staging buffer; the remaining full-frame copy stays 1280x720, and clears remain ordered on the same
+queue. A complete top-origin, full-width resolve also records an exact host BGRA result and its
+guest tiled-byte mirror. Swap may reuse that result only when all fetch metadata and the live guest
+bytes still match; tracked guest writes invalidate it, and a final comparison protects against
+untracked CPU writes. Tiled surface ranges now use the real tiled-address extent rather than a
+linear byte-size estimate, fixing the previously omitted tail of a 1280x720 destination.
+
+A representative fixed early checkpoint improved from 14.43 seconds on the original per-draw-wait
+path to approximately 10.5 seconds, about 27%. The result varies with host scheduling and the
+real-time periodic input diagnostic, so it is not a stable FPS claim. The same optimized strict
+path still takes far too long to reach and animate the later menu; the project remains well short
+of playable pacing despite the measurable startup improvement. Menu visual parity was confirmed
+after these changes, and no diagnostic rendering shortcut is part of the result.
 
 The decisive geometry fault was discarded index delivery. A four-vertex title triangle fan was
 converted correctly by `PrimitiveProcessor` to the six indices `(1,2,0,2,3,0)`, but Metal issued
@@ -118,6 +146,14 @@ longer blocked on that sequence.
 - Standalone `metal_pipeline_probe_test` for external-buffer and array-texture delivery
 - Indexed fan-remap, scissor, source-alpha blend, and partial-write-mask regression coverage in
   `metal_pipeline_probe_test`
+- Bounded asynchronous producer submission with resource-mutation, readback, swap, and lifecycle
+  fences
+- Ordered queued-draw, 64-draw command buffers, four retained batches, 256-draw drain, explicit
+  wait, resize, queued-clear, regional-readback, and release regression coverage in
+  `metal_pipeline_probe_test`
+- Regional private render-target readback with reusable staging and ordered queued clears
+- Exact resolved-surface swap reuse guarded by fetch metadata, guest-byte comparison, tracked
+  invalidation, and the true tiled-memory extent
 - Recognizable main-menu presentation through real title draws, guest-visible resolves, and normal
   `IssueSwap`
 
@@ -149,24 +185,25 @@ The remaining graphics risk is the next layer of fixed-function fidelity. Live v
 current host-context ownership, the observed banded copy sequence, the title's two blend modes,
 blend constants, and per-channel write masks are active and verified. Culling/front-face selection,
 shared depth/stencil ownership, and true guest MSAA behavior are still absent and are likely to
-matter more in gameplay than in the mostly layered 2D menu. The Metal probe path also submits and
-waits one command buffer per draw, making long validation runs much slower than the guest's intended
-pacing. Missing game data remains a separate launch problem and must not be diagnosed as a renderer
-failure.
+matter more in gameplay than in the mostly layered 2D menu. The former per-draw wait has been
+replaced by bounded asynchronous submission with explicit safety fences, and visual parity has
+been rechecked at the menu. The early checkpoint is faster, but late-title pacing remains the
+immediate runtime blocker. Missing game data remains a separate launch problem and must not be
+diagnosed as a renderer failure.
 
 ## Next development priority
 
 Work in this order:
 
-1. Wire normal macOS keyboard events into the input path or validate the SDL controller route, then
+1. Profile the late title/menu path with dumps and verbose logs disabled, separating guest pacing,
+   command processing, resolve/readback, and presentation costs at fixed swap checkpoints.
+2. Remove the remaining CPU round trips in the exact resolve/swap route where ownership permits,
+   while keeping guest-memory coherence and strict provenance intact.
+3. Wire normal macOS keyboard events into the input path or validate the SDL controller route, then
    navigate the real menu into the first mission without automated selection.
-2. Apply guest cull/front-face state and add focused regression coverage before judging 3D scenes.
-3. Build shared depth/stencil ownership and depth/stencil clear behavior for persistent Metal
-   render targets.
-4. Replace the current single-sample host approximation with faithful guest MSAA ownership and
-   resolve behavior.
-5. Batch Metal probe submissions safely, with synchronization at readback and shared-resource
-   mutation boundaries, then audit pacing and long-run stability.
+4. Apply guest cull/front-face state and add focused regression coverage before judging 3D scenes.
+5. Build shared depth/stencil ownership and faithful guest MSAA resolve behavior for persistent
+   Metal render targets.
 
 Do not restore heuristic command scavenging or direct presentation shortcuts. The real ring and
 normal `XE_SWAP` path now provide the authoritative evidence needed to debug production.

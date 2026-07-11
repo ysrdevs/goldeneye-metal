@@ -70,12 +70,28 @@ void* CreatePipelineProbeContext(void* metal_device, std::string* error_out);
 void* CreateHostRenderTargetContext(void* metal_device, std::string* error_out);
 void ResetPipelineProbeContext(void* context);
 void ReleasePipelineProbeContext(void* context);
+// Waits for all render submissions currently owned by a persistent context.
+// Normal Metal command buffers retain their encoded resources, so callers may
+// release externally supplied Metal objects after submission. Callers must not
+// mutate those resources until this, Read, Clear, resize, or release drains the
+// context.
+bool WaitPipelineProbeContext(void* context, std::string* error_out,
+                              uint32_t* waited_submission_count_out = nullptr);
+// Counts encoded draw submissions, including draws in the currently open
+// encoder and metadata for committed command buffers (not command-buffer count).
+uint32_t GetPipelineProbeContextPendingSubmissionCount(void* context);
 bool ClearPipelineProbeContext(void* context, uint32_t width, uint32_t height, double red,
                                double green, double blue, double alpha, std::string* error_out);
 bool ClearPipelineProbeContextRect(void* context, uint32_t width, uint32_t height, uint32_t x,
                                    uint32_t y, uint32_t clear_width, uint32_t clear_height,
                                    double red, double green, double blue, double alpha,
                                    std::string* error_out);
+// Encodes a rectangular clear in the context's ordered asynchronous batch.
+// A later read, wait, resize, clear, or release drains it.
+bool QueuePipelineProbeContextClearRect(void* context, uint32_t width, uint32_t height, uint32_t x,
+                                        uint32_t y, uint32_t clear_width, uint32_t clear_height,
+                                        double red, double green, double blue, double alpha,
+                                        std::string* error_out);
 bool RenderPipelineProbeToContext(
     void* context, void* pipeline_state, const void* system_constants, size_t system_constants_size,
     const void* float_constants, size_t float_constants_size, const void* fetch_constants,
@@ -100,6 +116,11 @@ bool RenderPipelineProbeToContext(
     const ProbeRasterizationState* rasterization_state = nullptr);
 bool ReadPipelineProbeContext(void* context, uint32_t width, uint32_t height,
                               std::vector<uint8_t>& bgra_out, std::string* error_out);
+// Reads a tightly packed BGRA rectangle. Like the full read, this is a fence:
+// pending submissions are drained before metadata and bounds are validated.
+bool ReadPipelineProbeContextRect(void* context, uint32_t width, uint32_t height, uint32_t x,
+                                  uint32_t y, uint32_t read_width, uint32_t read_height,
+                                  std::vector<uint8_t>& bgra_out, std::string* error_out);
 bool RenderPipelineProbe(
     void* metal_device, void* pipeline_state, const void* system_constants,
     size_t system_constants_size, const void* float_constants, size_t float_constants_size,

@@ -218,6 +218,10 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
     return false;
   }
 
+  if (!metal_shared_memory_.SynchronizeBeforeHostResourceMutation()) {
+    return false;
+  }
+
   uint32_t width = key.GetWidth();
   uint32_t height = key.GetHeight();
   uint32_t x_blocks = (width + format_info->block_width - 1) / format_info->block_width;

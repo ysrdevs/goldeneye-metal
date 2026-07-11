@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -23,20 +24,25 @@
 namespace {
 
 using rex::graphics::metal::ClearPipelineProbeContext;
+using rex::graphics::metal::CreateHostRenderTargetContext;
 using rex::graphics::metal::CreateMslLibrary;
 using rex::graphics::metal::CreatePipelineProbeContext;
 using rex::graphics::metal::CreateRenderPipelineState;
+using rex::graphics::metal::GetPipelineProbeContextPendingSubmissionCount;
 using rex::graphics::metal::ProbeColorTargetState;
 using rex::graphics::metal::ProbeIndexBuffer;
 using rex::graphics::metal::ProbeRasterizationState;
 using rex::graphics::metal::ProbeSamplerSlot;
 using rex::graphics::metal::ProbeTextureSlot;
+using rex::graphics::metal::QueuePipelineProbeContextClearRect;
 using rex::graphics::metal::ReadPipelineProbeContext;
+using rex::graphics::metal::ReadPipelineProbeContextRect;
 using rex::graphics::metal::ReleaseMslLibrary;
 using rex::graphics::metal::ReleasePipelineProbeContext;
 using rex::graphics::metal::ReleaseRenderPipelineState;
 using rex::graphics::metal::RenderPipelineProbeToContext;
 using rex::graphics::metal::ResetPipelineProbeContext;
+using rex::graphics::metal::WaitPipelineProbeContext;
 
 constexpr uint32_t kWidth = 40;
 constexpr uint32_t kHeight = 40;
@@ -204,15 +210,20 @@ int RunPipelineProbeTest() {
         /*bool_loop_constants=*/nullptr, /*bool_loop_constants_size=*/0,
         /*vertex_bool_loop_constants_buffer_index=*/UINT32_MAX,
         /*fragment_bool_loop_constants_buffer_index=*/UINT32_MAX);
+    uint32_t pending_after_render = GetPipelineProbeContextPendingSubmissionCount(context);
 
     std::vector<uint8_t> bgra;
     bool read = rendered && ReadPipelineProbeContext(context, kWidth, kHeight, bgra, &error);
+    uint32_t pending_after_read = GetPipelineProbeContextPendingSubmissionCount(context);
 
     [position_buffer release];
 
-    if (!rendered || !read) {
-      std::fprintf(stderr, "[metal_pipeline_probe_test] FAIL: probe draw/readback: %s\n",
-                   error.c_str());
+    if (!rendered || pending_after_render != 1 || !read || pending_after_read != 0) {
+      std::fprintf(stderr,
+                   "[metal_pipeline_probe_test] FAIL: asynchronous probe draw/readback: %s "
+                   "rendered=%d pending_before_read=%u read=%d pending_after_read=%u\n",
+                   error.c_str(), int(rendered), pending_after_render, int(read),
+                   pending_after_read);
       ReleasePipelineProbeContext(context);
       release_pipeline_states();
       return 1;
@@ -243,6 +254,55 @@ int RunPipelineProbeTest() {
                    "textured=%zu clear=%zu\n",
                    center[0], center[1], center[2], center[3], corner[0], corner[1], corner[2],
                    corner[3], textured_pixels, clear_pixels);
+      ReleasePipelineProbeContext(context);
+      release_pipeline_states();
+      return 1;
+    }
+
+    constexpr uint32_t kRegionX = 5;
+    constexpr uint32_t kRegionY = 7;
+    constexpr uint32_t kRegionWidth = 17;
+    constexpr uint32_t kRegionHeight = 13;
+    std::vector<uint8_t> region_bgra;
+    bool region_read =
+        ReadPipelineProbeContextRect(context, kWidth, kHeight, kRegionX, kRegionY, kRegionWidth,
+                                     kRegionHeight, region_bgra, &error);
+    bool region_matches =
+        region_read && region_bgra.size() == size_t(kRegionWidth) * kRegionHeight * 4;
+    for (uint32_t row = 0; row < kRegionHeight && region_matches; ++row) {
+      const uint8_t* expected = bgra.data() + (size_t(kRegionY + row) * kWidth + kRegionX) * 4;
+      const uint8_t* actual = region_bgra.data() + size_t(row) * kRegionWidth * 4;
+      region_matches = std::memcmp(actual, expected, size_t(kRegionWidth) * 4) == 0;
+    }
+    if (!region_matches) {
+      std::fprintf(stderr,
+                   "[metal_pipeline_probe_test] FAIL: rectangular readback read=%d bytes=%zu: %s\n",
+                   int(region_read), region_bgra.size(), error.c_str());
+      ReleasePipelineProbeContext(context);
+      release_pipeline_states();
+      return 1;
+    }
+
+    bool queued_clear = QueuePipelineProbeContextClearRect(context, kWidth, kHeight, 0, 0, 4, 4,
+                                                           1.0, 0.25, 0.5, 1.0, &error);
+    uint32_t queued_clear_pending = GetPipelineProbeContextPendingSubmissionCount(context);
+    std::vector<uint8_t> queued_clear_bgra;
+    bool queued_clear_read = queued_clear && ReadPipelineProbeContext(context, kWidth, kHeight,
+                                                                      queued_clear_bgra, &error);
+    uint32_t queued_clear_pending_after = GetPipelineProbeContextPendingSubmissionCount(context);
+    constexpr std::array<uint8_t, 4> kQueuedClearBgra = {128, 64, 255, 255};
+    bool queued_clear_ok = queued_clear && queued_clear_pending == 1 && queued_clear_read &&
+                           queued_clear_pending_after == 0 &&
+                           queued_clear_bgra.size() == size_t(kWidth) * kHeight * 4 &&
+                           PixelNear(queued_clear_bgra.data(), kQueuedClearBgra) &&
+                           std::memcmp(queued_clear_bgra.data() + (size_t(10) * kWidth + 10) * 4,
+                                       bgra.data() + (size_t(10) * kWidth + 10) * 4, 4) == 0;
+    if (!queued_clear_ok) {
+      std::fprintf(stderr,
+                   "[metal_pipeline_probe_test] FAIL: queued clear queued=%d pending=%u "
+                   "read=%d pending_after=%u bytes=%zu: %s\n",
+                   int(queued_clear), queued_clear_pending, int(queued_clear_read),
+                   queued_clear_pending_after, queued_clear_bgra.size(), error.c_str());
       ReleasePipelineProbeContext(context);
       release_pipeline_states();
       return 1;
@@ -332,22 +392,60 @@ int RunPipelineProbeTest() {
                         PixelNear(scissored_left, kExpectedBgra) &&
                         PixelNear(scissored_right, kClearBgra);
 
-    auto render_indexed_fan = [&](void* draw_pipeline_state, const ProbeTextureSlot* draw_texture) {
+    auto render_indexed_fan_to_context = [&](void* draw_context, void* draw_pipeline_state,
+                                             const ProbeTextureSlot* draw_texture,
+                                             uint32_t draw_width, uint32_t draw_height) {
       return RenderPipelineProbeToContext(
-          context, draw_pipeline_state, kUnusedSystemConstants.data(),
+          draw_context, draw_pipeline_state, kUnusedSystemConstants.data(),
           sizeof(kUnusedSystemConstants), nullptr, 0, nullptr, 0, nullptr, 0, fan_position_buffer,
           nullptr, 0, 0, draw_texture, 1, 1,
-          /*primitive_type=TriangleList=*/4, uint32_t(kFanIndices.size()), kWidth, kHeight, &error,
+          /*primitive_type=TriangleList=*/4, uint32_t(kFanIndices.size()), draw_width, draw_height,
+          &error,
           /*vertex_shared_memory_buffer_index=*/3, UINT32_MAX, UINT32_MAX, nullptr, 0, UINT32_MAX,
           UINT32_MAX, nullptr, &sampler, nullptr, 0, UINT32_MAX, nullptr, 0, UINT32_MAX, UINT32_MAX,
           &fan_index_buffer);
     };
+    auto render_indexed_fan = [&](void* draw_pipeline_state, const ProbeTextureSlot* draw_texture) {
+      return render_indexed_fan_to_context(context, draw_pipeline_state, draw_texture, kWidth,
+                                           kHeight);
+    };
+
+    // Host render targets use private Metal storage. Their regional readback
+    // must enqueue the blit behind pending draws and fence both with one wait.
+    void* private_context = CreateHostRenderTargetContext(device, &error);
+    bool private_rendered =
+        private_context &&
+        render_indexed_fan_to_context(private_context, pipeline_state, &texture, kWidth, kHeight);
+    uint32_t private_pending_before =
+        GetPipelineProbeContextPendingSubmissionCount(private_context);
+    std::vector<uint8_t> private_region_bgra;
+    bool private_region_read =
+        private_rendered && ReadPipelineProbeContextRect(private_context, kWidth, kHeight, 18, 18,
+                                                         4, 4, private_region_bgra, &error);
+    uint32_t private_pending_after = GetPipelineProbeContextPendingSubmissionCount(private_context);
+    bool private_region_ok = private_region_read && private_pending_before == 1 &&
+                             private_pending_after == 0 && private_region_bgra.size() == 4 * 4 * 4;
+    for (size_t pixel = 0; pixel < 16 && private_region_ok; ++pixel) {
+      private_region_ok = PixelNear(private_region_bgra.data() + pixel * 4, kExpectedBgra);
+    }
+    ReleasePipelineProbeContext(private_context);
+    if (!private_region_ok) {
+      std::fprintf(stderr,
+                   "[metal_pipeline_probe_test] FAIL: private regional readback rendered=%d "
+                   "pending=%u read=%d pending_after=%u bytes=%zu: %s\n",
+                   int(private_rendered), private_pending_before, int(private_region_read),
+                   private_pending_after, private_region_bgra.size(), error.c_str());
+      [fan_metal_index_buffer release];
+      [fan_position_buffer release];
+      ReleasePipelineProbeContext(context);
+      release_pipeline_states();
+      return 1;
+    }
 
     // Blend a half-transparent source over a nontrivial destination. Using the
     // same factors for color and alpha exercises every field in 0x07060706.
     constexpr std::array<uint8_t, 4> kBlendSourceRgba = {224, 128, 32, 128};
     constexpr std::array<uint8_t, 4> kBlendDestinationRgba = {32, 64, 128, 192};
-    constexpr std::array<uint8_t, 4> kBlendDestinationBgra = {128, 64, 32, 192};
     // round(src * 128 / 255 + dst * 127 / 255), in BGRA order.
     constexpr std::array<uint8_t, 4> kExpectedBlendedBgra = {80, 96, 128, 160};
     ProbeTextureSlot blend_texture;
@@ -357,21 +455,33 @@ int RunPipelineProbeTest() {
     blend_texture.array_length = 1;
     blend_texture.bytes_per_row = kBlendSourceRgba.size();
     blend_texture.bytes_per_image = kBlendSourceRgba.size();
-    bool blend_cleared = ClearPipelineProbeContext(
-        context, kWidth, kHeight, double(kBlendDestinationRgba[0]) / 255.0,
-        double(kBlendDestinationRgba[1]) / 255.0, double(kBlendDestinationRgba[2]) / 255.0,
-        double(kBlendDestinationRgba[3]) / 255.0, &error);
-    bool blend_rendered =
-        blend_cleared && render_indexed_fan(alpha_blend_pipeline_state, &blend_texture);
+    ProbeTextureSlot blend_destination_texture;
+    blend_destination_texture.rgba = kBlendDestinationRgba.data();
+    blend_destination_texture.width = 1;
+    blend_destination_texture.height = 1;
+    blend_destination_texture.array_length = 1;
+    blend_destination_texture.bytes_per_row = kBlendDestinationRgba.size();
+    blend_destination_texture.bytes_per_image = kBlendDestinationRgba.size();
+    // Submit two draws without a CPU wait between them. Both are encoded in the
+    // same render pass, and the second draw must blend over the first's output.
+    bool blend_cleared =
+        ClearPipelineProbeContext(context, kWidth, kHeight, 0.0, 0.0, 0.0, 0.0, &error);
+    bool blend_destination_rendered =
+        blend_cleared && render_indexed_fan(pipeline_state, &blend_destination_texture);
+    bool blend_rendered = blend_destination_rendered &&
+                          render_indexed_fan(alpha_blend_pipeline_state, &blend_texture);
+    uint32_t blend_pending_before_read = GetPipelineProbeContextPendingSubmissionCount(context);
     std::vector<uint8_t> blend_bgra;
     bool blend_read =
         blend_rendered && ReadPipelineProbeContext(context, kWidth, kHeight, blend_bgra, &error);
+    uint32_t blend_pending_after_read = GetPipelineProbeContextPendingSubmissionCount(context);
     const uint8_t* blend_center =
         blend_read ? blend_bgra.data() + (size_t(kHeight / 2) * kWidth + kWidth / 2) * 4 : nullptr;
     const uint8_t* blend_corner = blend_read ? blend_bgra.data() : nullptr;
     bool blend_ok = blend_center && blend_corner &&
                     PixelNear(blend_center, kExpectedBlendedBgra, 2) &&
-                    PixelNear(blend_corner, kBlendDestinationBgra);
+                    PixelNear(blend_corner, std::array<uint8_t, 4>{0, 0, 0, 0}) &&
+                    blend_pending_before_read == 2 && blend_pending_after_read == 0;
 
     // Opaque replacement with only Xenos R and B enabled. G and A must retain
     // the clear value; this specifically catches a direct (unreversed) mapping
@@ -402,6 +512,102 @@ int RunPipelineProbeTest() {
     bool mask_ok = mask_center && mask_corner && PixelNear(mask_center, kExpectedMaskedBgra) &&
                    PixelNear(mask_corner, kMaskDestinationBgra);
 
+    // Clear is an explicit synchronization boundary, even when the previous
+    // render is still pending.
+    bool clear_drain_rendered = render_indexed_fan(pipeline_state, &texture);
+    uint32_t clear_pending_before = GetPipelineProbeContextPendingSubmissionCount(context);
+    bool clear_drain_cleared =
+        clear_drain_rendered &&
+        ClearPipelineProbeContext(context, kWidth, kHeight, 0.0, 0.0, 0.0, 1.0, &error);
+    uint32_t clear_pending_after = GetPipelineProbeContextPendingSubmissionCount(context);
+    bool clear_drain_ok = clear_drain_rendered && clear_pending_before == 1 &&
+                          clear_drain_cleared && clear_pending_after == 0;
+
+    // Draw 64 closes the first shared encoder / command buffer without losing
+    // submission metadata. Four committed 64-draw buffers (256 draws total)
+    // trigger the bounded drain.
+    bool cap_submissions_ok = clear_drain_ok;
+    for (uint32_t i = 0; i < 63 && cap_submissions_ok; ++i) {
+      cap_submissions_ok = render_indexed_fan(pipeline_state, &texture);
+    }
+    uint32_t pending_after_63 = GetPipelineProbeContextPendingSubmissionCount(context);
+    bool submission_64_ok = cap_submissions_ok && render_indexed_fan(pipeline_state, &texture);
+    uint32_t pending_after_64 = GetPipelineProbeContextPendingSubmissionCount(context);
+    bool submission_65_ok = submission_64_ok && render_indexed_fan(pipeline_state, &texture);
+    uint32_t pending_after_65 = GetPipelineProbeContextPendingSubmissionCount(context);
+    bool submissions_to_255_ok = submission_65_ok;
+    for (uint32_t submitted = 65; submitted < 255 && submissions_to_255_ok; ++submitted) {
+      submissions_to_255_ok = render_indexed_fan(pipeline_state, &texture);
+    }
+    uint32_t pending_after_255 = GetPipelineProbeContextPendingSubmissionCount(context);
+    bool submission_256_ok = submissions_to_255_ok && render_indexed_fan(pipeline_state, &texture);
+    uint32_t pending_after_256 = GetPipelineProbeContextPendingSubmissionCount(context);
+    bool submission_257_ok = submission_256_ok && render_indexed_fan(pipeline_state, &texture);
+    uint32_t pending_after_257 = GetPipelineProbeContextPendingSubmissionCount(context);
+    uint32_t explicitly_waited = UINT32_MAX;
+    bool explicit_wait_ok =
+        submission_257_ok && WaitPipelineProbeContext(context, &error, &explicitly_waited);
+    uint32_t pending_after_explicit_wait = GetPipelineProbeContextPendingSubmissionCount(context);
+    bool cap_ok = cap_submissions_ok && pending_after_63 == 63 && submission_64_ok &&
+                  pending_after_64 == 64 && submission_65_ok && pending_after_65 == 65 &&
+                  submissions_to_255_ok && pending_after_255 == 255 && submission_256_ok &&
+                  pending_after_256 == 0 && submission_257_ok && pending_after_257 == 1 &&
+                  explicit_wait_ok && explicitly_waited == 1 && pending_after_explicit_wait == 0;
+
+    // Read is a fence even when its requested size is wrong and no pixels can
+    // be returned. This catches validation-before-drain ordering regressions.
+    bool invalid_read_rendered = cap_ok && render_indexed_fan(pipeline_state, &texture);
+    uint32_t invalid_read_pending_before = GetPipelineProbeContextPendingSubmissionCount(context);
+    std::vector<uint8_t> invalid_read_bgra;
+    std::string invalid_read_error;
+    bool invalid_read_rejected =
+        invalid_read_rendered && !ReadPipelineProbeContext(context, kWidth + 1, kHeight,
+                                                           invalid_read_bgra, &invalid_read_error);
+    uint32_t invalid_read_pending_after = GetPipelineProbeContextPendingSubmissionCount(context);
+    bool invalid_read_fence_ok = invalid_read_rendered && invalid_read_pending_before == 1 &&
+                                 invalid_read_rejected && invalid_read_pending_after == 0 &&
+                                 !invalid_read_error.empty();
+
+    // Resizing drains work targeting the old texture before replacing it, then
+    // leaves the new-size draw pending until readback.
+    constexpr uint32_t kResizedWidth = 32;
+    constexpr uint32_t kResizedHeight = 32;
+    bool resize_old_rendered =
+        invalid_read_fence_ok && render_indexed_fan(pipeline_state, &texture);
+    uint32_t resize_old_pending = GetPipelineProbeContextPendingSubmissionCount(context);
+    bool resize_new_rendered =
+        resize_old_rendered && render_indexed_fan_to_context(context, pipeline_state, &texture,
+                                                             kResizedWidth, kResizedHeight);
+    uint32_t resize_new_pending = GetPipelineProbeContextPendingSubmissionCount(context);
+    std::vector<uint8_t> resized_bgra;
+    bool resize_read =
+        resize_new_rendered &&
+        ReadPipelineProbeContext(context, kResizedWidth, kResizedHeight, resized_bgra, &error);
+    uint32_t resize_pending_after_read = GetPipelineProbeContextPendingSubmissionCount(context);
+    const uint8_t* resized_center =
+        resize_read ? resized_bgra.data() +
+                          (size_t(kResizedHeight / 2) * kResizedWidth + kResizedWidth / 2) * 4
+                    : nullptr;
+    bool resize_ok = resize_old_rendered && resize_old_pending == 1 && resize_new_rendered &&
+                     resize_new_pending == 1 && resize_read && resize_pending_after_read == 0 &&
+                     resized_center && PixelNear(resized_center, kExpectedBgra);
+
+    // Release must safely drain without requiring an explicit caller wait.
+    std::string release_context_error;
+    void* release_context = CreatePipelineProbeContext(device, &release_context_error);
+    bool release_rendered =
+        release_context &&
+        render_indexed_fan_to_context(release_context, pipeline_state, &texture, kWidth, kHeight);
+    uint32_t release_pending = GetPipelineProbeContextPendingSubmissionCount(release_context);
+    bool release_drain_ok = release_context && release_rendered && release_pending == 1;
+    ReleasePipelineProbeContext(release_context);
+
+    std::string null_wait_error;
+    uint32_t null_waited = UINT32_MAX;
+    bool null_wait_ok = !WaitPipelineProbeContext(nullptr, &null_wait_error, &null_waited) &&
+                        null_waited == 0 && !null_wait_error.empty() &&
+                        GetPipelineProbeContextPendingSubmissionCount(nullptr) == 0;
+
     [fan_metal_index_buffer release];
     [fan_position_buffer release];
     ReleasePipelineProbeContext(context);
@@ -421,12 +627,15 @@ int RunPipelineProbeTest() {
     if (!blend_ok) {
       std::fprintf(stderr,
                    "[metal_pipeline_probe_test] FAIL: source-alpha blend: %s "
-                   "clear=%d draw=%d read=%d center=%u,%u,%u,%u corner=%u,%u,%u,%u\n",
-                   error.c_str(), int(blend_cleared), int(blend_rendered), int(blend_read),
-                   blend_center ? blend_center[0] : 0, blend_center ? blend_center[1] : 0,
-                   blend_center ? blend_center[2] : 0, blend_center ? blend_center[3] : 0,
-                   blend_corner ? blend_corner[0] : 0, blend_corner ? blend_corner[1] : 0,
-                   blend_corner ? blend_corner[2] : 0, blend_corner ? blend_corner[3] : 0);
+                   "clear=%d destination=%d draw=%d pending=%u read=%d pending_after=%u "
+                   "center=%u,%u,%u,%u corner=%u,%u,%u,%u\n",
+                   error.c_str(), int(blend_cleared), int(blend_destination_rendered),
+                   int(blend_rendered), blend_pending_before_read, int(blend_read),
+                   blend_pending_after_read, blend_center ? blend_center[0] : 0,
+                   blend_center ? blend_center[1] : 0, blend_center ? blend_center[2] : 0,
+                   blend_center ? blend_center[3] : 0, blend_corner ? blend_corner[0] : 0,
+                   blend_corner ? blend_corner[1] : 0, blend_corner ? blend_corner[2] : 0,
+                   blend_corner ? blend_corner[3] : 0);
       return 1;
     }
     if (!mask_ok) {
@@ -440,11 +649,33 @@ int RunPipelineProbeTest() {
                    mask_corner ? mask_corner[2] : 0, mask_corner ? mask_corner[3] : 0);
       return 1;
     }
+    if (!clear_drain_ok || !cap_ok || !invalid_read_fence_ok || !resize_ok || !release_drain_ok ||
+        !null_wait_ok) {
+      std::fprintf(
+          stderr,
+          "[metal_pipeline_probe_test] FAIL: async lifecycle: %s "
+          "clear=(%d,%u,%d,%u) batch=(%d,%u,%d,%u,%d,%u) "
+          "cap=(%d,%u,%d,%u,%d,%u,%d,%u,%u) "
+          "invalid_read=(%d,%u,%d,%u,%s) "
+          "resize=(%d,%u,%d,%u,%d,%u) release=(%d,%u,%s) null_wait=(%d,%u,%s)\n",
+          error.c_str(), int(clear_drain_rendered), clear_pending_before, int(clear_drain_cleared),
+          clear_pending_after, int(cap_submissions_ok), pending_after_63, int(submission_64_ok),
+          pending_after_64, int(submission_65_ok), pending_after_65, int(submissions_to_255_ok),
+          pending_after_255, int(submission_256_ok), pending_after_256, int(submission_257_ok),
+          pending_after_257, int(explicit_wait_ok), explicitly_waited, pending_after_explicit_wait,
+          int(invalid_read_rendered), invalid_read_pending_before, int(invalid_read_rejected),
+          invalid_read_pending_after, invalid_read_error.c_str(), int(resize_old_rendered),
+          resize_old_pending, int(resize_new_rendered), resize_new_pending, int(resize_read),
+          resize_pending_after_read, int(release_rendered), release_pending,
+          release_context_error.c_str(), int(null_wait_ok), null_waited, null_wait_error.c_str());
+      return 1;
+    }
 
     std::fprintf(stdout,
                  "[metal_pipeline_probe_test] PASS: external MTLBuffer rasterized %zu sentinel "
                  "pixels; indexed fan remap rasterized %zu; scissor clipped its right half "
-                 "(%zu clear); source-alpha blend and R/B write mask matched\n",
+                 "(%zu clear); ordered multi-draw batch, R/B write mask, 64-draw command buffers, "
+                 "256-draw drain cap, resize, explicit wait, and release drains matched\n",
                  textured_pixels, indexed_textured_pixels, clear_pixels);
     return 0;
   }
