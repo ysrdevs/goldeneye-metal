@@ -11,9 +11,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string_view>
 
@@ -103,6 +105,20 @@ using namespace rex::graphics::xenos;
 
 namespace {
 
+bool EnvironmentFlagEnabled(const char* name) {
+  const char* value = std::getenv(name);
+  return value && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+}
+
+bool MetalSubmissionDiagnosticsEnabled() {
+  static const bool enabled =
+      EnvironmentFlagEnabled("GOLDENEYE_METAL_SUBMISSION_DIAGNOSTICS");
+  return enabled;
+}
+
+constexpr uint32_t kCommandRingSaveMarker = 0x52494E47u;  // "RING"
+constexpr uint32_t kCommandRingSaveVersion = 1;
+
 ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
   if (value == "fast") {
     return ReadbackResolveMode::kFast;
@@ -126,8 +142,7 @@ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
       register_file_(graphics_system_->register_file()),
       trace_writer_(graphics_system->memory()->physical_membase()),
       worker_running_(true),
-      write_ptr_index_event_(rex::thread::Event::CreateAutoResetEvent(false)),
-      write_ptr_index_(0) {
+      write_ptr_index_event_(rex::thread::Event::CreateAutoResetEvent(false)) {
   assert_not_null(write_ptr_index_event_);
 }
 
@@ -249,11 +264,46 @@ void CommandProcessor::RestoreGammaRamp(const reg::DC_LUT_30_COLOR* new_gamma_ra
 }
 
 void CommandProcessor::CallInThread(std::function<void()> fn) {
-  if (pending_fns_.empty() && system::XThread::IsInThread(worker_thread_.get())) {
+  if (!fn || !worker_running_.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  bool run_inline = false;
+  {
+    std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+    if (!worker_running_.load(std::memory_order_relaxed)) {
+      return;
+    }
+    run_inline = pending_fns_.empty() && worker_thread_ &&
+                 system::XThread::IsInThread(worker_thread_.get());
+    if (!run_inline) {
+      pending_fns_.push(std::move(fn));
+    }
+  }
+
+  if (run_inline) {
     fn();
   } else {
-    pending_fns_.push(std::move(fn));
+    // Pending work and primary-ring writes share this wake event. Without the
+    // signal, a task queued while the ring is idle may wait for an unrelated
+    // future WPTR write.
+    write_ptr_index_event_->Set();
   }
+}
+
+bool CommandProcessor::HasPendingFunctions() const {
+  std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+  return !pending_fns_.empty();
+}
+
+bool CommandProcessor::TryPopPendingFunction(std::function<void()>* fn) {
+  std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+  if (pending_fns_.empty()) {
+    return false;
+  }
+  *fn = std::move(pending_fns_.front());
+  pending_fns_.pop();
+  return true;
 }
 
 void CommandProcessor::ClearCaches() {}
@@ -294,15 +344,21 @@ void CommandProcessor::WorkerThreadMain() {
     return;
   }
 
-  while (worker_running_) {
-    while (!pending_fns_.empty()) {
-      auto fn = std::move(pending_fns_.front());
-      pending_fns_.pop();
+  for (;;) {
+    std::function<void()> fn;
+    while (TryPopPendingFunction(&fn)) {
       fn();
     }
 
-    uint32_t write_ptr_index = write_ptr_index_.load();
-    if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
+    if (!worker_running_.load(std::memory_order_acquire)) {
+      break;
+    }
+
+    CommandRingState::Snapshot ring_snapshot = ring_state_.GetSnapshot();
+    uint32_t write_ptr_index = ring_snapshot.write_pointer;
+    uint32_t read_ptr_index = ring_snapshot.read_pointer;
+    if (write_ptr_index == CommandRingState::kInvalidWritePointer ||
+        read_ptr_index == write_ptr_index) {
       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
       // We've run out of commands to execute.
       // We spin here waiting for new ones, as the overhead of waiting on our
@@ -319,24 +375,45 @@ void CommandProcessor::WorkerThreadMain() {
 
         rex::thread::MaybeYield();
         loop_count++;
-        write_ptr_index = write_ptr_index_.load();
-      } while (worker_running_ && pending_fns_.empty() &&
-               (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+        ring_snapshot = ring_state_.GetSnapshot();
+        write_ptr_index = ring_snapshot.write_pointer;
+        read_ptr_index = ring_snapshot.read_pointer;
+      } while (worker_running_.load(std::memory_order_acquire) && !HasPendingFunctions() &&
+               (write_ptr_index == CommandRingState::kInvalidWritePointer ||
+                read_ptr_index == write_ptr_index));
       ReturnFromWait();
-      if (!worker_running_ || !pending_fns_.empty()) {
+      if (!worker_running_.load(std::memory_order_acquire) || HasPendingFunctions()) {
         continue;
       }
     }
-    assert_true(read_ptr_index_ != write_ptr_index);
+    ring_snapshot = ring_state_.GetSnapshot();
+    if (!ring_snapshot.has_pending_commands()) {
+      continue;
+    }
+    read_ptr_index = ring_snapshot.read_pointer;
+    write_ptr_index = ring_snapshot.write_pointer;
 
     // Execute. Note that we handle wraparound transparently.
-    read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
-
-    // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
-    //     that many indices.
-    if (read_ptr_writeback_ptr_) {
-      memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
-                                       read_ptr_index_);
+    read_ptr_index = ExecutePrimaryBuffer(read_ptr_index, write_ptr_index, ring_snapshot.base,
+                                          ring_snapshot.capacity_bytes());
+    if (!ring_state_.CommitReadPointerAndApply(
+            ring_snapshot.generation, read_ptr_index,
+            [this, read_ptr_index](const CommandRingState::Snapshot& committed_snapshot) {
+              if (!committed_snapshot.read_pointer_writeback_enabled()) {
+                return;
+              }
+              uint32_t writeback_address =
+                  committed_snapshot.read_pointer_writeback_address();
+              uint8_t* writeback_host = memory_->TranslatePhysical(writeback_address);
+              if (committed_snapshot.read_pointer_writeback_swap() == 2) {
+                memory::store_and_swap<uint32_t>(writeback_host, read_ptr_index);
+              } else {
+                memory::store<uint32_t>(writeback_host, read_ptr_index);
+              }
+            })) {
+      // The guest replaced the ring while this batch was executing. Its new
+      // generation owns RPTR and must not be overwritten by stale progress.
+      continue;
     }
 
     // GoldenEye GPU throttle: pause briefly after draining so the emulated GPU
@@ -381,12 +458,24 @@ void CommandProcessor::Resume() {
 bool CommandProcessor::Save(::rex::stream::ByteStream* stream) {
   assert_true(paused_);
 
-  stream->Write<uint32_t>(primary_buffer_ptr_);
-  stream->Write<uint32_t>(primary_buffer_size_);
-  stream->Write<uint32_t>(read_ptr_index_);
-  stream->Write<uint32_t>(read_ptr_update_freq_);
-  stream->Write<uint32_t>(read_ptr_writeback_ptr_);
-  stream->Write<uint32_t>(write_ptr_index_.load());
+  const CommandRingState::Snapshot snapshot = ring_state_.GetSnapshot();
+
+  // Keep the first six fields layout-compatible with existing saves. The old
+  // read-pointer update-frequency slot is now a marker for the appended full
+  // register state, allowing current builds to restore old saves as well.
+  stream->Write<uint32_t>(snapshot.base);
+  stream->Write<uint32_t>(snapshot.capacity_bytes());
+  stream->Write<uint32_t>(snapshot.read_pointer);
+  stream->Write<uint32_t>(kCommandRingSaveMarker);
+  stream->Write<uint32_t>(snapshot.read_pointer_writeback_address());
+  stream->Write<uint32_t>(snapshot.write_pointer);
+
+  stream->Write<uint32_t>(kCommandRingSaveVersion);
+  stream->Write<uint32_t>(snapshot.control);
+  stream->Write<uint32_t>(snapshot.read_pointer_address_register);
+  stream->Write<uint32_t>(snapshot.read_pointer_write);
+  stream->Write<uint32_t>(snapshot.base_programmed ? 1u : 0u);
+  stream->Write<uint32_t>(snapshot.control_programmed ? 1u : 0u);
 
   return true;
 }
@@ -394,12 +483,60 @@ bool CommandProcessor::Save(::rex::stream::ByteStream* stream) {
 bool CommandProcessor::Restore(::rex::stream::ByteStream* stream) {
   assert_true(paused_);
 
-  primary_buffer_ptr_ = stream->Read<uint32_t>();
-  primary_buffer_size_ = stream->Read<uint32_t>();
-  read_ptr_index_ = stream->Read<uint32_t>();
-  read_ptr_update_freq_ = stream->Read<uint32_t>();
-  read_ptr_writeback_ptr_ = stream->Read<uint32_t>();
-  write_ptr_index_.store(stream->Read<uint32_t>());
+  const uint32_t legacy_base = stream->Read<uint32_t>();
+  const uint32_t legacy_capacity_bytes = stream->Read<uint32_t>();
+  const uint32_t restored_read_pointer = stream->Read<uint32_t>();
+  const uint32_t marker_or_update_frequency = stream->Read<uint32_t>();
+  const uint32_t legacy_writeback_address = stream->Read<uint32_t>();
+  const uint32_t restored_write_pointer = stream->Read<uint32_t>();
+
+  CommandRingState::Snapshot snapshot;
+  snapshot.base = legacy_base;
+  snapshot.read_pointer = restored_read_pointer;
+  snapshot.write_pointer = restored_write_pointer;
+
+  if (marker_or_update_frequency == kCommandRingSaveMarker) {
+    const uint32_t version = stream->Read<uint32_t>();
+    if (version != kCommandRingSaveVersion) {
+      REXGPU_ERROR("Unsupported command-ring save version {}", version);
+      return false;
+    }
+    snapshot.control = stream->Read<uint32_t>();
+    snapshot.read_pointer_address_register = stream->Read<uint32_t>();
+    snapshot.read_pointer_write = stream->Read<uint32_t>();
+    snapshot.base_programmed = stream->Read<uint32_t>() != 0;
+    snapshot.control_programmed = stream->Read<uint32_t>() != 0;
+    if (snapshot.base_programmed && snapshot.control_programmed &&
+        CommandRingState::DecodeCapacityBytes(snapshot.control) != legacy_capacity_bytes) {
+      REXGPU_ERROR("Command-ring save capacity does not match its control register");
+      return false;
+    }
+  } else if (legacy_capacity_bytes) {
+    // Legacy saves stored a derived size and update frequency rather than the
+    // raw CNTL/RPTR registers. Reconstruct the closest equivalent state.
+    if (!std::has_single_bit(legacy_capacity_bytes) || legacy_capacity_bytes < 8u) {
+      REXGPU_ERROR("Invalid legacy command-ring capacity {}", legacy_capacity_bytes);
+      return false;
+    }
+    const uint32_t size_log2 =
+        legacy_capacity_bytes >= 32u ? std::countr_zero(legacy_capacity_bytes) - 3u : 0u;
+    snapshot.control = CommandRingState::kDefaultInitializeControl | size_log2;
+    snapshot.base_programmed = true;
+    snapshot.control_programmed = true;
+    if (legacy_writeback_address) {
+      snapshot.read_pointer_address_register =
+          (legacy_writeback_address & CommandRingState::kAddressMask) | 2u;
+      snapshot.control &= ~CommandRingState::kControlNoUpdate;
+      if (marker_or_update_frequency && std::has_single_bit(marker_or_update_frequency)) {
+        const uint32_t block_size_log2 =
+            std::countr_zero(marker_or_update_frequency) + 2u;
+        snapshot.control |=
+            (block_size_log2 << 8) & CommandRingState::kControlBlockSizeMask;
+      }
+    }
+  }
+
+  ring_state_.Restore(snapshot);
 
   return true;
 }
@@ -411,34 +548,44 @@ bool CommandProcessor::SetupContext() {
 void CommandProcessor::ShutdownContext() {}
 
 void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
-  read_ptr_index_ = 0;
-  primary_buffer_ptr_ = ptr;
-  primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
+  ring_state_.Initialize(ptr, size_log2);
 }
 
 void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) {
   // CP_RB_RPTR_ADDR Ring Buffer Read Pointer Address 0x70C
   // ptr = RB_RPTR_ADDR, pointer to write back the address to.
-  read_ptr_writeback_ptr_ = ptr;
   // CP_RB_CNTL Ring Buffer Control 0x704
   // block_size = RB_BLKSZ, log2 of number of quadwords read between updates of
   //              the read pointer.
-  read_ptr_update_freq_ = uint32_t(1) << block_size_log2 >> 2;
+  ring_state_.WriteReadPointerAddress((ptr & CommandRingState::kAddressMask) | 2u);
+  CommandRingState::Snapshot snapshot = ring_state_.GetSnapshot();
+  uint32_t control = snapshot.control & ~(CommandRingState::kControlNoUpdate |
+                                          CommandRingState::kControlBlockSizeMask);
+  control |= (block_size_log2 << 8) & CommandRingState::kControlBlockSizeMask;
+  ring_state_.WriteControl(control);
 }
 
 void CommandProcessor::UpdateWritePointer(uint32_t value) {
-  write_ptr_index_ = value;
+  if (!ring_state_.WriteWritePointer(value)) {
+    return;
+  }
+  CommandRingState::Snapshot ring_snapshot = ring_state_.GetSnapshot();
+  value = ring_snapshot.write_pointer;
   static std::atomic<uint32_t> wptr_logs{0};
   uint32_t wptr_index = wptr_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (wptr_index <= 32 || (wptr_index & 0x3F) == 0) {
-    uint32_t pending_offset = (read_ptr_index_ % (primary_buffer_size_ / sizeof(uint32_t))) *
+  const uint32_t primary_buffer_ptr = ring_snapshot.base;
+  const uint32_t primary_buffer_size = ring_snapshot.capacity_bytes();
+  if (MetalSubmissionDiagnosticsEnabled() && primary_buffer_size &&
+      (wptr_index <= 32 || (wptr_index & 0x3F) == 0)) {
+    uint32_t read_ptr_index = ring_snapshot.read_pointer;
+    uint32_t pending_offset = (read_ptr_index % (primary_buffer_size / sizeof(uint32_t))) *
                               sizeof(uint32_t);
     uint32_t physical_value = memory::load_and_swap<uint32_t>(
-        memory_->TranslatePhysical(primary_buffer_ptr_ + pending_offset));
-    uint32_t alias_a = 0xA0000000u | ((primary_buffer_ptr_ + pending_offset) & 0x1FFFFFFFu);
-    uint32_t alias_c = 0xC0000000u | ((primary_buffer_ptr_ + pending_offset) & 0x1FFFFFFFu);
+        memory_->TranslatePhysical(primary_buffer_ptr + pending_offset));
+    uint32_t alias_a = 0xA0000000u | ((primary_buffer_ptr + pending_offset) & 0x1FFFFFFFu);
+    uint32_t alias_c = 0xC0000000u | ((primary_buffer_ptr + pending_offset) & 0x1FFFFFFFu);
     uint32_t alias_e = 0xE0000000u |
-                       (((primary_buffer_ptr_ + pending_offset) - 0x1000u) & 0x1FFFFFFFu);
+                       (((primary_buffer_ptr + pending_offset) - 0x1000u) & 0x1FFFFFFFu);
     uint32_t alias_a_value =
         memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(alias_a));
     uint32_t alias_c_value =
@@ -446,8 +593,8 @@ void CommandProcessor::UpdateWritePointer(uint32_t value) {
     uint32_t alias_e_value =
         memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(alias_e));
     std::fprintf(stderr, "[rex] CP WPTR#%u value=0x%08x rptr=0x%08x ring=0x%08x size=0x%08x\n",
-                 wptr_index, value, read_ptr_index_, primary_buffer_ptr_,
-                 primary_buffer_size_);
+                 wptr_index, value, read_ptr_index, primary_buffer_ptr,
+                 primary_buffer_size);
     std::fprintf(stderr,
                  "[rex] CP WPTR alias#%u offset=0x%08x phys=%08x A[%08x]=%08x C[%08x]=%08x "
                  "E[%08x]=%08x\n",
@@ -461,22 +608,22 @@ void CommandProcessor::UpdateWritePointer(uint32_t value) {
     // zero on phys but nonzero on the A-alias => phys/virtual coherency;
     // zero everywhere => title writes the ring at a different (CP_RB_BASE) base.
     {
-      uint32_t ring_dwords = primary_buffer_size_ / sizeof(uint32_t);
+      uint32_t ring_dwords = primary_buffer_size / sizeof(uint32_t);
       uint32_t w = ring_dwords ? (value % ring_dwords) : value;
       uint32_t s = (w >= 3u) ? (w - 3u) : 0u;
       uint32_t phys[3] = {0, 0, 0};
       uint32_t aval[3] = {0, 0, 0};
       for (uint32_t i = 0; i < 3u; ++i) {
         uint32_t off = (s + i) * uint32_t(sizeof(uint32_t));
-        phys[i] =
-            memory::load_and_swap<uint32_t>(memory_->TranslatePhysical(primary_buffer_ptr_ + off));
-        uint32_t alias = 0xA0000000u | ((primary_buffer_ptr_ + off) & 0x1FFFFFFFu);
+        phys[i] = memory::load_and_swap<uint32_t>(
+            memory_->TranslatePhysical(primary_buffer_ptr + off));
+        uint32_t alias = 0xA0000000u | ((primary_buffer_ptr + off) & 0x1FFFFFFFu);
         aval[i] = memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(alias));
       }
       std::fprintf(stderr,
                    "[ge-diag] WPTR-slot#%u wptr=0x%x base=0x%08x s=0x%x phys=%08x %08x %08x "
                    "A=%08x %08x %08x\n",
-                   wptr_index, value, primary_buffer_ptr_, s, phys[0], phys[1], phys[2], aval[0],
+                   wptr_index, value, primary_buffer_ptr, s, phys[0], phys[1], phys[2], aval[0],
                    aval[1], aval[2]);
       std::fflush(stderr);
     }
@@ -484,8 +631,60 @@ void CommandProcessor::UpdateWritePointer(uint32_t value) {
   write_ptr_index_event_->Set();
 }
 
+uint32_t CommandProcessor::ReadRingBufferRegister(uint32_t index) const {
+  const CommandRingState::Snapshot snapshot = ring_state_.GetSnapshot();
+  switch (index) {
+    case CommandRingState::kRegisterBase:
+      return snapshot.base;
+    case CommandRingState::kRegisterControl:
+      return snapshot.control;
+    case CommandRingState::kRegisterReadPointerAddress:
+      return snapshot.read_pointer_address_register;
+    case CommandRingState::kRegisterReadPointer:
+      return snapshot.read_pointer;
+    case CommandRingState::kRegisterWritePointer:
+      return snapshot.write_pointer_valid() ? snapshot.write_pointer : 0u;
+    case CommandRingState::kRegisterReadPointerWrite:
+      return snapshot.read_pointer_write;
+    default:
+      return 0;
+  }
+}
+
+void CommandProcessor::WriteRingBufferRegister(uint32_t index, uint32_t value) {
+  switch (index) {
+    case CommandRingState::kRegisterBase:
+      ring_state_.WriteBase(value);
+      break;
+    case CommandRingState::kRegisterControl:
+      ring_state_.WriteControl(value);
+      break;
+    case CommandRingState::kRegisterReadPointerAddress:
+      ring_state_.WriteReadPointerAddress(value);
+      break;
+    case CommandRingState::kRegisterReadPointerWrite:
+      ring_state_.WriteReadPointerWrite(value);
+      break;
+    case CommandRingState::kRegisterWritePointer:
+      UpdateWritePointer(value);
+      return;
+    default:
+      return;
+  }
+
+  write_ptr_index_event_->Set();
+}
 
 uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
+  switch (index) {
+    case CommandRingState::kRegisterBase:
+    case CommandRingState::kRegisterControl:
+    case CommandRingState::kRegisterReadPointerAddress:
+    case CommandRingState::kRegisterReadPointer:
+    case CommandRingState::kRegisterWritePointer:
+    case CommandRingState::kRegisterReadPointerWrite:
+      return ReadRingBufferRegister(index);
+  }
   if (index < RegisterFile::kRegisterCount) {
     return register_file_->values[index];
   }
@@ -494,6 +693,16 @@ uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
 }
 
 void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+  switch (index) {
+    case CommandRingState::kRegisterBase:
+    case CommandRingState::kRegisterControl:
+    case CommandRingState::kRegisterReadPointerAddress:
+    case CommandRingState::kRegisterWritePointer:
+    case CommandRingState::kRegisterReadPointerWrite:
+      WriteRingBufferRegister(index, value);
+      return;
+  }
+
   RegisterFile& regs = *register_file_;
   if (index >= RegisterFile::kRegisterCount) {
     auto [it, inserted] = extended_register_values_.insert_or_assign(index, value);
@@ -516,7 +725,8 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   // (regs 0x4800..0x4800+32*6), regardless of path (SET_CONSTANT/FETCH,
   // LOAD_ALU_CONSTANT/FETCH, SET_CONSTANT2, raw type-0). dword_1 (rel%6==1) holds
   // base_address<<12. Reveals whether the menu textures ever bind to slots 0/1.
-  if (index >= 0x4800u && index < 0x4800u + 32u * 6u && (index - 0x4800u) % 6u == 1u &&
+  if (MetalSubmissionDiagnosticsEnabled() && index >= 0x4800u &&
+      index < 0x4800u + 32u * 6u && (index - 0x4800u) % 6u == 1u &&
       (value & 0xFFFFF000u) != 0u) {
     if (graphics_system_ && graphics_system_->name() == "Metal") {
       static std::atomic<uint32_t> fr_logs{0};
@@ -700,7 +910,8 @@ void CommandProcessor::WriteFetchRangeFromRing(memory::RingBuffer* ring, uint32_
   // menu textures ever get bound to the slots the pixel shaders sample. A texture
   // fetch constant is 6 dwords; base_address (dword_1 bits 12..31) << 12 is the
   // guest texel address.
-  if (num_registers && graphics_system_ && graphics_system_->name() == "Metal") {
+  if (MetalSubmissionDiagnosticsEnabled() && num_registers && graphics_system_ &&
+      graphics_system_->name() == "Metal") {
     static std::atomic<uint32_t> fetch_logs{0};
     uint32_t li = fetch_logs.fetch_add(1, std::memory_order_relaxed) + 1;
     if (li <= 600) {
@@ -805,7 +1016,9 @@ void CommandProcessor::PrepareForWait() {
 
 void CommandProcessor::ReturnFromWait() {}
 
-uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index) {
+uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index,
+                                                uint32_t primary_buffer_ptr,
+                                                uint32_t primary_buffer_size) {
   SCOPE_profile_cpu_f("gpu");
 
   // If we have a pending trace stream open it now. That way we ensure we get
@@ -820,25 +1033,30 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   }
 
   // Adjust pointer base.
-  uint32_t start_ptr = primary_buffer_ptr_ + read_index * sizeof(uint32_t);
-  start_ptr = (primary_buffer_ptr_ & ~0x1FFFFFFF) | (start_ptr & 0x1FFFFFFF);
-  uint32_t end_ptr = primary_buffer_ptr_ + write_index * sizeof(uint32_t);
-  end_ptr = (primary_buffer_ptr_ & ~0x1FFFFFFF) | (end_ptr & 0x1FFFFFFF);
+  uint32_t ring_dwords = primary_buffer_size / sizeof(uint32_t);
+  uint32_t pending_dwords = write_index >= read_index
+                                ? write_index - read_index
+                                : ring_dwords - read_index + write_index;
+  uint32_t start_ptr = primary_buffer_ptr + read_index * sizeof(uint32_t);
+  start_ptr = (primary_buffer_ptr & ~0x1FFFFFFF) | (start_ptr & 0x1FFFFFFF);
+  uint32_t end_ptr = primary_buffer_ptr + write_index * sizeof(uint32_t);
+  end_ptr = (primary_buffer_ptr & ~0x1FFFFFFF) | (end_ptr & 0x1FFFFFFF);
 
-  if (graphics_system_ && graphics_system_->name() == "Metal") {
+  if (MetalSubmissionDiagnosticsEnabled() && graphics_system_ &&
+      graphics_system_->name() == "Metal") {
     static std::atomic<uint32_t> metal_primary_logs{0};
     uint32_t primary_log_index = metal_primary_logs.fetch_add(1, std::memory_order_relaxed) + 1;
     if (primary_log_index <= 32 || (primary_log_index & 0x3F) == 0) {
-      uint32_t dword_count = write_index - read_index;
-      uint8_t* ring_base = memory_->TranslatePhysical(primary_buffer_ptr_);
+      uint32_t dword_count = pending_dwords;
+      uint8_t* ring_base = memory_->TranslatePhysical(primary_buffer_ptr);
       std::fprintf(stderr,
                    "[rex] Metal primary#%u r=%08x w=%08x count=%u start=0x%08x end=0x%08x "
                    "ring=0x%08x size=0x%08x",
                    primary_log_index, read_index, write_index, dword_count, start_ptr, end_ptr,
-                   primary_buffer_ptr_, primary_buffer_size_);
+                   primary_buffer_ptr, primary_buffer_size);
       uint32_t preview_count = std::min<uint32_t>(dword_count, 12);
       for (uint32_t i = 0; i < preview_count; ++i) {
-        uint32_t dword_offset = (read_index + i) % (primary_buffer_size_ / sizeof(uint32_t));
+        uint32_t dword_offset = (read_index + i) % ring_dwords;
         uint32_t value =
             memory::load_and_swap<uint32_t>(ring_base + size_t(dword_offset) * sizeof(uint32_t));
         std::fprintf(stderr, " %08x", value);
@@ -848,10 +1066,10 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
     }
   }
 
-  trace_writer_.WritePrimaryBufferStart(start_ptr, write_index - read_index);
+  trace_writer_.WritePrimaryBufferStart(start_ptr, pending_dwords);
 
   // Execute commands!
-  memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
+  memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr), primary_buffer_size);
   reader.set_read_offset(read_index * sizeof(uint32_t));
   reader.set_write_offset(write_index * sizeof(uint32_t));
   do {
@@ -1242,7 +1460,9 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     } else if (trace_state_ == TraceState::kSingleFrame) {
       // New trace request - we only start tracing at the beginning of a frame.
       uint32_t title_id = kernel_state_->GetExecutableModule()->title_id();
-      auto file_name = fmt::format("{:08X}_{}.xtr", title_id, counter_ - 1);
+      auto file_name =
+          fmt::format("{:08X}_{}.xtr", title_id,
+                      counter_.load(std::memory_order_acquire) - 1);
       auto path = trace_frame_path_ / file_name;
       trace_writer_.Open(path, title_id);
       InitializeTrace();
@@ -1351,10 +1571,11 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 
   static std::atomic<uint32_t> xe_swap_logs{0};
   uint32_t xe_swap_index = xe_swap_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (xe_swap_index <= 16 || (xe_swap_index & 0x3F) == 0) {
+  if (MetalSubmissionDiagnosticsEnabled() &&
+      (xe_swap_index <= 16 || (xe_swap_index & 0x3F) == 0)) {
     std::fprintf(stderr, "[rex] CP XE_SWAP#%u fb_pa=0x%08x %ux%u counter=%u\n",
                  xe_swap_index, frontbuffer_ptr, frontbuffer_width, frontbuffer_height,
-                 counter_);
+                 counter_.load(std::memory_order_acquire));
     std::fflush(stderr);
   }
 
@@ -1399,11 +1620,14 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   // give up and proceed, which lets the CP advance, the guest wait clear, and
   // the CPU resume and write the fence. Worst case is a one-frame artifact, not
   // a hard freeze.
-  // [GE] On Metal the primary ring is empty; every WAIT_REG_MEM comes from the
-  // VdSwap bridge replaying the title's (often stale) command segment, where the
-  // polled fence never changes during this synchronous replay. Stalling 60ms on
-  // each craters the frame rate so the menu never advances. Check once, proceed.
-  const bool fast_wait_metal = graphics_system_ && graphics_system_->name() == "Metal";
+  // The opt-in VdSwap scavenger replays synchronously and may encounter stale
+  // fences that cannot change during the replay. Only that legacy diagnostic
+  // gets the one-poll behavior; packets from the real primary ring retain normal
+  // WAIT_REG_MEM semantics.
+  static const bool vd_swap_scavenger_enabled =
+      EnvironmentFlagEnabled("GOLDENEYE_METAL_VDSWAP_SCAVENGE");
+  const bool fast_wait_metal = vd_swap_scavenger_enabled && graphics_system_ &&
+                               graphics_system_->name() == "Metal";
   const auto wait_deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(60);
 
@@ -1644,7 +1868,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   uint32_t data_value;
   if ((initiator >> 31) & 0x1) {
     // Write counter (GPU vblank counter?).
-    data_value = counter_;
+    data_value = counter_.load(std::memory_order_acquire);
   } else {
     // Write value.
     data_value = value;
@@ -1969,20 +2193,18 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
   uint32_t size_dwords = start_size & 0xFFFF;  // dwords
   assert_true(start == 0);
 
-  // [GE] Reject bogus IM_LOAD packets (null / out-of-range shader address). The
-  // Metal bridge can scavenge false IM_LOAD headers from gap data; loading from
-  // them clobbers the active shader with garbage -> black menu. Keep the last
-  // valid shader instead of overwriting it.
+  // IM_LOAD addresses are physical and therefore limited to the 29-bit Xenos
+  // GPU address space. Do not dereference malformed packets outside it.
   if (addr == 0 || addr >= 0x20000000u) {
     return true;
   }
 
-  // [GE] Sanity guard: the VdSwap bridge can scavenge NON-microcode bytes from
-  // gap data and present them as a shader (proven: VS 1f20 = high-entropy noise,
-  // 57 distinct bytes in 64). Real Xenos microcode is highly structured (CF +
-  // packed ALU/fetch) with modest byte diversity. Reject near-random bytes and
-  // KEEP the previously-bound shader instead of rendering garbage.
-  {
+  // The legacy VdSwap scavenger may mistake high-entropy gap data for an
+  // IM_LOAD. Keep its old filter inside that opt-in diagnostic only; rejecting
+  // a shader by byte diversity is not valid for the authoritative PM4 path.
+  static const bool vd_swap_scavenger_enabled =
+      EnvironmentFlagEnabled("GOLDENEYE_METAL_VDSWAP_SCAVENGE");
+  if (vd_swap_scavenger_enabled) {
     const uint8_t* uc = memory_->TranslatePhysical<const uint8_t*>(addr);
     if (uc) {
       uint32_t nbytes = std::min<uint32_t>(size_dwords * 4u, 64u);
@@ -2010,11 +2232,11 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
     }
   }
 
-  // [GE-DIAG] Shader-load truncation probe. bdc9 (a menu content PS) loads
-  // size_dwords=9 = CF-only; its body is missing -> unsupportedTfetch -> black.
-  // Peek guest memory PAST the claimed size: if real ucode lives there, the
-  // size field (from the VdSwap bridge's PM4) is truncated, not the data.
-  {
+  // Opt-in shader-boundary diagnostic. Reading past the guest-provided IM_LOAD
+  // extent is never part of normal command execution.
+  static const bool im_load_diagnostics_enabled =
+      EnvironmentFlagEnabled("GOLDENEYE_METAL_IM_LOAD_DIAGNOSTICS");
+  if (im_load_diagnostics_enabled) {
     static std::atomic<uint32_t> ge_imload_logs{0};
     uint32_t idx = ge_imload_logs.fetch_add(1, std::memory_order_relaxed) + 1;
     if (idx <= 64) {
@@ -2044,7 +2266,7 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
   {
     static std::atomic<uint32_t> ge_ptr_logs{0};
     uint32_t i = ge_ptr_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-    if ((i <= 64 || (i & 0xFF) == 0) && shader) {
+    if (MetalSubmissionDiagnosticsEnabled() && (i <= 64 || (i & 0xFF) == 0) && shader) {
       std::fprintf(stderr, "[ge-shaderload] PTR#%u type=%u size=%u addr=0x%08x hash=%016llx\n", i,
                    uint32_t(shader_type), size_dwords, addr,
                    (unsigned long long)shader->ucode_data_hash());
@@ -2084,7 +2306,7 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer* 
   {
     static std::atomic<uint32_t> ge_imm_logs{0};
     uint32_t i = ge_imm_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-    if ((i <= 64 || (i & 0xFF) == 0) && shader) {
+    if (MetalSubmissionDiagnosticsEnabled() && (i <= 64 || (i & 0xFF) == 0) && shader) {
       std::fprintf(stderr, "[ge-shaderload] IMM#%u type=%u size=%u count=%u hash=%016llx\n", i,
                    uint32_t(shader_type), size_dwords, count,
                    (unsigned long long)shader->ucode_data_hash());

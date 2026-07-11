@@ -20,8 +20,9 @@ PM4 command stream -> Xenos shader translation -> Metal draws -> Metal RT/EDRAM
 
 Implemented foundations include the macOS window and presenter, shared guest memory, texture
 decode and upload, Xenos-to-SPIR-V-to-MSL translation, private Metal render targets, resolve-copy,
-and swap presentation. The current blocker is faithful delivery of the real command stream,
-vertex fetches, and shader inputs to the producer draw path.
+and swap presentation. The title's real primary ring, indirect buffers, shaders, resolves, and
+`XE_SWAP` now reach Metal without heuristic replay. The current blocker is producer-draw fidelity:
+real draws execute, but the render target remains black.
 
 See [the native Metal status report](docs/GOLDENEYE_NATIVE_METAL_PROJECT_STATUS.md) for the exact
 milestones, evidence, and next development priority.
@@ -65,7 +66,7 @@ brew install cmake spirv-cross
 Clone and initialize the source dependencies:
 
 ```sh
-git clone --recurse-submodules <repository-url> goldeneye-metal
+git clone --recurse-submodules https://github.com/ysrdevs/goldeneye-metal.git
 cd goldeneye-metal
 git submodule update --init --recursive
 ```
@@ -81,8 +82,8 @@ ctest --preset macos-arm64-release --output-on-failure
 
 ### Generate and build the game target
 
-Create `vendor/GoldenEye-Recomp/assets/`, place your authorized compatible files there, and ensure
-the entry executable is named `default.xex`. Then run:
+Create `vendor/GoldenEye-Recomp/assets/`, place an authorized compatible `default.xex` there for
+code generation, then run:
 
 ```sh
 ./out/macos-arm64/rexglue codegen \
@@ -93,11 +94,13 @@ cmake --build vendor/GoldenEye-Recomp/out/build/macos-arm64-release \
   --target ge --parallel
 ```
 
-The game executable is written to its vendor build directory. Run it from the repository root with:
+The game executable is written to its vendor build directory. Run it from the repository root
+against your complete authorized game-data directory, which must include `default.xex`, `files/`,
+and the companion title data:
 
 ```sh
 ./vendor/GoldenEye-Recomp/out/build/macos-arm64-release/GoldenEye \
-  --game_data_root vendor/GoldenEye-Recomp/assets \
+  --game_data_root /absolute/path/to/complete/game-data \
   --gpu metal
 ```
 

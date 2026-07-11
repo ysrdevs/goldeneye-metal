@@ -278,6 +278,13 @@ uint32_t GraphicsSystem::ReadRegister(uint32_t addr) {
   uint32_t r = (addr & 0xFFFF) / 4;
 
   switch (r) {
+    case CommandRingState::kRegisterBase:
+    case CommandRingState::kRegisterControl:
+    case CommandRingState::kRegisterReadPointerAddress:
+    case CommandRingState::kRegisterReadPointer:
+    case CommandRingState::kRegisterWritePointer:
+    case CommandRingState::kRegisterReadPointerWrite:
+      return command_processor_ ? command_processor_->ReadRingBufferRegister(r) : 0;
     case 0x0F00:  // RB_EDRAM_TIMING
       return 0x08100748;
     case 0x0F01:  // RB_BC_CONTROL
@@ -311,20 +318,16 @@ void GraphicsSystem::WriteRegister(uint32_t addr, uint32_t value) {
   uint32_t r = (addr & 0xFFFF) / 4;
 
   switch (r) {
-    case 0x01C5:  // CP_RB_WPTR
-      command_processor_->UpdateWritePointer(value);
+    case CommandRingState::kRegisterBase:
+    case CommandRingState::kRegisterControl:
+    case CommandRingState::kRegisterReadPointerAddress:
+    case CommandRingState::kRegisterWritePointer:
+    case CommandRingState::kRegisterReadPointerWrite:
+      command_processor_->WriteRingBufferRegister(r, value);
       break;
     case 0x1844:  // AVIVO_D1GRPH_PRIMARY_SURFACE_ADDRESS
       break;
     default:
-      // [GE-DIAG] Watch the CP ring-control registers the CP currently DROPS.
-      // r: 0x01C0=CP_RB_BASE, 0x01C1=CP_RB_CNTL, 0x01C3=CP_RB_RPTR_ADDR,
-      // 0x01C4=CP_RB_RPTR_WR. If the title reprograms the ring base here, the CP
-      // is draining a stale base (0x1fc9d000) -> empty ring.
-      if (r == 0x01C0 || r == 0x01C1 || r == 0x01C2 || r == 0x01C3 || r == 0x01C4) {
-        std::fprintf(stderr, "[ge-diag] CP ring-ctl reg %04X write = %08X\n", r, value);
-        std::fflush(stderr);
-      }
       REXGPU_WARN("Unknown GPU register {:04X} write: {:08X}", r, value);
       break;
   }

@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <rex/graphics/command_ring_state.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/trace_writer.h>
@@ -85,10 +86,12 @@ class CommandProcessor {
   CommandProcessor(GraphicsSystem* graphics_system, system::KernelState* kernel_state);
   virtual ~CommandProcessor();
 
-  uint32_t counter() const { return counter_; }
-  void increment_counter() { counter_++; }
-  uint32_t swap_counter() const { return swap_counter_; }
-  void increment_swap_counter() { swap_counter_++; }
+  uint32_t counter() const { return counter_.load(std::memory_order_acquire); }
+  void increment_counter() { counter_.fetch_add(1, std::memory_order_acq_rel); }
+  uint32_t swap_counter() const { return swap_counter_.load(std::memory_order_acquire); }
+  void increment_swap_counter() { swap_counter_.fetch_add(1, std::memory_order_acq_rel); }
+  uint32_t read_ptr_index() const { return ring_state_.GetSnapshot().read_pointer; }
+  uint32_t write_ptr_index() const { return ring_state_.GetSnapshot().write_pointer; }
 
   Shader* active_vertex_shader() const { return active_vertex_shader_; }
   Shader* active_pixel_shader() const { return active_pixel_shader_; }
@@ -135,6 +138,8 @@ class CommandProcessor {
   void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2);
 
   void UpdateWritePointer(uint32_t value);
+  uint32_t ReadRingBufferRegister(uint32_t index) const;
+  void WriteRingBufferRegister(uint32_t index, uint32_t value);
 
   void ExecutePacket(uint32_t ptr, uint32_t count);
 
@@ -155,6 +160,8 @@ class CommandProcessor {
   };
 
   void WorkerThreadMain();
+  bool HasPendingFunctions() const;
+  bool TryPopPendingFunction(std::function<void()>* fn);
   virtual bool SetupContext() = 0;
   virtual void ShutdownContext() = 0;
 
@@ -185,7 +192,8 @@ class CommandProcessor {
   virtual void PrepareForWait();
   virtual void ReturnFromWait();
 
-  uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
+  uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index,
+                                uint32_t primary_buffer_ptr, uint32_t primary_buffer_size);
   virtual void OnPrimaryBufferEnd() {}
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
   bool ExecutePacket(memory::RingBuffer* reader);
@@ -266,23 +274,18 @@ class CommandProcessor {
   std::atomic<bool> worker_running_;
   system::object_ref<system::XHostThread> worker_thread_;
 
+  mutable std::mutex pending_fns_mutex_;
   std::queue<std::function<void()>> pending_fns_;
 
   // MicroEngine binary from PM4_ME_INIT
   std::vector<uint32_t> me_bin_;
 
-  uint32_t counter_ = 0;
-  uint32_t swap_counter_ = 0;
+  std::atomic<uint32_t> counter_{0};
+  std::atomic<uint32_t> swap_counter_{0};
 
-  uint32_t primary_buffer_ptr_ = 0;
-  uint32_t primary_buffer_size_ = 0;
-
-  uint32_t read_ptr_index_ = 0;
-  uint32_t read_ptr_update_freq_ = 0;
-  uint32_t read_ptr_writeback_ptr_ = 0;
+  CommandRingState ring_state_;
 
   std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
-  std::atomic<uint32_t> write_ptr_index_;
 
   // Some titles submit writes beyond the emulated register file range in PM4
   // packets. Preserve these values so dependent packet logic can still observe

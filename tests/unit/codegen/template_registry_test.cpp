@@ -133,6 +133,7 @@ TEST_CASE("TemplateRegistry: init_h includes shared indirect-call partial", "[Te
   CHECK(result.find("ResolveIndirectFunction") != std::string::npos);
   CHECK(result.find("last_indirect_target") != std::string::npos);
   CHECK(result.find("REX_THUNK_RESERVE_SIZE") != std::string::npos);
+  CHECK(result.find("rex::memory::PhysicalHostOffset") != std::string::npos);
   CHECK(result.find("[[likely]]") != std::string::npos);
   CHECK(result.find("[[unlikely]]") != std::string::npos);
 }
@@ -150,6 +151,7 @@ TEST_CASE("TemplateRegistry: ppc_config_h includes shared indirect-call partial"
   std::string result = registry.render("test/ppc_config_h", json);
   CHECK(result.find("ResolveIndirectFunction") != std::string::npos);
   CHECK(result.find("last_indirect_target") != std::string::npos);
+  CHECK(result.find("rex::memory::PhysicalHostOffset") != std::string::npos);
   CHECK(result.find("[[likely]]") != std::string::npos);
 }
 

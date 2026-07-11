@@ -37,7 +37,7 @@ From the repository root:
 
 ```sh
 mkdir -p vendor/GoldenEye-Recomp/assets
-# Supply vendor/GoldenEye-Recomp/assets/default.xex locally.
+# Supply vendor/GoldenEye-Recomp/assets/default.xex locally for code generation.
 
 ./out/macos-arm64/rexglue codegen \
   vendor/GoldenEye-Recomp/ge_manifest.toml
@@ -50,6 +50,18 @@ cmake --build vendor/GoldenEye-Recomp/out/build/macos-arm64-release \
 The vendor preset points `REXSDK_DIR` back to the repository root, enables Metal, disables Vulkan,
 and leaves runtime profiling off. Generated files stay under `vendor/GoldenEye-Recomp/generated/`
 and must not be committed.
+
+Run the game against the complete authorized game-data directory, not an XEX-only staging
+directory. The runtime root must contain `default.xex`, `files/`, and the title's companion data:
+
+```sh
+./vendor/GoldenEye-Recomp/out/build/macos-arm64-release/GoldenEye \
+  --game_data_root /absolute/path/to/complete/game-data \
+  --gpu metal
+```
+
+Missing extracted data can look like a runtime or renderer fault because optional resource loads
+resolve to null. Game data stays local and must never be committed.
 
 ## Tests
 
@@ -71,10 +83,9 @@ Diagnostics are opt-in so normal runs do not write files or substitute success c
 | --- | --- |
 | `GOLDENEYE_METAL_DUMP_SHADERS=1` | Write translated/failed MSL and selected microcode dumps under `/tmp` |
 | `GOLDENEYE_METAL_DUMP_FRAMES=1` | Write selected BGRA frame stages as PPM files under `/tmp` |
-| `GOLDENEYE_METAL_NO_BRIDGE=1` | Disable the heuristic VdSwap command scavenger |
-| `GOLDENEYE_METAL_KICKOFF_REPLAY=1` | Enable exact kickoff replay instrumentation |
-| `GOLDENEYE_METAL_FLUSH_REPLAY=1` | Enable exact flush replay instrumentation |
-| `GOLDENEYE_METAL_COMBINED_REPLAY=1` | Enable both exact replay paths |
+| `GOLDENEYE_METAL_SUBMISSION_DIAGNOSTICS=1` | Log rate-limited kickoff, flush, and VdSwap metadata without replaying it |
+| `GOLDENEYE_METAL_VDSWAP_SCAVENGE=1` | Enable the legacy heuristic VdSwap packet scavenger; this changes execution and is not a strict-path result |
+| `GOLDENEYE_METAL_IM_LOAD_DIAGNOSTICS=1` | Inspect words beyond pointer-based shader extents for boundary diagnosis |
 | `GOLDENEYE_METAL_PIPELINE_PROBE=1` | Exercise pipeline-probe diagnostics |
 | `GOLDENEYE_METAL_HOST_RT_SOLID_TEST=1` | Run the controlled solid render-target test |
 | `GOLDENEYE_METAL_MAGENTA_RESOLVE=1` | Run the controlled resolve visibility test |

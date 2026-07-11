@@ -2,6 +2,8 @@
 
 add_executable(unit_tests
     memory/heap_allocation_test.cpp
+    memory/physical_host_offset_test.cpp
+    graphics/command_ring_state_test.cpp
     kernel/object_table_test.cpp
     core/cvar_test.cpp
     core/fiber_test.cpp

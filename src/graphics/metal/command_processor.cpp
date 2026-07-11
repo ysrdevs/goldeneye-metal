@@ -7163,15 +7163,11 @@ bool MetalCommandProcessor::RenderHostPixelShader(MetalShader& pixel_shader,
       continue;
     }
     xenos::xe_gpu_texture_fetch_t fetch = register_file_->GetTextureFetch(fetch_constant);
-    // [ge-sticky] Diagnostic (GOLDENEYE_METAL_STICKY_TEX=1). GoldenEye's content
-    // command stream is captured only by the late VdSwap bridge, which replays the
-    // LOAD_ALU_CONSTANT fetch-constant loads against STALE guest memory. As a
-    // result a draw's texture slot is frequently clobbered to an invalid fetch
-    // (type!=kTexture, e.g. base 0x10000000) even though the real texture
-    // (e.g. the menu 0x15c5c000) was bound a moment earlier. Remember the last
-    // VALID texture per fetch-constant slot and substitute it when the current
-    // fetch is invalid, to prove whether binding ORDER is the sole blocker (should
-    // surface the menu background into the framebuffer).
+    // [ge-sticky] Historical binding-order diagnostic
+    // (GOLDENEYE_METAL_STICKY_TEX=1). Remember the last valid content texture
+    // and substitute it for an invalid current fetch to isolate stale texture
+    // state from the rest of the producer pipeline. This changes execution and
+    // is never part of a strict-path result.
     {
       static const bool ge_sticky_tex = std::getenv("GOLDENEYE_METAL_STICKY_TEX") != nullptr;
       // Track the last-valid *content* texture (a real 2D texture, not the

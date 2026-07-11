@@ -5,8 +5,8 @@ directly into the main repository and is not a separate repository or Git submod
 
 > [!WARNING]
 > The native Apple Silicon/Metal path is an active research prototype. It builds and passes
-> controlled GPU diagnostics, but strict title-driven rendering has not reached a recognizable menu
-> and is not playable.
+> controlled GPU diagnostics. Real title PM4 now reaches Metal draws, resolve, and swap without
+> heuristic replay, but the producer render target remains black and the build is not playable.
 
 ## What is included
 
@@ -22,8 +22,8 @@ links for game data in project spaces.
 ## Build on Apple Silicon
 
 First build the root toolchain as described in the main [README](../../README.md). From the
-repository root, place your compatible executable at `assets/default.xex` within this directory,
-then run:
+repository root, place your compatible executable at `assets/default.xex` within this directory for
+code generation, then run:
 
 ```sh
 ./out/macos-arm64/rexglue codegen \
@@ -34,11 +34,12 @@ cmake --build vendor/GoldenEye-Recomp/out/build/macos-arm64-release \
   --target ge --parallel
 ```
 
-Run the resulting prototype from the repository root:
+Run the resulting prototype from the repository root against the complete authorized game-data
+directory, including `default.xex`, `files/`, and the companion title data:
 
 ```sh
 ./vendor/GoldenEye-Recomp/out/build/macos-arm64-release/GoldenEye \
-  --game_data_root vendor/GoldenEye-Recomp/assets \
+  --game_data_root /absolute/path/to/complete/game-data \
   --gpu metal
 ```
 

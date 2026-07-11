@@ -728,6 +728,18 @@ TEST_CASE("Physical heap vE0000000 (4KB pages, write-combine)", "[memory][physic
   // Should be 4KB aligned
   CHECK((addr % 4096) == 0);
 
+  // Recompiled guest accesses and physical GPU accesses must resolve to the
+  // same backing byte. This catches the 0x1000 view offset required on hosts
+  // whose mapping granularity is larger than 4 KiB (including Apple Silicon).
+  uint32_t physical_address = memory.GetPhysicalAddress(addr);
+  uint8_t* generated_guest_pointer =
+      rex::memory::GuestPtr(memory.virtual_membase(), addr);
+  uint8_t* gpu_physical_pointer = memory.TranslatePhysical(physical_address);
+  *gpu_physical_pointer = 0x3C;
+  CHECK(*generated_guest_pointer == 0x3C);
+  *generated_guest_pointer = 0xA5;
+  CHECK(*gpu_physical_pointer == 0xA5);
+
   heap->Release(addr, nullptr);
 }
 

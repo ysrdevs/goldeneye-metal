@@ -9,6 +9,7 @@
 // fragment's register/memory effect, tail-invokes the continuation function,
 // and the recompiled source function then returns.
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -97,15 +98,12 @@ void LaunchSelfDetached() {
 }
 }  // namespace ge
 
-// Probe to read CommandProcessor's protected ring read pointer (legal: a
-// derived class may touch protected base members; we only reinterpret an
-// existing CP* and call a non-virtual accessor -- no construction, no
-// vtable use, layout-compatible single inheritance).
 namespace {
-struct CPProbe : rex::graphics::CommandProcessor {
-  uint32_t rpi() const { return read_ptr_index_; }
-  uint32_t wpi() const { return write_ptr_index_.load(std::memory_order_acquire); }
-};
+bool EnvironmentFlagEnabled(const char* name) {
+  const char* value = std::getenv(name);
+  return value && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+}
+
 // rexglue CP swap counter sampled at the last guest present (sub_821996F8).
 // "GPU finished the just-submitted frame" == counter advanced past this.
 std::atomic<uint32_t> g_present_cpcnt{0};
@@ -271,8 +269,8 @@ void ge_watchdog_thread() {
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
     auto* cp = ge_cp();
     if (!cp) continue;
-    uint32_t wpi = static_cast<CPProbe*>(cp)->wpi();
-    uint32_t rpi = static_cast<CPProbe*>(cp)->rpi();
+    uint32_t wpi = cp->write_ptr_index();
+    uint32_t rpi = cp->read_ptr_index();
     uint32_t present = g_present_cpcnt.load(std::memory_order_relaxed);
     uint32_t dbg = g_dbgnow_calls.load(std::memory_order_relaxed);
     uint32_t dev = g_ge_device.load(std::memory_order_relaxed);
@@ -693,8 +691,8 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
   ge_start_watchdog_once();
   auto* cpp = ge_cp();
   uint32_t cpc = cpp ? cpp->swap_counter() : 0;
-  uint32_t rpi = cpp ? static_cast<CPProbe*>(cpp)->rpi() : 0;
-  uint32_t wpi = cpp ? static_cast<CPProbe*>(cpp)->wpi() : 0;
+  uint32_t rpi = cpp ? cpp->read_ptr_index() : 0;
+  uint32_t wpi = cpp ? cpp->write_ptr_index() : 0;
 
   // Clear the GPU-completion fence once the just-submitted frame is drawn.
   // Two race-free conditions:
@@ -820,7 +818,10 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
       }
     }
   }
-  if (present_index <= 16 || (present_index & 0x3F) == 0) {
+  static const bool submission_diagnostics =
+      EnvironmentFlagEnabled("GOLDENEYE_METAL_SUBMISSION_DIAGNOSTICS");
+  if (submission_diagnostics &&
+      (present_index <= 16 || (present_index & 0x3F) == 0)) {
     std::fprintf(stderr, "[ge] VdSwap hook present#%u dev=0x%08x cpcnt=%u\n",
                  present_index, a1, cpc);
     if (a1) {
@@ -835,7 +836,7 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
     }
     std::fflush(stderr);
   }
-  if ((present_index & 0x3F) == 0)
+  if (submission_diagnostics && (present_index & 0x3F) == 0)
     REXKRNL_INFO("GEGPU present#{} dev={:#x} cpcnt={}", n, a1, cpc);
   if (std::getenv("GOLDENEYE_PRESENT_THREAD_SAMPLE") &&
       (present_index == 64 || present_index == 128 || (present_index & 0xFF) == 0)) {
@@ -2112,120 +2113,60 @@ void ge_ce_watch_sfx_save() {
   ge_cont_82184E48(*ctx, base);
 }
 
-// =============================================================================
-// [GE] Faithful command delivery: intercept the D3D9 command-buffer kickoff.
-//
-// sub_8219CAF8 is the runtime flush/kickoff (ge_recomp.8.cpp:45551):
-//   r3 = device, r4 = descriptor array (guest addr), r5 = descriptor count.
-// Each 8-byte descriptor = { dword0: low 24 bits = INDIRECT_BUFFER dword length,
-//   dword1: IB guest address }. The recompiled body writes these as
-// PM4_INDIRECT_BUFFER into a device-private ring and bumps CP_RB_WPTR, but the
-// Metal CP drains a DIFFERENT ring (0x1fc9d000) that stays empty, so a heuristic
-// VdSwap bridge scavenges guest RAM, mis-bounds the real IBs and loads the wrong
-// shader bytes (e.g. pixel slot bdc9 getting vertex bytes) -> black menu.
-//
-// DEFINE_REX_FUNC emits a WEAK sub_8219CAF8 -> __imp__sub_8219CAF8, so a strong
-// definition here wins the link. DIAGNOSTIC-FIRST: read + log the runtime's
-// EXPLICIT (addr,len) descriptors, then run the original body unchanged. Once
-// confirmed, this is where we replay the genuine IBs faithfully.
-// =============================================================================
+// Optional command-provenance diagnostics. These hooks observe the D3D9
+// submission descriptors before the original bodies clobber their argument
+// registers. They never execute packets themselves: the title-owned primary
+// ring is the sole authoritative submission path.
 extern "C" void __imp__sub_8219CAF8(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_8219CAF8(PPCContext& ctx, uint8_t* base) {
-  auto* gs = ge_gs();
-  const bool metal = gs && gs->name() == "Metal";
-  // Capture the descriptor array (r4) + count (r5) BEFORE the body clobbers them.
   const uint32_t desc_ea = ctx.r4.u32;
   const uint32_t desc_count = ctx.r5.u32;
-
-  __imp__sub_8219CAF8(ctx, base);  // preserve original side effects
-
-  if (!metal) return;
-
-  // Setup kickoff — fires ~6x total, NOT per-frame. It carries the SETUP IBs
-  // (background shaders 0a6d/2e37 + SET_CONSTANT state, incl. TEXTURE FETCH
-  // CONSTANTS). The per-frame flush (sub_8219CF88) carries the DRAWS. Replaying
-  // the flush alone left textured draws black because their fetch constants were
-  // never bound. COMBINED replay (kickoff SETUP + flush DRAWS, bridge OFF) feeds
-  // both to the Metal CP so the draws see the state they need. Each 8-byte
-  // descriptor = { dword0: low 24 bits = IB dword len, dword1: IB GPU addr }.
-  static const bool ge_kickoff_replay =
-      std::getenv("GOLDENEYE_METAL_KICKOFF_REPLAY") != nullptr ||
-      std::getenv("GOLDENEYE_METAL_COMBINED_REPLAY") != nullptr;
-  auto* cp = ge_cp();
-
-  // Log EVERY kickoff call unconditionally (before any sanity gate) so we can see
-  // it fire and inspect its raw descriptor array/count regardless of range.
-  static std::atomic<uint32_t> ge_kick_calls{0};
-  uint32_t call_i = ge_kick_calls.fetch_add(1, std::memory_order_relaxed) + 1;
-  const bool log_this = call_i <= 64;
-  if (log_this) {
-    std::fprintf(stderr, "[ge-kickoff]#%u count=%u desc_ea=0x%08x cp=%d replay=%d\n", call_i,
-                 desc_count, desc_ea, cp ? 1 : 0, ge_kickoff_replay ? 1 : 0);
-    std::fflush(stderr);
-  }
-  // desc_ea is a guest VIRTUAL address (e.g. 0x7018f880) the guest itself reads
-  // via REX_LOAD (base+ea is mapped); do NOT reject it for being >= 0x20000000.
-  if (!cp || !desc_ea || !desc_count || desc_count > 4096u) return;
-
-  for (uint32_t d = 0; d < desc_count; ++d) {
-    const uint32_t da = desc_ea + d * 8u;
-    const uint32_t len = REX_LOAD_U32(da + 0) & 0xFFFFFFu;
-    const uint32_t raw = REX_LOAD_U32(da + 4);
-    // The descriptors hold physical IB addresses (e.g. 0x1faa0040) — the same
-    // buffers the per-frame flush submits. CpuToGpu's canonical rule is & 0x1FFFFFFF
-    // (a no-op when already physical). ExecutePacket fail-softs on bad packets, so
-    // trust the guest-provided (addr,len) like the flush replay does — no header
-    // pre-validation (which wrongly rejected valid non-type-3 leading packets).
-    const uint32_t phys = raw & 0x1FFFFFFFu;
-    if (log_this && d < 16) {
-      std::fprintf(stderr, "  [ge-kickoff-desc]#%u.%u raw=0x%08x len=%u -> phys=0x%08x\n", call_i, d,
-                   raw, len, phys);
-    }
-    if (ge_kickoff_replay && phys && len && len <= 0x40000u) {
-      cp->ExecutePacket(phys, len);
+  static const bool submission_diagnostics =
+      EnvironmentFlagEnabled("GOLDENEYE_METAL_SUBMISSION_DIAGNOSTICS");
+  if (submission_diagnostics) {
+    auto* gs = ge_gs();
+    if (gs && gs->name() == "Metal") {
+      static std::atomic<uint32_t> calls{0};
+      const uint32_t call_index = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (call_index <= 64) {
+        std::fprintf(stderr, "[ge-kickoff]#%u count=%u desc_ea=0x%08x\n", call_index,
+                     desc_count, desc_ea);
+        if (desc_ea && desc_count && desc_count <= 4096u) {
+          for (uint32_t descriptor_index = 0;
+               descriptor_index < std::min(desc_count, 16u); ++descriptor_index) {
+            const uint32_t descriptor_address = desc_ea + descriptor_index * 8u;
+            const uint32_t length = REX_LOAD_U32(descriptor_address) & 0xFFFFFFu;
+            const uint32_t raw_address = REX_LOAD_U32(descriptor_address + 4u);
+            std::fprintf(stderr,
+                         "  [ge-kickoff-desc]#%u.%u raw=0x%08x len=%u phys=0x%08x\n",
+                         call_index, descriptor_index, raw_address, length,
+                         raw_address & 0x1FFFFFFFu);
+          }
+        }
+        std::fflush(stderr);
+      }
     }
   }
-  if (log_this) std::fflush(stderr);
+  __imp__sub_8219CAF8(ctx, base);
 }
 
-// sub_8219CF88 = the D3D9 flush (ge_recomp.8.cpp:46256): r5 = IB GPU address,
-// r6 = IB dword length. DIAGNOSTIC: is THIS the per-frame draw submission
-// (called ~once per swap) and does (r5,r6) bound real PM4 (a type-3 header)? If
-// so it is the faithful per-frame command stream to replay instead of the bridge.
 extern "C" void __imp__sub_8219CF88(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_8219CF88(PPCContext& ctx, uint8_t* base) {
-  auto* gs = ge_gs();
-  const bool metal = gs && gs->name() == "Metal";
-  // Capture the IB (addr,len) BEFORE the original body runs (it clobbers r5/r6).
   const uint32_t ib_addr = ctx.r5.u32;
   const uint32_t ib_len = ctx.r6.u32;
-
-  __imp__sub_8219CF88(ctx, base);  // preserve original side effects
-
-  if (!metal) {
-    return;
+  static const bool submission_diagnostics =
+      EnvironmentFlagEnabled("GOLDENEYE_METAL_SUBMISSION_DIAGNOSTICS");
+  if (submission_diagnostics) {
+    auto* gs = ge_gs();
+    if (gs && gs->name() == "Metal") {
+      static std::atomic<uint32_t> logs{0};
+      const uint32_t log_index = logs.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (log_index <= 96 || (log_index & 0x3FFu) == 0) {
+        std::fprintf(stderr, "[ge-flush]#%u ib_addr=0x%08x ib_len=%u\n", log_index,
+                     ib_addr, ib_len);
+        std::fflush(stderr);
+      }
+    }
   }
-  // The D3D9 flush hands us the EXACT (addr,len) of each command-buffer batch.
-  // Replaying it directly via ExecutePacket (GOLDENEYE_METAL_FLUSH_REPLAY=1) is
-  // faithful but (a) never surfaced the content draws in testing and (b)
-  // accelerated the pre-existing guest SIGBUS (crashed ~swap 24 vs the bridge's
-  // 256). Left here, gated OFF, so the heuristic VdSwap bridge remains the
-  // default per-frame path. Diagnostic logging stays on to map the submission.
-  static const bool ge_flush_replay =
-      std::getenv("GOLDENEYE_METAL_FLUSH_REPLAY") != nullptr ||
-      std::getenv("GOLDENEYE_METAL_COMBINED_REPLAY") != nullptr;
-  auto* cp = ge_cp();
-  if (!cp || !ib_addr || ib_addr >= 0x20000000u || !ib_len || ib_len > 0x40000u) {
-    return;
-  }
-  static std::atomic<uint32_t> ge_flush_logs{0};
-  uint32_t i = ge_flush_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (i <= 96 || (i & 0x3F) == 0) {
-    std::fprintf(stderr, "[ge-flush]#%u ib_addr=0x%08x ib_len=%u replay=%d\n", i, ib_addr, ib_len,
-                 ge_flush_replay ? 1 : 0);
-    std::fflush(stderr);
-  }
-  if (ge_flush_replay) {
-    cp->ExecutePacket(ib_addr, ib_len);
-  }
+  __imp__sub_8219CF88(ctx, base);
 }

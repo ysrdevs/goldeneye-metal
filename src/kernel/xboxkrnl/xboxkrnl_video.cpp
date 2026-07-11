@@ -45,6 +45,11 @@ constexpr uint32_t kDisplayGammaType = 2;
 // Display gamma power (used with gamma type 3)
 constexpr double kDisplayGammaPower = 2.22222233;
 
+bool EnvironmentFlagEnabled(const char* name) {
+  const char* value = std::getenv(name);
+  return value && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+}
+
 uint32_t GetConfiguredVideoModeWidth() {
   int32_t configured_width = REXCVAR_GET(video_mode_width);
   if (!rex::cvar::HasNonDefaultValue("video_mode_width")) {
@@ -483,7 +488,10 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
 
   static std::atomic<uint32_t> swap_prewrite_logs{0};
   uint32_t swap_prewrite_index = swap_prewrite_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (swap_prewrite_index <= 8 || (swap_prewrite_index & 0x3F) == 0) {
+  static const bool ge_submission_diagnostics =
+      EnvironmentFlagEnabled("GOLDENEYE_METAL_SUBMISSION_DIAGNOSTICS");
+  if (ge_submission_diagnostics &&
+      (swap_prewrite_index <= 8 || (swap_prewrite_index & 0x3F) == 0)) {
     uint32_t preview_start = buffer_ptr.guest_address() - 64;
     std::fprintf(stderr, "[rex] VdSwap pre#%u buf=0x%08x prev@0x%08x", swap_prewrite_index,
                  buffer_ptr.guest_address(), preview_start);
@@ -498,11 +506,11 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
 
   auto* graphics_system =
       static_cast<graphics::GraphicsSystem*>(REX_KERNEL_STATE()->emulator()->graphics_system());
-  // The heuristic VdSwap command scavenger remains enabled while the exact
-  // kickoff path is brought up. Set GOLDENEYE_METAL_NO_BRIDGE=1 to disable it
-  // when validating strict command-stream replay.
-  static const bool ge_bridge_scavenge = std::getenv("GOLDENEYE_METAL_NO_BRIDGE") ==
-                                         nullptr;  // default ON (set NO_BRIDGE=1 to disable)
+  // Legacy diagnostic only. Normal Metal execution consumes the title's real
+  // primary ring; scanning arbitrary RAM around VdSwap can mis-bound packets
+  // and must never alter the default command stream.
+  static const bool ge_bridge_scavenge =
+      EnvironmentFlagEnabled("GOLDENEYE_METAL_VDSWAP_SCAVENGE");
   if (graphics_system && graphics_system->name() == "Metal" && ge_bridge_scavenge) {
     static std::atomic<uint32_t> last_swap_buffer_end{0};
     uint32_t current_swap_buffer = buffer_ptr.guest_address();
@@ -877,23 +885,14 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
 
   static std::atomic<uint32_t> swap_logs{0};
   uint32_t swap_index = swap_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (swap_index <= 16 || (swap_index & 0x3F) == 0) {
+  if (ge_submission_diagnostics &&
+      (swap_index <= 16 || (swap_index & 0x3F) == 0)) {
     std::fprintf(stderr,
                  "[rex] VdSwap entry#%u buf=0x%08x fb_va=0x%08x fb_pa=0x%08x %ux%u fmt=%u\n",
                  swap_index, buffer_ptr.guest_address(), frontbuffer_virtual_address,
                  frontbuffer_physical_address, width.value(), height.value(),
                  static_cast<uint32_t>(texture_format));
     std::fflush(stderr);
-  }
-
-  if (graphics_system && graphics_system->name() == "Metal") {
-    if (auto* command_processor = graphics_system->command_processor()) {
-      command_processor->RestoreRegisters(rex::graphics::XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0,
-                                          &gpu_fetch.dword_0, 6, true);
-      command_processor->IssueSwap(frontbuffer_physical_address, width.value(), height.value());
-      command_processor->increment_swap_counter();
-      command_processor->increment_counter();
-    }
   }
 
   // Fill the rest of the buffer with NOP packets.

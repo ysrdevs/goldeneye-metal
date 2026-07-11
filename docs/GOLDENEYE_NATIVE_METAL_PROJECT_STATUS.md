@@ -1,6 +1,6 @@
 # GoldenEye native Metal project status
 
-Last updated: 2026-07-09
+Last updated: 2026-07-10
 
 ## Goal
 
@@ -35,10 +35,21 @@ textures, and heuristic presentation are useful probes but do not satisfy the mi
 
 ## Current result
 
-The native Metal infrastructure is substantial and operational in isolation. The strict producer
-path still presents black. A representative strict 30-second run produced four swaps with zero
-visible pixels; the resolve/copy path matched its black source correctly. This localizes the main
-failure before or within the title-driven producer draw, not in the final byte copy alone.
+The command-provenance blocker is resolved. Apple Silicon uses 16 KiB mapping granularity, while
+the guest `0xE0000000` physical-heap view begins at backing-store offset `0x1000`. Generated title
+memory accesses omitted that host adjustment, so writes to the virtual command ring at
+`0xFFC9C000` landed one page before the command processor's physical `0x1FC9D000` view.
+
+The centralized physical-host-offset fix makes the physical, A, C, and E aliases agree. In a
+strict run with the heuristic scavenger and replay disabled, the command processor drained the
+real primary ring, followed the title's real indirect buffers, loaded real microcode, issued Metal
+draws and resolves, processed `PM4_XE_SWAP`, and presented through the normal path.
+
+The result is still black. A representative content draw used vertex shader
+`bc83ca8d00933874`, pixel shader `e4ed09508b1a5ae8`, and a real 1280x720 texture binding, but the
+owned producer render target reported zero visible pixels. The resolve and presenter faithfully
+carried that black source. This localizes the active failure to the producer draw rather than
+command delivery or final presentation.
 
 ### Working foundations
 
@@ -58,46 +69,47 @@ failure before or within the title-driven producer draw, not in the final byte c
 | --- | --- | --- |
 | A. Controlled resolve diagnostic | Passed | Magenta resolve reaches the destination and presentation path |
 | B. Controlled render-target diagnostic | Passed | A solid Metal render target survives readback and resolve |
-| C. Real producer content | Blocked | Title-driven render target remains black or receives incomplete draws |
-| D. Watched 32-bpp structure | Partial | Buffer layout and copy behavior are understood, content provenance is not yet faithful |
+| C. Real producer content | In progress | Real title PM4 and microcode reach Metal, but the producer target remains black |
+| D. Guest-visible resolve | Partial | Real resolves and `XE_SWAP` execute; they currently carry the black producer source |
 | E. Recognizable menu | Not reached | No strict-path menu frame has been produced |
 
 ## Primary blocker
 
-The current command provenance is not yet trustworthy enough. A heuristic VdSwap scavenger is
-enabled by default and can recover plausible packets, but it can mis-bound command ranges and load
-the wrong shader or fetch state. Exact kickoff and flush replay hooks exist behind diagnostic
-environment flags, but they have not yet replaced the scavenger as the proven default path.
+The first failing content draw builds a valid Metal pipeline but writes no visible pixels. Its
+vertex shader references fetch constant 95 (`1fabd333 1000007a ...` in the captured live state),
+while current producer diagnostics only decode the simpler fetch-0 setup draws. The next task is to
+trace that exact fetch through address, stride, endian, range, shader binding, transformed position,
+and raster state. Texture binding and resolve are downstream checks once vertex/raster coverage is
+proven.
 
-The strongest current shader-input symptom is a vertex-fetch mismatch: a shader expects one fetch
-constant while the live register state looks texture-typed or otherwise inconsistent. That can
-produce a valid Metal pipeline which draws nothing useful.
-
-A separate SIGBUS/watchdog failure exists during some longer or heavily instrumented runs. It must
-be isolated, but it is not evidence that the black producer frame is solved.
+The reproducible SIGBUS and invalid-function failures from the initial diagnostic runs were traced
+to an XEX-only staging directory. Running against the complete authorized game-data root proceeds
+through audio, draws, resolves, and CP-driven swaps. A later interactive black/audio run coincided
+with the app and development session exiting, so longer-run stability remains to be audited with
+bounded, redirected diagnostics. Missing game data must not be treated as a renderer defect.
 
 ## Next development priority
 
 Work in this order:
 
-1. Prove exact kickoff and indirect-buffer boundaries from the title hook through the runtime.
-2. Disable the VdSwap scavenger and reproduce the same packet sequence through exact replay.
-3. Audit each failing draw's vertex fetch constants, endian handling, address, stride, and range.
-4. Match translated MSL resource bindings to the exact microcode and live register snapshot.
+1. Capture the exact first failing content draw and its complete live register snapshot.
+2. Decode vertex fetch 95 and validate its address, stride, endian mode, range, and Metal binding.
+3. Verify translated vertex positions, clip-space coverage, viewport/scissor, culling, and color
+   write state for that draw.
+4. Match the translated MSL resource bindings to the exact microcode and live constants.
 5. Demonstrate nonzero title pixels in the real producer render target.
-6. Follow those pixels through the normal resolve and IssueSwap path to the menu.
-7. Minimize and fix the independent SIGBUS/watchdog failure.
+6. Follow those pixels through the already-working normal resolve and `IssueSwap` path to the menu.
 
-Do not spend the next cycle polishing fallback presentation. It has already established that the
-host can display pixels; the remaining priority is faithful production of those pixels.
+Do not restore heuristic command scavenging or direct presentation shortcuts. The real ring and
+normal `XE_SWAP` path now provide the authoritative evidence needed to debug production.
 
 ## Useful source areas
 
-- `src/graphics/metal/command_processor.cpp` — command replay, translation, draw, resolve, probes
+- `src/graphics/metal/command_processor.cpp` — translation, producer draws, resolve, and probes
 - `src/graphics/metal/shader.cpp` — SPIR-V-to-MSL translation and sanitization
 - `src/graphics/metal/texture_cache.mm` — texture decode and Metal upload
-- `src/kernel/xboxkrnl/xboxkrnl_video.cpp` — swap bridge and guest-buffer handoff
-- `vendor/GoldenEye-Recomp/src/ge_hooks.cpp` — title kickoff, flush, input, and diagnostic hooks
+- `src/kernel/xboxkrnl/xboxkrnl_video.cpp` — VdSwap packet construction and guest-buffer handoff
+- `vendor/GoldenEye-Recomp/src/ge_hooks.cpp` — title integration and submission diagnostics
 - `src/graphics/vulkan/command_processor.cpp` — useful behavioral reference, not the target backend
 
 Build, test, and opt-in diagnostic commands are documented in [DEVELOPMENT.md](DEVELOPMENT.md).
