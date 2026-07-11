@@ -53,18 +53,16 @@ bool MetalSharedMemory::Initialize(void* metal_device) {
     std::fflush(stderr);
     return false;
   }
-  // Take +1 ownership; released in Shutdown(). CFBridgingRetain is valid under
-  // both ARC and MRC.
-  buffer_ = (void*)CFBridgingRetain(gpu_buffer);
+  // newBufferWithLength returns a +1 object. This target is built without ARC,
+  // so store that ownership directly and balance it in Shutdown(). A bridging
+  // retain here would add a second reference and leak the 512 MiB buffer.
+  buffer_ = (void*)gpu_buffer;
   return true;
 }
 
 void MetalSharedMemory::Shutdown(bool from_destructor) {
   if (buffer_) {
-    // Balance the CFBridgingRetain in Initialize(); the transfer back to ARC/MRC
-    // releases the +1 reference when the local goes out of scope.
-    id<MTLBuffer> gpu_buffer = (id<MTLBuffer>)CFBridgingRelease(buffer_);
-    (void)gpu_buffer;
+    [(id<MTLBuffer>)buffer_ release];
     buffer_ = nullptr;
   }
   metal_device_ = nullptr;
@@ -135,6 +133,29 @@ bool MetalSharedMemory::UploadRanges(
     std::memcpy(buffer_contents + start, guest_src, length);
   }
 
+  return true;
+}
+
+bool MetalSharedMemory::CommitGuestCpuWriteAsGpu(uint32_t start, uint32_t length) {
+  if (!length || start >= kBufferSize || !buffer_) {
+    return false;
+  }
+  length = std::min(length, kBufferSize - start);
+
+  const uint8_t* guest_source = memory().TranslatePhysical<const uint8_t*>(start);
+  id<MTLBuffer> gpu_buffer = (id<MTLBuffer>)buffer_;
+  uint8_t* buffer_contents = reinterpret_cast<uint8_t*>([gpu_buffer contents]);
+  if (!guest_source || !buffer_contents) {
+    return false;
+  }
+
+  // Publish and protect before copying, matching UploadRanges' race contract.
+  // If the guest CPU writes this range during the copy, the protection callback
+  // invalidates it again and the next RequestRange performs a fresh upload.
+  // Texture watches only mark resources outdated here; their reload happens on
+  // a later command-processor request, after this synchronous copy completes.
+  RangeWrittenByGpu(start, length);
+  std::memcpy(buffer_contents + start, guest_source, length);
   return true;
 }
 

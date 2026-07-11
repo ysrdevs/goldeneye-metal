@@ -32,6 +32,12 @@ class MetalSharedMemory final : public SharedMemory {
   // VulkanSharedMemory::buffer() / D3D12SharedMemory::GetBuffer().
   void* buffer() const { return buffer_; }
 
+  // Commits bytes written through the guest CPU mapping to the separate Metal
+  // shared-memory buffer, then publishes the range as GPU-produced data. This
+  // is used by the current CPU readback/resolve path: RangeWrittenByGpu alone
+  // would mark the Metal copy valid without actually updating its bytes.
+  bool CommitGuestCpuWriteAsGpu(uint32_t start, uint32_t length);
+
  protected:
   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
 

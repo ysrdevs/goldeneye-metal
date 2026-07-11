@@ -107,9 +107,6 @@ bool EnvironmentFlagEnabled(const char* name) {
 // rexglue CP swap counter sampled at the last guest present (sub_821996F8).
 // "GPU finished the just-submitted frame" == counter advanced past this.
 std::atomic<uint32_t> g_present_cpcnt{0};
-std::atomic<uint32_t> g_present_serial{0};
-// Guest tick at the last present, for a bounded completion wait.
-std::atomic<uint32_t> g_present_tb{0};
 inline rex::graphics::CommandProcessor* ge_cp() {
   auto* ks = rex::system::kernel_state();
   if (!ks) return nullptr;
@@ -246,8 +243,8 @@ void ge_sample_present_main_thread_path(uint8_t* base, uint32_t present_index) {
 // ===========================================================================
 // Freeze watchdog. Auto-detects the visual freeze (the guest keeps presenting
 // -- present# advancing -- but the GPU command ring stops advancing) and logs
-// the exact pipeline state ONCE per stall episode, so we can read the mechanism
-// off the log instead of capturing a live process. Zero gameplay effect.
+// the exact pipeline state once per stall episode. This is observation-only;
+// synchronization state remains owned by the title and command processor.
 // ===========================================================================
 namespace {
 std::atomic<uint32_t> g_ge_device{0};   // device struct (dev) seen by ge_dbg_now
@@ -264,7 +261,6 @@ void ge_watchdog_thread() {
   uint32_t no_present_stall = 0;
   bool logged = false;
   bool no_present_logged = false;
-  bool recover_fired = false;
   for (;;) {
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
     auto* cp = ge_cp();
@@ -409,21 +405,8 @@ void ge_watchdog_thread() {
         present_at_stall_start = present;
         dbg_at_stall_start = dbg;
         submit_at_stall_start = submit;
-        recover_fired = false;
       }
       ++stall;
-      // AUTO-RECOVERY for the CPU<->GPU semaphore deadlock. The CP parks in a
-      // WAIT_REG_MEM polling idblk for ==0 (the semaphore the render writes 0 to
-      // release the CP). The render is parked waiting on GPU completion ->
-      // deadlock. Write 0 to release the CP: it drains the buffer, delivers the
-      // completion, the render resumes. Memory-only, no interrupt (safe).
-      if (stall >= 2 && dev && idblk && idblk < 0xFFFFFFFEu) {
-        ST32(base, idblk, 0u);  // release the CP's WAIT_REG_MEM semaphore
-        if (!recover_fired) {
-          recover_fired = true;
-          REXKRNL_INFO("GEWATCHDOG RECOVERY: released CP semaphore (idblk={:#x} := 0)", idblk);
-        }
-      }
       if (stall >= 6 && !logged) {  // ~1.5s of present-but-no-ring
         logged = true;
         uint32_t presented = dev ? LD32(base, dev + 16552) : 0;
@@ -644,7 +627,6 @@ void ge_watchdog_thread() {
     } else {
       stall = 0;
       logged = false;
-      recover_fired = false;
     }
     last_wpi = wpi; last_rpi = rpi; last_present = present; last_submit = submit;
   }
@@ -694,8 +676,8 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
   uint32_t rpi = cpp ? cpp->read_ptr_index() : 0;
   uint32_t wpi = cpp ? cpp->write_ptr_index() : 0;
 
-  // Clear the GPU-completion fence once the just-submitted frame is drawn.
-  // Two race-free conditions:
+  // Let the title's GPU-completion poll expire only after the command
+  // processor has made authoritative progress. Two safe conditions:
   //  (a) CP swap counter advanced past the value sampled at the matching
   //      present -> the frame's swap executed; OR
   //  (b) the CP read pointer caught up to the write pointer -> the CP consumed
@@ -708,52 +690,19 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
   bool drawn = (cpc != g_present_cpcnt.load(std::memory_order_relaxed)) ||
                (wpi != 0u && rpi == wpi);
 
-  //  (c) WATCHDOG. If neither (a) nor (b) has happened for a long stretch
-  //      (~80ms of real wall time), the CP is genuinely stuck on this frame
-  //      (e.g. blocked in a D3D12 op the backend can't complete for this
-  //      title's scene). Force-complete so the guest's GPU-completion spin
-  //      clears instead of deadlocking forever -- and, critically, releases the
-  //      device spinlock other guest threads (sub_821A3A40) are blocked on.
-  //      This turns a permanent freeze into a recoverable hitch. 80ms is far
-  //      above any real frame time, so normal frames still clear via (a)/(b).
-  // sub_82198C28 checks the skip bit *(device+10941)&2 at its very top and
-  // returns 0 (proceed) before any fence/timeout logic -- the only GUARANTEED
-  // way out of the spin. Writing the completion fence does not always release
-  // it (it resets the routine's own timeout anchor, and only helps when
-  // submit>=target). So: when the wait has stalled for a real wall-clock
-  // stretch (~80ms, far above any frame), SET the skip bit so the guest stops
-  // blocking on a GPU completion the CP cannot deliver -- and, crucially,
-  // releases the device spinlock the rest of the guest threads are stuck on.
-  // When the CP is keeping up (drawn via (a)/(b)) CLEAR it again so waits are
-  // honored and frames stay visible. Net: visible when the GPU keeps up, a
-  // brief skipped (black) frame during a stall instead of a permanent freeze.
-  // Do NOT touch the skip bit on the normal/keeping-up path -- the game manages
-  // *(device+10941)&2 itself (sets it when it intends NOT to block, clears it
-  // when it wants to wait), and clearing it during early init hangs the boot.
-  // Only SET it when the wait has genuinely stalled (~80ms, far above any real
-  // frame): that forces sub_82198C28 to return 0 next iteration so the guest
-  // stops blocking on a GPU completion the CP cannot deliver -- breaking the
-  // spinlock cascade / freeze. The game re-clears it on its own next frame, so
-  // this stays a one-shot "proceed past this stall", not a permanent skip.
-  static thread_local uint32_t s_wait_start = 0;
-  static thread_local bool s_waiting = false;
-  static thread_local uint32_t s_no_present_start = 0;
-  static thread_local uint32_t s_last_present_serial = 0;
-  uint32_t present_serial = g_present_serial.load(std::memory_order_relaxed);
-  if (present_serial != s_last_present_serial) {
-    s_last_present_serial = present_serial;
-    s_no_present_start = t;
-  } else if (present_serial >= 8u && dev &&
-             (uint32_t)(t - s_no_present_start) > 4000000u) {
-    drawn = true;
-    base[dev + 10941u] |= 0x02u;
-    s_no_present_start = t;
-  }
+  // Never acknowledge a frame on a wall-clock deadline. The Metal producer
+  // path may legitimately take longer than the title's short polling timeout,
+  // especially while compiling a new pipeline. A premature acknowledgement
+  // publishes a stale ring read pointer and lets the title overrun or drop the
+  // next submission. Also, device+10941 is title-owned synchronization state;
+  // host recovery must not set or clear its skip bits.
+  //
+  // Keep sub_82198C28's elapsed-time check below its timeout while the CP still
+  // owns work. Once either authoritative completion condition is true, restore
+  // the real timebase value and let the original routine retire its own fence.
   if (!drawn) {
-    if (!s_waiting) { s_waiting = true; s_wait_start = t; }
-    else if ((uint32_t)(t - s_wait_start) > 4000000u) {  // ~80ms @49.875MHz
-      drawn = true;
-      if (dev) base[dev + 10941u] |= 0x02u;   // stalled: skip this GPU wait
+    if (ws) {
+      r30.u32 = LD32(base, ws + 12u);
     }
     // The six GPU-completion waits poll this routine in a TIGHT busy spin. With
     // dozens of guest threads that oversubscribes the cores and starves the
@@ -762,21 +711,12 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
     // never advances, the spin never exits = freeze (visual stops, audio thread
     // keeps running on its own core). Yield here while still waiting so the CP
     // worker reliably gets CPU and can finish the frame.
-    if (!drawn) std::this_thread::yield();
-  } else {
-    s_waiting = false;
+    std::this_thread::yield();
   }
 
-  if (dev && idblk && idblk < 0xFFFFFFFEu && drawn) {
-    // DO NOT write idblk+0 here. idblk+0 is the CPU<->GPU semaphore the CP polls
-    // in WAIT_REG_MEM (waits for ==0; the render writes 0 to release the CP).
-    // Writing a non-zero "completed" value here HELD the semaphore -> the CP
-    // stalled in WAIT_REG_MEM -> CPU<->GPU deadlock -> the visual freeze. THIS
-    // self-inflicted write was the freeze. (Confirmed via the WAIT_REG_MEM
-    // >60ms deadlock-breaker log polling exactly this address.)
-    ST32(base, dev + 16552, LD32(base, dev + 16544));   // presented := submit
-    ST32(base, idblk + 60, rpi);                        // ring RPTR write-back
-  }
+  // The title owns its presented counter and device skip bits. The command
+  // processor alone owns the ring RPTR write-back at idblk+60. Host writes to
+  // any of these can race later guest work and acknowledge the wrong frame.
 }
 
 // ---------------------------------------------------------------------------
@@ -795,12 +735,10 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
   auto* cpp = ge_cp();
   uint32_t cpc = cpp ? cpp->swap_counter() : 0;
   g_present_cpcnt.store(cpc, std::memory_order_relaxed);
-  g_present_tb.store((uint32_t)REX_QUERY_TIMEBASE(), std::memory_order_relaxed);
   ge_start_watchdog_once();
 
   static uint32_t n = 0;                       // throttled fps heartbeat
   uint32_t present_index = ++n;
-  g_present_serial.store(present_index, std::memory_order_relaxed);
   static const bool force_presented_on_vdswap =
       std::getenv("GOLDENEYE_FORCE_PRESENTED_ON_VDSWAP") != nullptr;
   if (force_presented_on_vdswap && a1) {
@@ -825,13 +763,16 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
     std::fprintf(stderr, "[ge] VdSwap hook present#%u dev=0x%08x cpcnt=%u\n",
                  present_index, a1, cpc);
     if (a1) {
+      // Sequence the counter reads explicitly. Function-argument evaluation
+      // order would otherwise make concurrent title updates look inverted.
+      uint32_t presented = LD32(base, a1 + 16552u);
+      uint32_t submit = LD32(base, a1 + 16544u);
       std::fprintf(stderr,
                    "[ge] present flags#%u +10941=0x%02x +10943=0x%02x +21516=0x%08x "
                    "+21600=%u +21604=%u +22280=0x%08x submit=%u presented=%u render_gate=0x%08x\n",
                    present_index, base[a1 + 10941u], base[a1 + 10943u],
                    LD32(base, a1 + 21516u), LD32(base, a1 + 21600u),
-                   LD32(base, a1 + 21604u), LD32(base, a1 + 22280u),
-                   LD32(base, a1 + 16544u), LD32(base, a1 + 16552u),
+                   LD32(base, a1 + 21604u), LD32(base, a1 + 22280u), submit, presented,
                    LD32(base, 0x8242043Cu));
     }
     std::fflush(stderr);
@@ -1701,15 +1642,18 @@ bool ge_skip_null_memcpy_ptr(PPCRegister& r3, PPCRegister& r4, PPCRegister& r5) 
 }
 
 bool ge_skip_null_bitset_write(PPCRegister& r3, PPCRegister& r4) {
+  // This hook only exists to bypass a null startup edge case. Bitset helpers
+  // are hot during title-data loading, so valid calls must not pay for atomic
+  // diagnostics on every bit operation.
+  if (r3.u32 != 0) {
+    return false;
+  }
   static std::atomic<uint32_t> calls{0};
   uint32_t call_index = calls.fetch_add(1, std::memory_order_relaxed) + 1;
   if (call_index <= 48 || (call_index & 0x3FFFF) == 0) {
     std::fprintf(stderr, "[ge] bitset_write#%u dst=0x%08x bit=%u\n", call_index, r3.u32,
                  r4.u32);
     std::fflush(stderr);
-  }
-  if (r3.u32 != 0) {
-    return false;
   }
   static std::atomic<uint32_t> logs{0};
   if (logs.fetch_add(1, std::memory_order_relaxed) < 16) {
@@ -1719,15 +1663,17 @@ bool ge_skip_null_bitset_write(PPCRegister& r3, PPCRegister& r4) {
 }
 
 bool ge_skip_null_bitset_test(PPCRegister& r3, PPCRegister& r4) {
+  // See ge_skip_null_bitset_write: non-null calls are the overwhelmingly
+  // common path and must remain effectively free.
+  if (r3.u32 != 0) {
+    return false;
+  }
   static std::atomic<uint32_t> calls{0};
   uint32_t call_index = calls.fetch_add(1, std::memory_order_relaxed) + 1;
   if (call_index <= 48 || (call_index & 0x3FFFF) == 0) {
     std::fprintf(stderr, "[ge] bitset_test#%u src=0x%08x bit=%u\n", call_index, r3.u32,
                  r4.u32);
     std::fflush(stderr);
-  }
-  if (r3.u32 != 0) {
-    return false;
   }
   static std::atomic<uint32_t> logs{0};
   if (logs.fetch_add(1, std::memory_order_relaxed) < 16) {

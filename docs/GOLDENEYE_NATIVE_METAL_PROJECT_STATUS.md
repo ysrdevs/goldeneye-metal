@@ -45,23 +45,36 @@ strict run with the heuristic scavenger and replay disabled, the command process
 real primary ring, followed the title's real indirect buffers, loaded real microcode, issued Metal
 draws and resolves, processed `PM4_XE_SWAP`, and presented through the normal path.
 
-The result is still black. A representative content draw used vertex shader
-`bc83ca8d00933874`, pixel shader `e4ed09508b1a5ae8`, and a real 1280x720 texture binding, but the
-owned producer render target reported zero visible pixels. The resolve and presenter faithfully
-carried that black source. This localizes the active failure to the producer draw rather than
-command delivery or final presentation.
+Sustained title execution is now working. The old two-swap ceiling was caused by the host's 80 ms
+GPU-wait recovery: while Metal still owned a primary batch, it set a title-owned skip bit. The
+title's submission routine saw that bit and returned before writing WPTR for kickoffs 31 and 32.
+The recovery also published a sampled RPTR into command-processor-owned writeback memory. The hook
+now holds the title wait until the CP swap counter advances or the ring drains, yields while
+waiting, never changes the title's skip bits or presented counter, and leaves RPTR writeback solely
+to the CP.
+
+In a bounded run with scavenging, replay, forced presentation, and replacement rendering disabled,
+WPTR progressed beyond 1088, the Metal primary-ring worker passed batch 192, and normal
+`IssueSwap` reached 64. The same run produced nonzero pixels from real title shaders and resources,
+carried them through the normal guest resolve, and presented them. Captured results contain
+malformed geometry and flat colors rather than a recognizable menu, so fixed-function and
+fragment-output fidelity remain incomplete.
 
 ### Working foundations
 
 - Native macOS window, Metal layer, device, presenter, and swap integration
 - Shared guest-memory access and range tracking
+- Authoritative shared Metal-buffer residency for producer vertex fetches
+- CPU-backed resolve commits kept coherent with the Metal shared-memory copy
 - Texture layout, decode, upload, and Metal texture creation
+- Metal 2D/stacked textures matching translated `texture2d_array` bindings
 - Xenos microcode analysis and SPIR-V translation
 - SPIR-V-to-MSL translation and runtime Metal library creation
 - Private Metal render-target allocation and readback
 - EDRAM/resolve-copy compute path
 - Guest output capture and swap presentation plumbing
 - Standalone `metal_resolve_test` with byte-for-byte CPU/GPU comparison
+- Standalone `metal_pipeline_probe_test` for external-buffer and array-texture delivery
 
 ### Milestones
 
@@ -69,36 +82,36 @@ command delivery or final presentation.
 | --- | --- | --- |
 | A. Controlled resolve diagnostic | Passed | Magenta resolve reaches the destination and presentation path |
 | B. Controlled render-target diagnostic | Passed | A solid Metal render target survives readback and resolve |
-| C. Real producer content | In progress | Real title PM4 and microcode reach Metal, but the producer target remains black |
-| D. Guest-visible resolve | Partial | Real resolves and `XE_SWAP` execute; they currently carry the black producer source |
+| C. Real producer content | In progress | Real title shaders now produce nonzero pixels, but the image is malformed |
+| D. Guest-visible resolve | Passed for current producer | Nonzero producer output reaches the guest buffer and normal presenter |
 | E. Recognizable menu | Not reached | No strict-path menu frame has been produced |
+| F. Sustained title execution | Passed | WPTR >1088 and normal `IssueSwap` 64 without scavenging or replay |
 
 ## Primary blocker
 
-The first failing content draw builds a valid Metal pipeline but writes no visible pixels. Its
-vertex shader references fetch constant 95 (`1fabd333 1000007a ...` in the captured live state),
-while current producer diagnostics only decode the simpler fetch-0 setup draws. The next task is to
-trace that exact fetch through address, stride, endian, range, shader binding, transformed position,
-and raster state. Texture binding and resolve are downstream checks once vertex/raster coverage is
-proven.
+Fetch constant 95 is no longer an unknown. Its live value addresses `0x1FABD330`, contains 30
+dwords, uses endian mode 2, and supplies six five-dword vertices through `fetch_constants[47].zw`.
+The referenced range is made resident in the authoritative Metal shared-memory buffer before the
+draw. The exact content vertex shader produces coverage with both a controlled solid fragment and
+real title pixel shaders.
 
-The reproducible SIGBUS and invalid-function failures from the initial diagnostic runs were traced
-to an XEX-only staging directory. Running against the complete authorized game-data root proceeds
-through audio, draws, resolves, and CP-driven swaps. A later interactive black/audio run coincided
-with the app and development session exiting, so longer-run stability remains to be audited with
-bounded, redirected diagnostics. Missing game data must not be treated as a renderer defect.
+The remaining failure is output fidelity. The first sustained frames contain title-driven pixels,
+but geometry and color are visibly corrupt. The next investigation must compare the earliest
+malformed draw's interpolators, packed constants, texture contents and sampler state, then apply
+the guest viewport, scissor, culling, depth, blend, and color-write state faithfully. Missing game
+data remains a separate launch problem and must not be diagnosed as a renderer failure.
 
 ## Next development priority
 
 Work in this order:
 
-1. Capture the exact first failing content draw and its complete live register snapshot.
-2. Decode vertex fetch 95 and validate its address, stride, endian mode, range, and Metal binding.
-3. Verify translated vertex positions, clip-space coverage, viewport/scissor, culling, and color
-   write state for that draw.
-4. Match the translated MSL resource bindings to the exact microcode and live constants.
-5. Demonstrate nonzero title pixels in the real producer render target.
-6. Follow those pixels through the already-working normal resolve and `IssueSwap` path to the menu.
+1. Capture the earliest malformed nonzero draw and its complete live register snapshot.
+2. Validate its vertex-to-fragment interpolators, packed constants, texture contents, texture type,
+   and sampler state against the translated MSL.
+3. Apply and verify the guest viewport, scissor, culling, depth, blend, and color-write state.
+4. Replace remaining probe-specific system-constant overrides with faithful guest state.
+5. Produce a recognizable title frame through the normal resolve and `IssueSwap` path.
+6. Audit pacing, input, and long-run stability once the frame is visually correct.
 
 Do not restore heuristic command scavenging or direct presentation shortcuts. The real ring and
 normal `XE_SWAP` path now provide the authoritative evidence needed to debug production.

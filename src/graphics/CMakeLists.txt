@@ -241,4 +241,28 @@ if(REXGLUE_USE_METAL)
     if(REXGLUE_BUILD_TESTS)
         add_test(NAME metal_resolve_test COMMAND metal_resolve_test)
     endif()
+
+    # Integration gate for translated-draw resource delivery. This compiles
+    # the exact probe implementation into a small standalone executable, then
+    # verifies an external MTLBuffer and a one-layer texture2d_array in one
+    # visible render.
+    add_executable(metal_pipeline_probe_test
+        metal/pipeline_probe_test.mm
+        metal/msl_compiler.mm
+    )
+    target_include_directories(metal_pipeline_probe_test PRIVATE
+        ${REXGLUE_ROOT}/include
+    )
+    target_link_libraries(metal_pipeline_probe_test PRIVATE
+        "-framework Metal"
+        "-framework Foundation"
+    )
+    set_target_properties(metal_pipeline_probe_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
+        CXX_STANDARD 23
+        CXX_STANDARD_REQUIRED ON
+    )
+    if(REXGLUE_BUILD_TESTS)
+        add_test(NAME metal_pipeline_probe_test COMMAND metal_pipeline_probe_test)
+    endif()
 endif()

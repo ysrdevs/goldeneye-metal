@@ -69,6 +69,7 @@ class MetalCommandProcessor final : public CommandProcessor {
   void UpdateMinimalSystemConstants(xenos::PrimitiveType prim_type,
                                     const IndexBufferInfo* index_buffer_info);
   void UpdateGuestConstantBuffers();
+  bool EnsureVertexFetchRangesResident(const MetalShader& vertex_shader);
   void TryRenderPipelineProbe(MetalShader& vertex_shader, MetalShader& pixel_shader,
                               void* pipeline_state, xenos::PrimitiveType prim_type,
                               uint32_t index_count, bool host_render_target_debug = false);

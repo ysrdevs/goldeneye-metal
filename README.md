@@ -5,8 +5,8 @@ Apple Silicon and Metal rendering path. This repository contains the runtime, to
 backend, and game integration in one tree.
 
 > [!WARNING]
-> The macOS build is not playable yet. Controlled Metal render-target and resolve tests pass, but
-> strict title-driven rendering still produces a black frame and has not reached a recognizable
+> The macOS build is not playable yet. The native title path now runs continuously and presents
+> nonzero output, but that output is malformed geometry and flat color rather than a recognizable
 > menu.
 
 ## Project status
@@ -21,8 +21,10 @@ PM4 command stream -> Xenos shader translation -> Metal draws -> Metal RT/EDRAM
 Implemented foundations include the macOS window and presenter, shared guest memory, texture
 decode and upload, Xenos-to-SPIR-V-to-MSL translation, private Metal render targets, resolve-copy,
 and swap presentation. The title's real primary ring, indirect buffers, shaders, resolves, and
-`XE_SWAP` now reach Metal without heuristic replay. The current blocker is producer-draw fidelity:
-real draws execute, but the render target remains black.
+`XE_SWAP` now run continuously through Metal without command scavenging or replay. Authoritative
+vertex-buffer delivery, translated array-texture bindings, and CPU/Metal resolve coherence are in
+place. Real producer pixels now survive the normal resolve and presentation path; the current
+blocker is faithful fragment inputs, render state, and output rather than command delivery.
 
 See [the native Metal status report](docs/GOLDENEYE_NATIVE_METAL_PROJECT_STATUS.md) for the exact
 milestones, evidence, and next development priority.
@@ -76,7 +78,7 @@ Configure and build the toolchain and Metal isolation test:
 ```sh
 cmake --preset macos-arm64-release
 cmake --build --preset macos-arm64-release \
-  --target rexglue metal_resolve_test --parallel
+  --target rexglue metal_resolve_test metal_pipeline_probe_test --parallel
 ctest --preset macos-arm64-release --output-on-failure
 ```
 

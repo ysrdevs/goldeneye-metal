@@ -14,11 +14,14 @@
 namespace rex::graphics::metal {
 namespace {
 
-MTLTextureType GetMetalTextureType(xenos::DataDimension dimension, uint32_t depth_or_array_size) {
+MTLTextureType GetMetalTextureType(xenos::DataDimension dimension) {
   if (dimension == xenos::DataDimension::kCube) {
     return MTLTextureTypeCube;
   }
-  return depth_or_array_size > 1 ? MTLTextureType2DArray : MTLTextureType2D;
+  // The Xenos 2D/stacked translator declares texture2d_array even for a
+  // single-layer fetch. Metal validates the texture type at draw time, so a
+  // plain MTLTextureType2D is not binding-compatible with that shader type.
+  return MTLTextureType2DArray;
 }
 
 MTLPixelFormat GetMetalPixelFormat(xenos::TextureFormat format, bool is_signed) {
@@ -183,8 +186,12 @@ std::unique_ptr<TextureCache::Texture> MetalTextureCache::CreateTexture(TextureK
                                                          width:width
                                                         height:height
                                                      mipmapped:NO];
-  descriptor.textureType = GetMetalTextureType(key.dimension, depth_or_array_size);
-  descriptor.arrayLength = key.dimension == xenos::DataDimension::kCube ? 6 : depth_or_array_size;
+  descriptor.textureType = GetMetalTextureType(key.dimension);
+  // A cube texture has one cube in Metal; its six faces are addressed as
+  // slices. Cube arrays would increase arrayLength, but Xenos cube fetches here
+  // represent a single cube.
+  descriptor.arrayLength =
+      key.dimension == xenos::DataDimension::kCube ? 1 : std::max(depth_or_array_size, 1u);
   descriptor.usage = MTLTextureUsageShaderRead;
   descriptor.storageMode = MTLStorageModeShared;
   id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
@@ -220,9 +227,9 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   const texture_util::TextureGuestLayout::Level& level = metal_texture.guest_layout().base;
   uint32_t base_physical = key.base_page << 12;
   memory::Memory& guest_memory = metal_shared_memory_.guest_memory();
-  // Phase 0.5 (B): read source texels from the shared-memory MTLBuffer (UMA: the
-  // same physical bytes as guest memory, but also reflects GPU resolves once
-  // RangeWrittenByGpu -> RequestRange has refetched them).
+  // Read source texels from the resident Metal shared-memory copy. CPU-backed
+  // resolve writes explicitly commit their guest bytes to this buffer before
+  // publishing the range as GPU-produced data.
   id<MTLBuffer> shared_buffer = (id<MTLBuffer>)metal_shared_memory_.buffer();
   if (!shared_buffer) {
     return false;

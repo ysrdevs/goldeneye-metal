@@ -536,7 +536,8 @@ bool RenderPipelineProbeToContext(
     void* opaque_context, void* pipeline_state, const void* system_constants,
     size_t system_constants_size, const void* float_constants, size_t float_constants_size,
     const void* fetch_constants, size_t fetch_constants_size, void* shared_memory,
-    size_t shared_memory_size, const ProbeTextureSlot* vertex_textures, size_t vertex_texture_count,
+    size_t shared_memory_size, void* shared_memory_metal_buffer,
+    const ProbeTextureSlot* vertex_textures, size_t vertex_texture_count,
     size_t vertex_sampler_count, const ProbeTextureSlot* fragment_textures,
     size_t fragment_texture_count, size_t fragment_sampler_count, uint32_t primitive_type,
     uint32_t vertex_count, uint32_t width, uint32_t height, std::string* error_out,
@@ -596,13 +597,15 @@ bool RenderPipelineProbeToContext(
   }
   uint32_t shared_dummy_words[4] = {};
   id<MTLBuffer> shared_memory_buffer = nil;
-  if (shared_memory && shared_memory_size) {
+  if (shared_memory_metal_buffer) {
+    shared_memory_buffer = [(id<MTLBuffer>)shared_memory_metal_buffer retain];
+  } else if (shared_memory && shared_memory_size) {
     shared_memory_buffer = [device newBufferWithBytesNoCopy:shared_memory
                                                      length:shared_memory_size
                                                     options:MTLResourceStorageModeShared
                                                 deallocator:nil];
   }
-  if (!shared_memory_buffer) {
+  if (!shared_memory_buffer && vertex_shared_memory_buffer_index == UINT32_MAX) {
     shared_memory_buffer = [device newBufferWithBytes:shared_dummy_words
                                                length:sizeof(shared_dummy_words)
                                               options:MTLResourceStorageModeShared];
@@ -630,7 +633,9 @@ bool RenderPipelineProbeToContext(
       [shared_memory_buffer release];
     }
     if (error_out) {
-      *error_out = "failed to create persistent probe argument buffers";
+      *error_out = vertex_shared_memory_buffer_index != UINT32_MAX && !shared_memory_buffer
+                       ? "required persistent shared-memory buffer is unavailable"
+                       : "failed to create persistent probe argument buffers";
     }
     return false;
   }
@@ -845,7 +850,8 @@ bool RenderPipelineProbe(
     void* metal_device, void* pipeline_state, const void* system_constants,
     size_t system_constants_size, const void* float_constants, size_t float_constants_size,
     const void* fetch_constants, size_t fetch_constants_size, void* shared_memory,
-    size_t shared_memory_size, const ProbeTextureSlot* vertex_textures, size_t vertex_texture_count,
+    size_t shared_memory_size, void* shared_memory_metal_buffer,
+    const ProbeTextureSlot* vertex_textures, size_t vertex_texture_count,
     size_t vertex_sampler_count, const ProbeTextureSlot* fragment_textures,
     size_t fragment_texture_count, size_t fragment_sampler_count, uint32_t primitive_type,
     uint32_t vertex_count, uint32_t width, uint32_t height, std::vector<uint8_t>& bgra_out,
@@ -927,13 +933,15 @@ bool RenderPipelineProbe(
   }
   uint32_t shared_dummy_words[4] = {};
   id<MTLBuffer> shared_memory_buffer = nil;
-  if (shared_memory && shared_memory_size) {
+  if (shared_memory_metal_buffer) {
+    shared_memory_buffer = [(id<MTLBuffer>)shared_memory_metal_buffer retain];
+  } else if (shared_memory && shared_memory_size) {
     shared_memory_buffer = [device newBufferWithBytesNoCopy:shared_memory
                                                      length:shared_memory_size
                                                     options:MTLResourceStorageModeShared
                                                 deallocator:nil];
   }
-  if (!shared_memory_buffer) {
+  if (!shared_memory_buffer && vertex_shared_memory_buffer_index == UINT32_MAX) {
     shared_memory_buffer = [device newBufferWithBytes:shared_dummy_words
                                                length:sizeof(shared_dummy_words)
                                               options:MTLResourceStorageModeShared];
@@ -964,7 +972,9 @@ bool RenderPipelineProbe(
     [render_texture release];
     [command_queue release];
     if (error_out) {
-      *error_out = "failed to create argument buffers";
+      *error_out = vertex_shared_memory_buffer_index != UINT32_MAX && !shared_memory_buffer
+                       ? "required shared-memory buffer is unavailable"
+                       : "failed to create argument buffers";
     }
     return false;
   }

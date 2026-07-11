@@ -5387,8 +5387,10 @@ bool MetalCommandProcessor::WriteBgraToTiledResolveRegion(
     uint32_t clamped_start = std::min(dest_base, SharedMemory::kBufferSize);
     uint32_t clamped_length =
         uint32_t(std::min<uint64_t>(surface_bytes, SharedMemory::kBufferSize - clamped_start));
-    if (clamped_length) {
-      shared_memory_->RangeWrittenByGpu(clamped_start, clamped_length);
+    if (clamped_length &&
+        !shared_memory_->CommitGuestCpuWriteAsGpu(clamped_start, clamped_length)) {
+      log_write_failure("shared-memory-commit");
+      return false;
     }
   }
   uint64_t surface_bytes = uint64_t(pitch) * height * 4;
@@ -6932,7 +6934,8 @@ bool MetalCommandProcessor::RenderFullscreenPixelShader(MetalShader& pixel_shade
         host_render_target_context_, pipeline_state, &fullscreen_system_constants,
         sizeof(fullscreen_system_constants), nullptr, 0, fetch_constants_.data(),
         fetch_constants_.size() * sizeof(uint32_t), memory_->physical_membase(), size_t(0x20000000),
-        nullptr, 0, 0, texture_slots.empty() ? nullptr : texture_slots.data(), texture_slots.size(),
+        nullptr, nullptr, 0, 0, texture_slots.empty() ? nullptr : texture_slots.data(),
+        texture_slots.size(),
         pixel_shader.GetSamplerBindingsAfterTranslation().size(),
         uint32_t(xenos::PrimitiveType::kTriangleList), 3, width, height, &render_error, UINT32_MAX,
         UINT32_MAX, UINT32_MAX, fragment_float_constants_data, fragment_float_constants_size,
@@ -6948,7 +6951,8 @@ bool MetalCommandProcessor::RenderFullscreenPixelShader(MetalShader& pixel_shade
         metal_device_, pipeline_state, &fullscreen_system_constants,
         sizeof(fullscreen_system_constants), nullptr, 0, fetch_constants_.data(),
         fetch_constants_.size() * sizeof(uint32_t), memory_->physical_membase(), size_t(0x20000000),
-        nullptr, 0, 0, texture_slots.empty() ? nullptr : texture_slots.data(), texture_slots.size(),
+        nullptr, nullptr, 0, 0, texture_slots.empty() ? nullptr : texture_slots.data(),
+        texture_slots.size(),
         pixel_shader.GetSamplerBindingsAfterTranslation().size(),
         uint32_t(xenos::PrimitiveType::kTriangleList), 3, width, height, bgra_out, &render_error,
         UINT32_MAX, UINT32_MAX, UINT32_MAX, nullptr, 0, fragment_float_constants_data,
@@ -7259,7 +7263,7 @@ bool MetalCommandProcessor::RenderHostPixelShader(MetalShader& pixel_shader,
             persistent_host_context, pipeline_state, &host_system_constants,
             sizeof(host_system_constants), nullptr, 0, fetch_constants_.data(),
             fetch_constants_.size() * sizeof(uint32_t), memory_->physical_membase(),
-            size_t(0x20000000), nullptr, 0, 0,
+            size_t(0x20000000), nullptr, nullptr, 0, 0,
             texture_slots.empty() ? nullptr : texture_slots.data(), texture_slots.size(),
             fragment_sampler_count, uint32_t(xenos::PrimitiveType::kTriangleList),
             uint32_t(probe_vertices.size()), width, height, &render_error, UINT32_MAX, UINT32_MAX,
@@ -7280,7 +7284,7 @@ bool MetalCommandProcessor::RenderHostPixelShader(MetalShader& pixel_shader,
     rendered = RenderPipelineProbe(
         metal_device_, pipeline_state, &host_system_constants, sizeof(host_system_constants),
         nullptr, 0, fetch_constants_.data(), fetch_constants_.size() * sizeof(uint32_t),
-        memory_->physical_membase(), size_t(0x20000000), nullptr, 0, 0,
+        memory_->physical_membase(), size_t(0x20000000), nullptr, nullptr, 0, 0,
         texture_slots.empty() ? nullptr : texture_slots.data(), texture_slots.size(),
         fragment_sampler_count, uint32_t(xenos::PrimitiveType::kTriangleList),
         uint32_t(probe_vertices.size()), width, height, bgra_out, &render_error, UINT32_MAX,
@@ -7655,7 +7659,7 @@ bool MetalCommandProcessor::ExecuteMemExportVertexShader(MetalShader& vertex_sha
       metal_device_, pipeline_state, &system_constants_, sizeof(system_constants_),
       vertex_float_constants_data, vertex_float_constants_size, fetch_constants_.data(),
       fetch_constants_.size() * sizeof(uint32_t), memory_->physical_membase(), size_t(0x20000000),
-      nullptr, 0, 0, nullptr, 0, 0, uint32_t(prim_type), index_count, 1, 1, ignored_bgra,
+      nullptr, nullptr, 0, 0, nullptr, 0, 0, uint32_t(prim_type), index_count, 1, 1, ignored_bgra,
       &render_error, vertex_buffer_bindings.shared_memory, vertex_buffer_bindings.float_constants,
       vertex_buffer_bindings.fetch_constants, nullptr, 0, nullptr, 0, UINT32_MAX, UINT32_MAX,
       nullptr, nullptr, nullptr, 0, UINT32_MAX, bool_loop_constants_.data(),
@@ -7829,6 +7833,56 @@ void MetalCommandProcessor::UpdateGuestConstantBuffers() {
     uint32_t texture_signs_mask = UINT32_C(0xFF) << texture_signs_shift;
     texture_signs_uint = (texture_signs_uint & ~texture_signs_mask) | texture_signs_shifted;
   }
+}
+
+bool MetalCommandProcessor::EnsureVertexFetchRangesResident(const MetalShader& vertex_shader) {
+  if (!shared_memory_ || !shared_memory_->buffer() || !register_file_) {
+    return false;
+  }
+
+  const Shader::ConstantRegisterMap& constant_map = vertex_shader.constant_register_map();
+  for (uint32_t bitmap_index = 0;
+       bitmap_index < rex::countof(constant_map.vertex_fetch_bitmap); ++bitmap_index) {
+    uint32_t fetch_bits = constant_map.vertex_fetch_bitmap[bitmap_index];
+    uint32_t bit_index = 0;
+    while (rex::bit_scan_forward(fetch_bits, &bit_index)) {
+      fetch_bits &= ~(UINT32_C(1) << bit_index);
+      uint32_t fetch_index = bitmap_index * 32 + bit_index;
+      xenos::xe_gpu_vertex_fetch_t fetch = register_file_->GetVertexFetch(fetch_index);
+      switch (fetch.type) {
+        case xenos::FetchConstantType::kVertex:
+          break;
+        case xenos::FetchConstantType::kInvalidVertex:
+          if (REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
+            break;
+          }
+          REXGPU_WARN(
+              "Metal vertex fetch constant {} ({:08X} {:08X}) has invalid type",
+              fetch_index, fetch.dword_0, fetch.dword_1);
+          return false;
+        default:
+          REXGPU_WARN(
+              "Metal vertex fetch constant {} ({:08X} {:08X}) is not a vertex fetch",
+              fetch_index, fetch.dword_0, fetch.dword_1);
+          return false;
+      }
+
+      uint32_t fetch_start = fetch.address << 2;
+      uint32_t fetch_length = fetch.size << 2;
+      if (!fetch_length) {
+        continue;
+      }
+      if (fetch_start >= SharedMemory::kBufferSize ||
+          fetch_length > SharedMemory::kBufferSize - fetch_start ||
+          !shared_memory_->RequestRange(fetch_start, fetch_length)) {
+        REXGPU_ERROR(
+            "Failed to make Metal vertex fetch {} resident at 0x{:08X} (size {})",
+            fetch_index, fetch_start, fetch_length);
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 void MetalCommandProcessor::TryRenderPipelineProbe(MetalShader& vertex_shader,
@@ -8068,6 +8122,23 @@ void MetalCommandProcessor::TryRenderPipelineProbe(MetalShader& vertex_shader,
   auto* pixel_shader_translation =
       static_cast<MetalShader::MetalTranslation*>(pixel_shader.GetTranslation(pixel_modification));
   VertexMslBufferBindings vertex_buffer_bindings = GetVertexMslBufferBindings(vertex_translation);
+  void* resident_shared_memory_buffer = nullptr;
+  if (vertex_buffer_bindings.shared_memory != UINT32_MAX) {
+    if (!EnsureVertexFetchRangesResident(vertex_shader)) {
+      static std::atomic<uint32_t> vertex_residency_failure_logs{0};
+      uint32_t failure_index =
+          vertex_residency_failure_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (failure_index <= 16 || (failure_index & 0xFF) == 0) {
+        std::fprintf(stderr,
+                     "[metal] guest pipeline vertex residency failed#%u vs=%016llx\n",
+                     failure_index,
+                     static_cast<unsigned long long>(vertex_shader.ucode_data_hash()));
+        std::fflush(stderr);
+      }
+      return;
+    }
+    resident_shared_memory_buffer = shared_memory_->buffer();
+  }
   uint32_t fragment_float_constants_buffer_index =
       pixel_shader_translation
           ? FindMslBufferIndex(pixel_shader_translation->msl_source(), "xe_uniform_float_constants")
@@ -8123,11 +8194,8 @@ void MetalCommandProcessor::TryRenderPipelineProbe(MetalShader& vertex_shader,
           bits &= ~(UINT32_C(1) << bit_index);
           uint32_t fetch_index = bitmap_index * 32 + bit_index;
           const uint32_t* fetch_words = fetch_constants_.data() + fetch_index * 2;
-          std::fprintf(stderr,
-                       "[metal]   used vfetch%u=%08x %08x %08x %08x "
-                       "%08x %08x\n",
-                       fetch_index, fetch_words[0], fetch_words[1], fetch_words[2], fetch_words[3],
-                       fetch_words[4], fetch_words[5]);
+          std::fprintf(stderr, "[metal]   used vfetch%u=%08x %08x\n", fetch_index,
+                       fetch_words[0], fetch_words[1]);
           if (++logged_fetches >= 8) {
             break;
           }
@@ -8153,6 +8221,7 @@ void MetalCommandProcessor::TryRenderPipelineProbe(MetalShader& vertex_shader,
         persistent_context, pipeline_state, &probe_system_constants, sizeof(probe_system_constants),
         vertex_float_constants_data, vertex_float_constants_size, fetch_constants_.data(),
         fetch_constants_.size() * sizeof(uint32_t), memory_->physical_membase(), size_t(0x20000000),
+        resident_shared_memory_buffer,
         vertex_texture_slots.empty() ? nullptr : vertex_texture_slots.data(),
         vertex_texture_slots.size(), vertex_shader.GetSamplerBindingsAfterTranslation().size(),
         fragment_texture_slots.empty() ? nullptr : fragment_texture_slots.data(),
@@ -8195,7 +8264,7 @@ void MetalCommandProcessor::TryRenderPipelineProbe(MetalShader& vertex_shader,
                 sizeof(probe_system_constants), vertex_float_constants_data,
                 vertex_float_constants_size, fetch_constants_.data(),
                 fetch_constants_.size() * sizeof(uint32_t), memory_->physical_membase(),
-                size_t(0x20000000),
+                size_t(0x20000000), resident_shared_memory_buffer,
                 vertex_texture_slots.empty() ? nullptr : vertex_texture_slots.data(),
                 vertex_texture_slots.size(),
                 vertex_shader.GetSamplerBindingsAfterTranslation().size(), nullptr, 0, 0,
@@ -8235,7 +8304,7 @@ void MetalCommandProcessor::TryRenderPipelineProbe(MetalShader& vertex_shader,
               sizeof(probe_system_constants), vertex_float_constants_data,
               vertex_float_constants_size, fetch_constants_.data(),
               fetch_constants_.size() * sizeof(uint32_t), memory_->physical_membase(),
-              size_t(0x20000000),
+              size_t(0x20000000), resident_shared_memory_buffer,
               vertex_texture_slots.empty() ? nullptr : vertex_texture_slots.data(),
               vertex_texture_slots.size(),
               vertex_shader.GetSamplerBindingsAfterTranslation().size(), nullptr, 0, 0,
@@ -8273,7 +8342,7 @@ void MetalCommandProcessor::TryRenderPipelineProbe(MetalShader& vertex_shader,
                 metal_device_, fullscreen_pipeline_state, &probe_system_constants,
                 sizeof(probe_system_constants), nullptr, 0, fetch_constants_.data(),
                 fetch_constants_.size() * sizeof(uint32_t), memory_->physical_membase(),
-                size_t(0x20000000), nullptr, 0, 0,
+                size_t(0x20000000), nullptr, nullptr, 0, 0,
                 fragment_texture_slots.empty() ? nullptr : fragment_texture_slots.data(),
                 fragment_texture_slots.size(),
                 pixel_shader.GetSamplerBindingsAfterTranslation().size(),
@@ -8356,6 +8425,7 @@ void MetalCommandProcessor::TryRenderPipelineProbe(MetalShader& vertex_shader,
       metal_device_, pipeline_state, &probe_system_constants, sizeof(probe_system_constants),
       vertex_float_constants_data, vertex_float_constants_size, fetch_constants_.data(),
       fetch_constants_.size() * sizeof(uint32_t), memory_->physical_membase(), size_t(0x20000000),
+      resident_shared_memory_buffer,
       vertex_texture_slots.empty() ? nullptr : vertex_texture_slots.data(),
       vertex_texture_slots.size(), vertex_shader.GetSamplerBindingsAfterTranslation().size(),
       fragment_texture_slots.empty() ? nullptr : fragment_texture_slots.data(),
@@ -8409,7 +8479,7 @@ void MetalCommandProcessor::TryRenderPipelineProbe(MetalShader& vertex_shader,
             metal_device_, fullscreen_pipeline_state, &fullscreen_system_constants,
             sizeof(fullscreen_system_constants), nullptr, 0, fetch_constants_.data(),
             fetch_constants_.size() * sizeof(uint32_t), memory_->physical_membase(),
-            size_t(0x20000000), nullptr, 0, 0,
+            size_t(0x20000000), nullptr, nullptr, 0, 0,
             fragment_texture_slots.empty() ? nullptr : fragment_texture_slots.data(),
             fragment_texture_slots.size(), pixel_shader.GetSamplerBindingsAfterTranslation().size(),
             uint32_t(xenos::PrimitiveType::kTriangleList), 3, probe_width, probe_height,

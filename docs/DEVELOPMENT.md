@@ -25,7 +25,7 @@ Build only the main developer targets:
 
 ```sh
 cmake --build --preset macos-arm64-release \
-  --target rexglue metal_resolve_test unit_tests --parallel
+  --target rexglue metal_resolve_test metal_pipeline_probe_test unit_tests --parallel
 ```
 
 The Metal backend deliberately fails during configuration if SPIRV-Cross MSL support is missing.
@@ -68,6 +68,10 @@ resolve to null. Game data stays local and must never be committed.
 `metal_resolve_test` allocates Metal EDRAM and destination buffers, runs the native resolve-copy
 kernel, and compares GPU output against a CPU reference byte for byte.
 
+`metal_pipeline_probe_test` renders through an externally owned Metal vertex buffer and samples a
+single-layer `texture2d_array`. It protects the resource contract used by translated producer
+draws. It does not replace title-level validation of texture-cache uploads or resolve coherence.
+
 Unit tests are enabled by the Apple Silicon preset. PPC assembly tests are disabled by default and
 require an external `powerpc-none-elf` binutils toolchain. Enable them explicitly with:
 
@@ -100,6 +104,8 @@ labelled as diagnostics and must not be reported as strict-path rendering succes
 - Prefer counters and bounded logs over unconditional output.
 - Keep dumps outside the repository and never share captures containing proprietary game data.
 - Confirm whether a pixel came from the real producer target before debugging the final swap copy.
+- Track guest VdSwap calls, CP write-pointer progress, and `IssueSwap` separately.
+- Do not advance title-owned fences or ring pointers from a wall-clock timeout.
 
 ## Formatting
 
