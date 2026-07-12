@@ -111,8 +111,7 @@ bool EnvironmentFlagEnabled(const char* name) {
 }
 
 bool MetalSubmissionDiagnosticsEnabled() {
-  static const bool enabled =
-      EnvironmentFlagEnabled("GOLDENEYE_METAL_SUBMISSION_DIAGNOSTICS");
+  static const bool enabled = EnvironmentFlagEnabled("GOLDENEYE_METAL_SUBMISSION_DIAGNOSTICS");
   return enabled;
 }
 
@@ -274,8 +273,8 @@ void CommandProcessor::CallInThread(std::function<void()> fn) {
     if (!worker_running_.load(std::memory_order_relaxed)) {
       return;
     }
-    run_inline = pending_fns_.empty() && worker_thread_ &&
-                 system::XThread::IsInThread(worker_thread_.get());
+    run_inline =
+        pending_fns_.empty() && worker_thread_ && system::XThread::IsInThread(worker_thread_.get());
     if (!run_inline) {
       pending_fns_.push(std::move(fn));
     }
@@ -402,8 +401,7 @@ void CommandProcessor::WorkerThreadMain() {
               if (!committed_snapshot.read_pointer_writeback_enabled()) {
                 return;
               }
-              uint32_t writeback_address =
-                  committed_snapshot.read_pointer_writeback_address();
+              uint32_t writeback_address = committed_snapshot.read_pointer_writeback_address();
               uint8_t* writeback_host = memory_->TranslatePhysical(writeback_address);
               if (committed_snapshot.read_pointer_writeback_swap() == 2) {
                 memory::store_and_swap<uint32_t>(writeback_host, read_ptr_index);
@@ -528,10 +526,8 @@ bool CommandProcessor::Restore(::rex::stream::ByteStream* stream) {
           (legacy_writeback_address & CommandRingState::kAddressMask) | 2u;
       snapshot.control &= ~CommandRingState::kControlNoUpdate;
       if (marker_or_update_frequency && std::has_single_bit(marker_or_update_frequency)) {
-        const uint32_t block_size_log2 =
-            std::countr_zero(marker_or_update_frequency) + 2u;
-        snapshot.control |=
-            (block_size_log2 << 8) & CommandRingState::kControlBlockSizeMask;
+        const uint32_t block_size_log2 = std::countr_zero(marker_or_update_frequency) + 2u;
+        snapshot.control |= (block_size_log2 << 8) & CommandRingState::kControlBlockSizeMask;
       }
     }
   }
@@ -578,23 +574,19 @@ void CommandProcessor::UpdateWritePointer(uint32_t value) {
   if (MetalSubmissionDiagnosticsEnabled() && primary_buffer_size &&
       (wptr_index <= 32 || (wptr_index & 0x3F) == 0)) {
     uint32_t read_ptr_index = ring_snapshot.read_pointer;
-    uint32_t pending_offset = (read_ptr_index % (primary_buffer_size / sizeof(uint32_t))) *
-                              sizeof(uint32_t);
+    uint32_t pending_offset =
+        (read_ptr_index % (primary_buffer_size / sizeof(uint32_t))) * sizeof(uint32_t);
     uint32_t physical_value = memory::load_and_swap<uint32_t>(
         memory_->TranslatePhysical(primary_buffer_ptr + pending_offset));
     uint32_t alias_a = 0xA0000000u | ((primary_buffer_ptr + pending_offset) & 0x1FFFFFFFu);
     uint32_t alias_c = 0xC0000000u | ((primary_buffer_ptr + pending_offset) & 0x1FFFFFFFu);
-    uint32_t alias_e = 0xE0000000u |
-                       (((primary_buffer_ptr + pending_offset) - 0x1000u) & 0x1FFFFFFFu);
-    uint32_t alias_a_value =
-        memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(alias_a));
-    uint32_t alias_c_value =
-        memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(alias_c));
-    uint32_t alias_e_value =
-        memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(alias_e));
+    uint32_t alias_e =
+        0xE0000000u | (((primary_buffer_ptr + pending_offset) - 0x1000u) & 0x1FFFFFFFu);
+    uint32_t alias_a_value = memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(alias_a));
+    uint32_t alias_c_value = memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(alias_c));
+    uint32_t alias_e_value = memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(alias_e));
     std::fprintf(stderr, "[rex] CP WPTR#%u value=0x%08x rptr=0x%08x ring=0x%08x size=0x%08x\n",
-                 wptr_index, value, read_ptr_index, primary_buffer_ptr,
-                 primary_buffer_size);
+                 wptr_index, value, read_ptr_index, primary_buffer_ptr, primary_buffer_size);
     std::fprintf(stderr,
                  "[rex] CP WPTR alias#%u offset=0x%08x phys=%08x A[%08x]=%08x C[%08x]=%08x "
                  "E[%08x]=%08x\n",
@@ -615,8 +607,8 @@ void CommandProcessor::UpdateWritePointer(uint32_t value) {
       uint32_t aval[3] = {0, 0, 0};
       for (uint32_t i = 0; i < 3u; ++i) {
         uint32_t off = (s + i) * uint32_t(sizeof(uint32_t));
-        phys[i] = memory::load_and_swap<uint32_t>(
-            memory_->TranslatePhysical(primary_buffer_ptr + off));
+        phys[i] =
+            memory::load_and_swap<uint32_t>(memory_->TranslatePhysical(primary_buffer_ptr + off));
         uint32_t alias = 0xA0000000u | ((primary_buffer_ptr + off) & 0x1FFFFFFFu);
         aval[i] = memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(alias));
       }
@@ -725,9 +717,8 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   // (regs 0x4800..0x4800+32*6), regardless of path (SET_CONSTANT/FETCH,
   // LOAD_ALU_CONSTANT/FETCH, SET_CONSTANT2, raw type-0). dword_1 (rel%6==1) holds
   // base_address<<12. Reveals whether the menu textures ever bind to slots 0/1.
-  if (MetalSubmissionDiagnosticsEnabled() && index >= 0x4800u &&
-      index < 0x4800u + 32u * 6u && (index - 0x4800u) % 6u == 1u &&
-      (value & 0xFFFFF000u) != 0u) {
+  if (MetalSubmissionDiagnosticsEnabled() && index >= 0x4800u && index < 0x4800u + 32u * 6u &&
+      (index - 0x4800u) % 6u == 1u && (value & 0xFFFFF000u) != 0u) {
     if (graphics_system_ && graphics_system_->name() == "Metal") {
       static std::atomic<uint32_t> fr_logs{0};
       uint32_t li = fr_logs.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -921,9 +912,10 @@ void CommandProcessor::WriteFetchRangeFromRing(memory::RingBuffer* ring, uint32_
         uint32_t d0i = 0x4800 + slot * 6;
         uint32_t d0 = register_file_->values[d0i];
         uint32_t d1 = register_file_->values[d0i + 1];
-        std::fprintf(stderr,
-                     "[ge-fetch] slot=%u type=%u base=0x%08x (fetch_reg=%u num=%u d0=%08x d1=%08x)\n",
-                     slot, d0 & 0x3u, d1 & 0xFFFFF000u, base, num_registers, d0, d1);
+        std::fprintf(
+            stderr,
+            "[ge-fetch] slot=%u type=%u base=0x%08x (fetch_reg=%u num=%u d0=%08x d1=%08x)\n", slot,
+            d0 & 0x3u, d1 & 0xFFFFF000u, base, num_registers, d0, d1);
       }
       std::fflush(stderr);
     }
@@ -1034,9 +1026,8 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
 
   // Adjust pointer base.
   uint32_t ring_dwords = primary_buffer_size / sizeof(uint32_t);
-  uint32_t pending_dwords = write_index >= read_index
-                                ? write_index - read_index
-                                : ring_dwords - read_index + write_index;
+  uint32_t pending_dwords =
+      write_index >= read_index ? write_index - read_index : ring_dwords - read_index + write_index;
   uint32_t start_ptr = primary_buffer_ptr + read_index * sizeof(uint32_t);
   start_ptr = (primary_buffer_ptr & ~0x1FFFFFFF) | (start_ptr & 0x1FFFFFFF);
   uint32_t end_ptr = primary_buffer_ptr + write_index * sizeof(uint32_t);
@@ -1461,8 +1452,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       // New trace request - we only start tracing at the beginning of a frame.
       uint32_t title_id = kernel_state_->GetExecutableModule()->title_id();
       auto file_name =
-          fmt::format("{:08X}_{}.xtr", title_id,
-                      counter_.load(std::memory_order_acquire) - 1);
+          fmt::format("{:08X}_{}.xtr", title_id, counter_.load(std::memory_order_acquire) - 1);
       auto path = trace_frame_path_ / file_name;
       trace_writer_.Open(path, title_id);
       InitializeTrace();
@@ -1571,10 +1561,9 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 
   static std::atomic<uint32_t> xe_swap_logs{0};
   uint32_t xe_swap_index = xe_swap_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (MetalSubmissionDiagnosticsEnabled() &&
-      (xe_swap_index <= 16 || (xe_swap_index & 0x3F) == 0)) {
-    std::fprintf(stderr, "[rex] CP XE_SWAP#%u fb_pa=0x%08x %ux%u counter=%u\n",
-                 xe_swap_index, frontbuffer_ptr, frontbuffer_width, frontbuffer_height,
+  if (MetalSubmissionDiagnosticsEnabled() && (xe_swap_index <= 16 || (xe_swap_index & 0x3F) == 0)) {
+    std::fprintf(stderr, "[rex] CP XE_SWAP#%u fb_pa=0x%08x %ux%u counter=%u\n", xe_swap_index,
+                 frontbuffer_ptr, frontbuffer_width, frontbuffer_height,
                  counter_.load(std::memory_order_acquire));
     std::fflush(stderr);
   }
@@ -1626,13 +1615,17 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   // WAIT_REG_MEM semantics.
   static const bool vd_swap_scavenger_enabled =
       EnvironmentFlagEnabled("GOLDENEYE_METAL_VDSWAP_SCAVENGE");
-  const bool fast_wait_metal = vd_swap_scavenger_enabled && graphics_system_ &&
-                               graphics_system_->name() == "Metal";
-  const auto wait_deadline =
-      std::chrono::steady_clock::now() + std::chrono::milliseconds(60);
+  const bool fast_wait_metal =
+      vd_swap_scavenger_enabled && graphics_system_ && graphics_system_->name() == "Metal";
+  const auto wait_started = std::chrono::steady_clock::now();
+  const auto wait_deadline = wait_started + std::chrono::milliseconds(60);
 
   bool matched = false;
+  bool timed_out = false;
+  uint32_t last_value = 0;
+  uint64_t poll_count = 0;
   do {
+    ++poll_count;
     uint32_t value = 0;
     if (is_memory) {
       value =
@@ -1646,6 +1639,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         value = ReadRegisterValue(poll_reg_addr);
       }
     }
+    last_value = value;
     switch (wait_info & 0x7) {
       case 0x0:  // Never.
         matched = false;
@@ -1677,6 +1671,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;  // bridge replay: do not stall on stale/synchronous fences
       }
       if (std::chrono::steady_clock::now() >= wait_deadline) {
+        timed_out = true;
         REXGPU_WARN(
             "WAIT_REG_MEM stalled >60ms (poll={:08X} ref={:08X} mask={:08X} op={}); proceeding to "
             "avoid a CPU/GPU sync deadlock",
@@ -1702,6 +1697,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
         if (!worker_running_) {
           // Short-circuited exit.
+          uint64_t duration_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - wait_started)
+                                              .count());
+          OnWaitRegMemComplete(is_memory, poll_reg_addr, ref, mask, wait_info & 0x7, wait,
+                               last_value, poll_count, duration_ns, matched, timed_out);
           return false;
         }
       } else {
@@ -1709,6 +1709,12 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
+
+  uint64_t duration_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - wait_started)
+                                      .count());
+  OnWaitRegMemComplete(is_memory, poll_reg_addr, ref, mask, wait_info & 0x7, wait, last_value,
+                       poll_count, duration_ns, matched, timed_out);
 
   return true;
 }

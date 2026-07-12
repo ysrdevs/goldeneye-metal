@@ -12,6 +12,15 @@
 namespace rex::graphics::metal {
 namespace {
 
+static_assert(MTLCompareFunctionNever == 0 && MTLCompareFunctionLess == 1 &&
+              MTLCompareFunctionEqual == 2 && MTLCompareFunctionLessEqual == 3 &&
+              MTLCompareFunctionGreater == 4 && MTLCompareFunctionNotEqual == 5 &&
+              MTLCompareFunctionGreaterEqual == 6 && MTLCompareFunctionAlways == 7);
+static_assert(MTLStencilOperationKeep == 0 && MTLStencilOperationZero == 1 &&
+              MTLStencilOperationReplace == 2 && MTLStencilOperationIncrementClamp == 3 &&
+              MTLStencilOperationDecrementClamp == 4 && MTLStencilOperationInvert == 5 &&
+              MTLStencilOperationIncrementWrap == 6 && MTLStencilOperationDecrementWrap == 7);
+
 MTLPrimitiveType ToMetalPrimitiveType(uint32_t primitive_type) {
   switch (primitive_type) {
     case 1:  // PointList
@@ -30,6 +39,17 @@ MTLPrimitiveType ToMetalPrimitiveType(uint32_t primitive_type) {
     case 8:  // RectangleList, expanded later.
     default:
       return MTLPrimitiveTypeTriangle;
+  }
+}
+
+MTLCullMode ToMetalCullMode(ProbeCullMode cull_mode) {
+  switch (cull_mode) {
+    case ProbeCullMode::kFront:
+      return MTLCullModeFront;
+    case ProbeCullMode::kBack:
+      return MTLCullModeBack;
+    default:
+      return MTLCullModeNone;
   }
 }
 
@@ -73,10 +93,78 @@ bool IsProbeRasterizationStateValid(const ProbeRasterizationState* state, uint32
       state->scissor_y > height || state->scissor_width > width - state->scissor_x ||
       state->scissor_height > height - state->scissor_y || !std::isfinite(state->blend_red) ||
       !std::isfinite(state->blend_green) || !std::isfinite(state->blend_blue) ||
-      !std::isfinite(state->blend_alpha)) {
+      !std::isfinite(state->blend_alpha) ||
+      uint32_t(state->cull_mode) > uint32_t(ProbeCullMode::kBack)) {
     return false;
   }
   return true;
+}
+
+bool IsProbeDepthStencilStateValid(const ProbeDepthStencilState* state) {
+  if (!state) {
+    return true;
+  }
+  auto face_valid = [](const ProbeStencilFaceState& face) {
+    return face.compare_function <= 7 && face.stencil_failure_operation <= 7 &&
+           face.depth_failure_operation <= 7 && face.depth_stencil_pass_operation <= 7;
+  };
+  return state->depth_compare_function <= 7 && face_valid(state->front) && face_valid(state->back);
+}
+
+uint64_t GetProbeDepthStencilKey(const ProbeDepthStencilState& state) {
+  uint64_t key = uint64_t(state.depth_test_enabled);
+  key |= uint64_t(state.depth_write_enabled) << 1;
+  key |= uint64_t(state.depth_compare_function & 7) << 2;
+  key |= uint64_t(state.stencil_test_enabled) << 5;
+  uint32_t shift = 6;
+  auto append_face = [&](const ProbeStencilFaceState& face) {
+    key |= uint64_t(face.compare_function & 7) << shift;
+    shift += 3;
+    key |= uint64_t(face.stencil_failure_operation & 7) << shift;
+    shift += 3;
+    key |= uint64_t(face.depth_failure_operation & 7) << shift;
+    shift += 3;
+    key |= uint64_t(face.depth_stencil_pass_operation & 7) << shift;
+    shift += 3;
+    key |= uint64_t(face.read_mask) << shift;
+    shift += 8;
+    key |= uint64_t(face.write_mask) << shift;
+    shift += 8;
+  };
+  append_face(state.front);
+  append_face(state.back);
+  return key;
+}
+
+id<MTLDepthStencilState> CreateProbeDepthStencilState(id<MTLDevice> device,
+                                                      const ProbeDepthStencilState& state) {
+  MTLDepthStencilDescriptor* descriptor = [[MTLDepthStencilDescriptor alloc] init];
+  if (state.depth_test_enabled) {
+    descriptor.depthCompareFunction = MTLCompareFunction(state.depth_compare_function);
+    descriptor.depthWriteEnabled = state.depth_write_enabled;
+  }
+  if (state.stencil_test_enabled) {
+    auto make_face = [](const ProbeStencilFaceState& face) {
+      MTLStencilDescriptor* descriptor = [[MTLStencilDescriptor alloc] init];
+      descriptor.stencilCompareFunction = MTLCompareFunction(face.compare_function);
+      descriptor.stencilFailureOperation = MTLStencilOperation(face.stencil_failure_operation);
+      descriptor.depthFailureOperation = MTLStencilOperation(face.depth_failure_operation);
+      descriptor.depthStencilPassOperation = MTLStencilOperation(face.depth_stencil_pass_operation);
+      descriptor.readMask = face.read_mask;
+      descriptor.writeMask = face.write_mask;
+      return descriptor;
+    };
+    MTLStencilDescriptor* front = make_face(state.front);
+    MTLStencilDescriptor* back = make_face(state.back);
+    descriptor.frontFaceStencil = front;
+    descriptor.backFaceStencil = back;
+    [front release];
+    [back release];
+  }
+  id<MTLDepthStencilState> depth_stencil_state =
+      [device newDepthStencilStateWithDescriptor:descriptor];
+  [descriptor release];
+  return depth_stencil_state;
 }
 
 MTLBlendFactor GetMetalBlendFactor(uint32_t factor, bool alpha) {
@@ -330,6 +418,8 @@ void* CreateRenderPipelineState(void* metal_device, void* vertex_library, void* 
   MTLRenderPipelineDescriptor* descriptor = [[MTLRenderPipelineDescriptor alloc] init];
   descriptor.vertexFunction = vertex_function;
   descriptor.fragmentFunction = fragment_function;
+  descriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+  descriptor.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
   MTLRenderPipelineColorAttachmentDescriptor* color_attachment = descriptor.colorAttachments[0];
   color_attachment.pixelFormat = MTLPixelFormatBGRA8Unorm;
   if (color_target_state) {
@@ -445,11 +535,13 @@ struct PipelineProbeContext {
   id<MTLDevice> device = nil;
   id<MTLCommandQueue> command_queue = nil;
   id<MTLTexture> render_texture = nil;
+  id<MTLTexture> depth_stencil_texture = nil;
   id<MTLBuffer> private_readback_buffer = nil;
   size_t private_readback_capacity = 0;
   id<MTLTexture> dummy_texture = nil;
   id<MTLSamplerState> dummy_sampler = nil;
   std::unordered_map<uint64_t, id<MTLSamplerState>> sampler_cache;
+  std::unordered_map<uint64_t, id<MTLDepthStencilState>> depth_stencil_state_cache;
   id<MTLRenderPipelineState> clear_pipeline_state = nil;
   id<MTLComputePipelineState> tiled_resolve_pipeline_state = nil;
   MTLStorageMode storage_mode = MTLStorageModeShared;
@@ -491,6 +583,19 @@ struct TiledResolveConstants {
   uint32_t copy_height;
   uint32_t destination_endian;
 };
+
+void ConfigureProbeDepthStencilPass(MTLRenderPassDescriptor* pass,
+                                    id<MTLTexture> depth_stencil_texture,
+                                    MTLLoadAction load_action) {
+  pass.depthAttachment.texture = depth_stencil_texture;
+  pass.depthAttachment.loadAction = load_action;
+  pass.depthAttachment.storeAction = MTLStoreActionStore;
+  pass.depthAttachment.clearDepth = 1.0;
+  pass.stencilAttachment.texture = depth_stencil_texture;
+  pass.stencilAttachment.loadAction = load_action;
+  pass.stencilAttachment.storeAction = MTLStoreActionStore;
+  pass.stencilAttachment.clearStencil = 0;
+}
 
 void ResetProbeUploadArena(ProbeUploadArena& arena) {
   for (ProbeUploadChunk& chunk : arena.chunks) {
@@ -805,6 +910,30 @@ void CreateCachedProbeSamplers(PipelineProbeContext* context, const ProbeSampler
   }
 }
 
+bool GetCachedProbeDepthStencilState(PipelineProbeContext* context,
+                                     const ProbeDepthStencilState* state,
+                                     id<MTLDepthStencilState>& state_out, std::string* error_out) {
+  state_out = nil;
+  ProbeDepthStencilState disabled_state;
+  const ProbeDepthStencilState& effective_state = state ? *state : disabled_state;
+  uint64_t key = GetProbeDepthStencilKey(effective_state);
+  auto existing = context->depth_stencil_state_cache.find(key);
+  if (existing != context->depth_stencil_state_cache.end()) {
+    state_out = existing->second;
+    return true;
+  }
+  id<MTLDepthStencilState> created = CreateProbeDepthStencilState(context->device, effective_state);
+  if (!created) {
+    if (error_out) {
+      *error_out = "failed to create persistent probe depth/stencil state";
+    }
+    return false;
+  }
+  context->depth_stencil_state_cache.emplace(key, created);
+  state_out = created;
+  return true;
+}
+
 void ResetOpenProbeBindingTracking(PipelineProbeContext* context) {
   context->tracked_vertex_buffer_mask = 0;
   context->tracked_fragment_buffer_mask = 0;
@@ -893,6 +1022,47 @@ bool ConsumeCompletedPipelineProbeCommands(PipelineProbeContext* context, std::s
   return false;
 }
 
+bool ConsumeOldestPipelineProbeCommand(PipelineProbeContext* context, std::string* error_out) {
+  if (!context || context->committed_command_buffers.empty()) {
+    return true;
+  }
+
+  CommittedProbeCommandBuffer committed = context->committed_command_buffers.front();
+  context->committed_command_buffers.erase(context->committed_command_buffers.begin());
+  id<MTLCommandBuffer> command_buffer = committed.command_buffer;
+  bool succeeded = [command_buffer status] == MTLCommandBufferStatusCompleted;
+  if (!succeeded) {
+    NSError* command_error = [command_buffer error];
+    const char* description =
+        command_error ? [[command_error localizedDescription] UTF8String] : nullptr;
+    context->initialized = false;
+    if (error_out) {
+      *error_out = description ? description : "asynchronous probe command buffer failed";
+    }
+  }
+  [command_buffer release];
+  ReleaseProbeUploadArena(context, committed.upload_arena_index);
+  return succeeded;
+}
+
+bool WaitOldestPipelineProbeCommand(PipelineProbeContext* context, std::string* error_out) {
+  if (!context) {
+    if (error_out) {
+      *error_out = "missing probe context";
+    }
+    return false;
+  }
+  if ((context->open_command_buffer || context->open_render_encoder) &&
+      !FinalizeOpenPipelineProbeCommandBuffer(context, error_out)) {
+    return false;
+  }
+  if (context->committed_command_buffers.empty()) {
+    return true;
+  }
+  [context->committed_command_buffers.front().command_buffer waitUntilCompleted];
+  return ConsumeOldestPipelineProbeCommand(context, error_out);
+}
+
 bool WaitPendingPipelineProbeCommands(PipelineProbeContext* context, std::string* error_out,
                                       uint32_t* waited_submission_count_out) {
   if (waited_submission_count_out) {
@@ -930,7 +1100,10 @@ bool EnsureOpenPipelineProbeEncoder(PipelineProbeContext* context, std::string* 
 
   uint32_t upload_arena_index = AcquireProbeUploadArena(context);
   if (upload_arena_index == kInvalidProbeUploadArena) {
-    if (!WaitPendingPipelineProbeCommands(context, error_out, nullptr)) {
+    // Keep three command buffers in flight while recycling only the oldest
+    // arena. Waiting for the newest buffer here needlessly serialized the CPU
+    // with all four queued buffers whenever a context reached its cap.
+    if (!WaitOldestPipelineProbeCommand(context, error_out)) {
       return false;
     }
     upload_arena_index = AcquireProbeUploadArena(context);
@@ -956,6 +1129,8 @@ bool EnsureOpenPipelineProbeEncoder(PipelineProbeContext* context, std::string* 
       context->initialized ? MTLLoadActionLoad : MTLLoadActionClear;
   pass.colorAttachments[0].storeAction = MTLStoreActionStore;
   pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+  ConfigureProbeDepthStencilPass(pass, context->depth_stencil_texture,
+                                 context->initialized ? MTLLoadActionLoad : MTLLoadActionClear);
   id<MTLRenderCommandEncoder> encoder = [command_buffer renderCommandEncoderWithDescriptor:pass];
   if (!encoder) {
     ReleaseProbeUploadArena(context, upload_arena_index);
@@ -1016,7 +1191,8 @@ bool EnsureProbeContextTexture(PipelineProbeContext* context, uint32_t width, ui
     }
     return false;
   }
-  if (context->render_texture && context->width == width && context->height == height) {
+  if (context->render_texture && context->depth_stencil_texture && context->width == width &&
+      context->height == height) {
     return true;
   }
   if (!WaitPendingPipelineProbeCommands(context, error_out, nullptr)) {
@@ -1026,6 +1202,10 @@ bool EnsureProbeContextTexture(PipelineProbeContext* context, uint32_t width, ui
     [context->render_texture release];
     context->render_texture = nil;
   }
+  if (context->depth_stencil_texture) {
+    [context->depth_stencil_texture release];
+    context->depth_stencil_texture = nil;
+  }
   MTLTextureDescriptor* texture_descriptor =
       [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                          width:width
@@ -1034,12 +1214,29 @@ bool EnsureProbeContextTexture(PipelineProbeContext* context, uint32_t width, ui
   texture_descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
   texture_descriptor.storageMode = context->storage_mode;
   context->render_texture = [context->device newTextureWithDescriptor:texture_descriptor];
-  if (!context->render_texture) {
+  MTLTextureDescriptor* depth_stencil_descriptor =
+      [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
+                                                         width:width
+                                                        height:height
+                                                     mipmapped:NO];
+  depth_stencil_descriptor.usage = MTLTextureUsageRenderTarget;
+  depth_stencil_descriptor.storageMode = MTLStorageModePrivate;
+  context->depth_stencil_texture =
+      [context->device newTextureWithDescriptor:depth_stencil_descriptor];
+  if (!context->render_texture || !context->depth_stencil_texture) {
+    if (context->render_texture) {
+      [context->render_texture release];
+      context->render_texture = nil;
+    }
+    if (context->depth_stencil_texture) {
+      [context->depth_stencil_texture release];
+      context->depth_stencil_texture = nil;
+    }
     context->width = 0;
     context->height = 0;
     context->initialized = false;
     if (error_out) {
-      *error_out = "failed to create persistent probe texture";
+      *error_out = "failed to create persistent probe color or depth/stencil texture";
     }
     return false;
   }
@@ -1110,6 +1307,8 @@ fragment float4 rex_clear_fragment(constant ClearConstants& constants [[buffer(0
   descriptor.vertexFunction = vertex_function;
   descriptor.fragmentFunction = fragment_function;
   descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+  descriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+  descriptor.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
   context->clear_pipeline_state = [context->device newRenderPipelineStateWithDescriptor:descriptor
                                                                                   error:&error];
   [descriptor release];
@@ -1129,8 +1328,9 @@ fragment float4 rex_clear_fragment(constant ClearConstants& constants [[buffer(0
 
 namespace {
 
-void* CreatePersistentRenderContext(void* metal_device, MTLStorageMode storage_mode,
-                                    const char* label, std::string* error_out) {
+void* CreatePersistentRenderContext(void* metal_device, void* metal_command_queue,
+                                    MTLStorageMode storage_mode, const char* label,
+                                    std::string* error_out) {
   if (!metal_device) {
     if (error_out) {
       *error_out = "missing Metal device";
@@ -1141,7 +1341,21 @@ void* CreatePersistentRenderContext(void* metal_device, MTLStorageMode storage_m
   context->committed_command_buffers.reserve(kMaxCommittedProbeCommandBuffers);
   context->device = [(id<MTLDevice>)metal_device retain];
   context->storage_mode = storage_mode;
-  context->command_queue = [context->device newCommandQueue];
+  if (metal_command_queue) {
+    id<MTLCommandQueue> command_queue = (id<MTLCommandQueue>)metal_command_queue;
+    if ([command_queue device] != context->device) {
+      if (error_out) {
+        *error_out = std::string("persistent ") + label +
+                     " command queue belongs to a different Metal device";
+      }
+      [context->device release];
+      delete context;
+      return nullptr;
+    }
+    context->command_queue = [command_queue retain];
+  } else {
+    context->command_queue = [context->device newCommandQueue];
+  }
   if (!context->command_queue) {
     if (error_out) {
       *error_out = std::string("failed to create persistent ") + label + " command queue";
@@ -1156,12 +1370,34 @@ void* CreatePersistentRenderContext(void* metal_device, MTLStorageMode storage_m
 }  // namespace
 
 void* CreatePipelineProbeContext(void* metal_device, std::string* error_out) {
-  return CreatePersistentRenderContext(metal_device, MTLStorageModeShared, "probe", error_out);
+  return CreatePipelineProbeContext(metal_device, nullptr, error_out);
+}
+
+void* CreatePipelineProbeContext(void* metal_device, void* metal_command_queue,
+                                 std::string* error_out) {
+  return CreatePersistentRenderContext(metal_device, metal_command_queue, MTLStorageModeShared,
+                                       "probe", error_out);
 }
 
 void* CreateHostRenderTargetContext(void* metal_device, std::string* error_out) {
-  return CreatePersistentRenderContext(metal_device, MTLStorageModePrivate, "host render target",
-                                       error_out);
+  return CreateHostRenderTargetContext(metal_device, nullptr, error_out);
+}
+
+void* CreateHostRenderTargetContext(void* metal_device, void* metal_command_queue,
+                                    std::string* error_out) {
+  return CreatePersistentRenderContext(metal_device, metal_command_queue, MTLStorageModePrivate,
+                                       "host render target", error_out);
+}
+
+bool FinalizePipelineProbeContext(void* opaque_context, std::string* error_out) {
+  auto* context = static_cast<PipelineProbeContext*>(opaque_context);
+  if (!context) {
+    if (error_out) {
+      *error_out = "missing probe context";
+    }
+    return false;
+  }
+  return FinalizeOpenPipelineProbeCommandBuffer(context, error_out);
 }
 
 bool WaitPipelineProbeContext(void* opaque_context, std::string* error_out,
@@ -1222,6 +1458,9 @@ void ReleasePipelineProbeContext(void* opaque_context) {
   if (context->render_texture) {
     [context->render_texture release];
   }
+  if (context->depth_stencil_texture) {
+    [context->depth_stencil_texture release];
+  }
   if (context->private_readback_buffer) {
     [context->private_readback_buffer release];
   }
@@ -1235,6 +1474,10 @@ void ReleasePipelineProbeContext(void* opaque_context) {
     [sampler.second release];
   }
   context->sampler_cache.clear();
+  for (auto& depth_stencil_state : context->depth_stencil_state_cache) {
+    [depth_stencil_state.second release];
+  }
+  context->depth_stencil_state_cache.clear();
   for (ProbeUploadArena& arena : context->upload_arenas) {
     for (ProbeUploadChunk& chunk : arena.chunks) {
       if (chunk.buffer) {
@@ -1274,6 +1517,7 @@ bool ClearPipelineProbeContext(void* opaque_context, uint32_t width, uint32_t he
     pass.colorAttachments[0].loadAction = MTLLoadActionClear;
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
     pass.colorAttachments[0].clearColor = MTLClearColorMake(red, green, blue, alpha);
+    ConfigureProbeDepthStencilPass(pass, context->depth_stencil_texture, MTLLoadActionClear);
 
     id<MTLRenderCommandEncoder> encoder = [command_buffer renderCommandEncoderWithDescriptor:pass];
     if (!encoder) {
@@ -1319,6 +1563,11 @@ bool ClearPipelineProbeContextRect(void* opaque_context, uint32_t width, uint32_
         !EnsureClearPipelineState(context, error_out)) {
       return false;
     }
+    id<MTLDepthStencilState> disabled_depth_stencil_state = nil;
+    if (!GetCachedProbeDepthStencilState(context, nullptr, disabled_depth_stencil_state,
+                                         error_out)) {
+      return false;
+    }
 
     float clear_constants[4] = {float(red), float(green), float(blue), float(alpha)};
     id<MTLBuffer> constants_buffer =
@@ -1346,6 +1595,8 @@ bool ClearPipelineProbeContextRect(void* opaque_context, uint32_t width, uint32_
         context->initialized ? MTLLoadActionLoad : MTLLoadActionClear;
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
     pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+    ConfigureProbeDepthStencilPass(pass, context->depth_stencil_texture,
+                                   context->initialized ? MTLLoadActionLoad : MTLLoadActionClear);
 
     id<MTLRenderCommandEncoder> encoder = [command_buffer renderCommandEncoderWithDescriptor:pass];
     if (!encoder) {
@@ -1358,6 +1609,7 @@ bool ClearPipelineProbeContextRect(void* opaque_context, uint32_t width, uint32_
     MTLScissorRect scissor = {x, y, clear_width, clear_height};
     [encoder setScissorRect:scissor];
     [encoder setRenderPipelineState:context->clear_pipeline_state];
+    [encoder setDepthStencilState:disabled_depth_stencil_state];
     [encoder setFragmentBuffer:constants_buffer offset:0 atIndex:0];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [encoder endEncoding];
@@ -1397,6 +1649,11 @@ bool QueuePipelineProbeContextClearRect(void* opaque_context, uint32_t width, ui
         !EnsureClearPipelineState(context, error_out)) {
       return false;
     }
+    id<MTLDepthStencilState> disabled_depth_stencil_state = nil;
+    if (!GetCachedProbeDepthStencilState(context, nullptr, disabled_depth_stencil_state,
+                                         error_out)) {
+      return false;
+    }
 
     if (!EnsureOpenPipelineProbeEncoder(context, error_out)) {
       return false;
@@ -1426,6 +1683,8 @@ bool QueuePipelineProbeContextClearRect(void* opaque_context, uint32_t width, ui
     [encoder setDepthClipMode:MTLDepthClipModeClip];
     [encoder setBlendColorRed:0.0 green:0.0 blue:0.0 alpha:0.0];
     [encoder setRenderPipelineState:context->clear_pipeline_state];
+    [encoder setDepthStencilState:disabled_depth_stencil_state];
+    [encoder setStencilFrontReferenceValue:0 backReferenceValue:0];
     [encoder setFragmentBuffer:constants.buffer offset:constants.offset atIndex:0];
     TrackOpenProbeBufferBinding(context, false, 0);
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
@@ -1437,7 +1696,7 @@ bool QueuePipelineProbeContextClearRect(void* opaque_context, uint32_t width, ui
       return false;
     }
     if (context->committed_command_buffers.size() >= kMaxCommittedProbeCommandBuffers) {
-      return WaitPendingPipelineProbeCommands(context, error_out, nullptr);
+      return WaitOldestPipelineProbeCommand(context, error_out);
     }
     return true;
   }
@@ -1460,7 +1719,8 @@ bool RenderPipelineProbeToContext(
     uint32_t vertex_data_buffer_index, const void* bool_loop_constants,
     size_t bool_loop_constants_size, uint32_t vertex_bool_loop_constants_buffer_index,
     uint32_t fragment_bool_loop_constants_buffer_index, const ProbeIndexBuffer* index_buffer,
-    const ProbeRasterizationState* rasterization_state) {
+    const ProbeRasterizationState* rasterization_state,
+    const ProbeDepthStencilState* depth_stencil_state) {
   @autoreleasepool {
     auto* context = static_cast<PipelineProbeContext*>(opaque_context);
     if (!context || !pipeline_state || !system_constants || !system_constants_size || !width ||
@@ -1482,12 +1742,25 @@ bool RenderPipelineProbeToContext(
       }
       return false;
     }
+    if (!IsProbeDepthStencilStateValid(depth_stencil_state)) {
+      if (error_out) {
+        *error_out = "invalid probe depth/stencil state";
+      }
+      return false;
+    }
     if (!EnsureProbeContextTexture(context, width, height, error_out) ||
         !EnsureDummyProbeResources(context, error_out)) {
       return false;
     }
 
     if (!EnsureOpenPipelineProbeEncoder(context, error_out)) {
+      return false;
+    }
+
+    id<MTLDepthStencilState> metal_depth_stencil_state = nil;
+    if (!GetCachedProbeDepthStencilState(context, depth_stencil_state, metal_depth_stencil_state,
+                                         error_out)) {
+      DiscardEmptyOpenPipelineProbeCommandBuffer(context);
       return false;
     }
 
@@ -1616,6 +1889,16 @@ bool RenderPipelineProbeToContext(
     }
     [encoder setViewport:viewport];
     [encoder setScissorRect:scissor];
+    [encoder setCullMode:ToMetalCullMode(rasterization_state ? rasterization_state->cull_mode
+                                                             : ProbeCullMode::kNone)];
+    [encoder setFrontFacingWinding:rasterization_state && rasterization_state->front_face_clockwise
+                                       ? MTLWindingClockwise
+                                       : MTLWindingCounterClockwise];
+    [encoder setDepthStencilState:metal_depth_stencil_state];
+    [encoder
+        setStencilFrontReferenceValue:depth_stencil_state ? depth_stencil_state->front.reference : 0
+                   backReferenceValue:depth_stencil_state ? depth_stencil_state->back.reference
+                                                          : 0];
     [encoder setBlendColorRed:blend_red green:blend_green blue:blend_blue alpha:blend_alpha];
     [encoder setVertexBuffer:system_buffer.buffer offset:system_buffer.offset atIndex:0];
     [encoder setFragmentBuffer:system_buffer.buffer offset:system_buffer.offset atIndex:0];
@@ -1708,8 +1991,11 @@ bool RenderPipelineProbeToContext(
     }
     bool committed_limit_reached =
         context->committed_command_buffers.size() >= kMaxCommittedProbeCommandBuffers;
-    if (raw_nocopy_buffer_bound || committed_limit_reached) {
+    if (raw_nocopy_buffer_bound) {
       return WaitPendingPipelineProbeCommands(context, error_out, nullptr);
+    }
+    if (committed_limit_reached) {
+      return WaitOldestPipelineProbeCommand(context, error_out);
     }
     return true;
   }
@@ -2021,7 +2307,8 @@ bool RenderPipelineProbe(
     const void* bool_loop_constants, size_t bool_loop_constants_size,
     uint32_t vertex_bool_loop_constants_buffer_index,
     uint32_t fragment_bool_loop_constants_buffer_index, const ProbeIndexBuffer* index_buffer,
-    const ProbeRasterizationState* rasterization_state) {
+    const ProbeRasterizationState* rasterization_state,
+    const ProbeDepthStencilState* depth_stencil_state) {
   if (!metal_device || !pipeline_state || !system_constants || !system_constants_size || !width ||
       !height || !vertex_count) {
     if (error_out) {
@@ -2038,6 +2325,12 @@ bool RenderPipelineProbe(
   if (!IsProbeRasterizationStateValid(rasterization_state, width, height)) {
     if (error_out) {
       *error_out = "invalid probe viewport or scissor";
+    }
+    return false;
+  }
+  if (!IsProbeDepthStencilStateValid(depth_stencil_state)) {
+    if (error_out) {
+      *error_out = "invalid probe depth/stencil state";
     }
     return false;
   }
@@ -2059,10 +2352,37 @@ bool RenderPipelineProbe(
   texture_descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
   texture_descriptor.storageMode = MTLStorageModeShared;
   id<MTLTexture> render_texture = [device newTextureWithDescriptor:texture_descriptor];
-  if (!render_texture) {
+  MTLTextureDescriptor* depth_stencil_descriptor =
+      [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
+                                                         width:width
+                                                        height:height
+                                                     mipmapped:NO];
+  depth_stencil_descriptor.usage = MTLTextureUsageRenderTarget;
+  depth_stencil_descriptor.storageMode = MTLStorageModePrivate;
+  id<MTLTexture> depth_stencil_texture = [device newTextureWithDescriptor:depth_stencil_descriptor];
+  if (!render_texture || !depth_stencil_texture) {
+    if (render_texture) {
+      [render_texture release];
+    }
+    if (depth_stencil_texture) {
+      [depth_stencil_texture release];
+    }
     [command_queue release];
     if (error_out) {
-      *error_out = "failed to create render texture";
+      *error_out = "failed to create color or depth/stencil render texture";
+    }
+    return false;
+  }
+
+  ProbeDepthStencilState disabled_depth_stencil_state;
+  id<MTLDepthStencilState> metal_depth_stencil_state = CreateProbeDepthStencilState(
+      device, depth_stencil_state ? *depth_stencil_state : disabled_depth_stencil_state);
+  if (!metal_depth_stencil_state) {
+    [depth_stencil_texture release];
+    [render_texture release];
+    [command_queue release];
+    if (error_out) {
+      *error_out = "failed to create probe depth/stencil state";
     }
     return false;
   }
@@ -2152,6 +2472,10 @@ bool RenderPipelineProbe(
       [shared_memory_buffer release];
     }
     [render_texture release];
+    [depth_stencil_texture release];
+    if (metal_depth_stencil_state) {
+      [metal_depth_stencil_state release];
+    }
     [command_queue release];
     if (error_out) {
       *error_out = index_buffer && !index_buffer_object
@@ -2219,9 +2543,19 @@ bool RenderPipelineProbe(
   pass.colorAttachments[0].loadAction = has_initial_bgra ? MTLLoadActionLoad : MTLLoadActionClear;
   pass.colorAttachments[0].storeAction = MTLStoreActionStore;
   pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+  ConfigureProbeDepthStencilPass(pass, depth_stencil_texture, MTLLoadActionClear);
 
   id<MTLRenderCommandEncoder> encoder = [command_buffer renderCommandEncoderWithDescriptor:pass];
   [encoder setRenderPipelineState:(id<MTLRenderPipelineState>)pipeline_state];
+  [encoder setCullMode:ToMetalCullMode(rasterization_state ? rasterization_state->cull_mode
+                                                           : ProbeCullMode::kNone)];
+  [encoder setFrontFacingWinding:rasterization_state && rasterization_state->front_face_clockwise
+                                     ? MTLWindingClockwise
+                                     : MTLWindingCounterClockwise];
+  [encoder setDepthStencilState:metal_depth_stencil_state];
+  [encoder
+      setStencilFrontReferenceValue:depth_stencil_state ? depth_stencil_state->front.reference : 0
+                 backReferenceValue:depth_stencil_state ? depth_stencil_state->back.reference : 0];
   if (rasterization_state) {
     MTLViewport viewport = {
         rasterization_state->viewport_x,     rasterization_state->viewport_y,
@@ -2345,6 +2679,10 @@ bool RenderPipelineProbe(
     [dummy_sampler release];
   }
   [render_texture release];
+  [depth_stencil_texture release];
+  if (metal_depth_stencil_state) {
+    [metal_depth_stencil_state release];
+  }
   [command_queue release];
   return succeeded;
 }

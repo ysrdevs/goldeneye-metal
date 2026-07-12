@@ -6,6 +6,7 @@
 #include <mutex>
 #include <vector>
 
+#include <rex/graphics/metal/profile.h>
 #include <rex/ui/presenter.h>
 
 namespace rex::ui::metal {
@@ -38,6 +39,8 @@ class MetalPresenter final : public Presenter {
   bool EnsureGuestPipeline();
   void FinalizeGuestFrameLocked();
   void DrawGuestFpsOverlayLocked();
+  void EndProfiledPresentAttempt(bool drawable_nil, uint64_t present_commit_ns = 0);
+  void ReportProfileWindowLocked();
 
   void* metal_device_ = nullptr;
   void* command_queue_ = nullptr;
@@ -55,6 +58,14 @@ class MetalPresenter final : public Presenter {
   uint64_t guest_fps_sample_start_tick_ = 0;
   uint32_t guest_fps_sample_frame_count_ = 0;
   double guest_fps_ = 0.0;
+  std::mutex profile_mutex_;
+  graphics::metal::profiling::PresenterProfileWindow profile_window_;
+  uint64_t profiled_present_attempt_count_ = 0;
+  uint64_t profile_last_source_hash_ = 0;
+  uint32_t profile_last_source_width_ = 0;
+  uint32_t profile_last_source_height_ = 0;
+  bool profile_last_source_valid_ = false;
+  bool profile_enabled_ = graphics::metal::profiling::IsEnabled();
 };
 
 }  // namespace rex::ui::metal

@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <mutex>
 
 #include "ge_init.h"          // PPCRegister/PPCContext + generated function decls
 #include <rex/cvar.h>         // REXCVAR_* (mouse-look settings)
@@ -106,10 +107,16 @@ bool EnvironmentFlagEnabled(const char* name) {
 }
 
 // rexglue CP swap counter sampled at the last guest present (sub_821996F8).
-// "GPU finished the just-submitted frame" == counter advanced past this.
+// This is diagnostic state only: XE_SWAP may execute before trailing primary-ring
+// packets retire, so a counter advance is not a completion fence.
 std::atomic<uint32_t> g_present_cpcnt{0};
 std::atomic<uint64_t> g_gpu_wait_blocked_polls{0};
 std::atomic<uint64_t> g_gpu_wait_completed_polls{0};
+std::atomic<uint64_t> g_gpu_wait_drain_grace_polls{0};
+std::atomic<uint64_t> g_gpu_wait_drain_grace_starts{0};
+std::atomic<uint64_t> g_gpu_wait_stable_drain_releases{0};
+std::atomic<uint64_t> g_gpu_wait_pending_progress_resets{0};
+std::atomic<uint64_t> g_gpu_wait_pending_stall_releases{0};
 inline rex::graphics::CommandProcessor* ge_cp() {
   auto* ks = rex::system::kernel_state();
   if (!ks)
@@ -134,6 +141,40 @@ inline rex::graphics::GraphicsSystem* ge_gs() {
     return nullptr;
   return static_cast<rex::graphics::GraphicsSystem*>(igs);
 }
+
+constexpr auto kGpuWatchdogStableDrainGrace = std::chrono::milliseconds(60);
+// Guest watchdog ticks are hardware-scale and can expire during ordinary host
+// scheduling or synchronous shader compilation. Keep them frozen while the CP
+// read pointer is moving, but never suppress a genuinely stuck pending ring
+// forever. Thirty seconds is intentionally conservative for cold Metal work.
+constexpr auto kGpuWatchdogPendingStallLimit = std::chrono::seconds(30);
+
+struct GpuWatchdogDrainGraceState {
+  uint32_t wait_context = 0;
+  uint32_t heartbeat_token = 0;
+  uint32_t pending_read_pointer = 0;
+  std::chrono::steady_clock::time_point drained_since{};
+  std::chrono::steady_clock::time_point pending_progress_at{};
+  bool observing_drain = false;
+  bool observing_pending = false;
+  bool drain_release_recorded = false;
+  bool pending_release_recorded = false;
+};
+
+constexpr bool ge_hold_gpu_watchdog_time(bool command_processor_available,
+                                         bool primary_ring_drained, bool stable_drain_grace_elapsed,
+                                         bool pending_stall_limit_elapsed) {
+  if (!command_processor_available) {
+    return false;
+  }
+  return primary_ring_drained ? !stable_drain_grace_elapsed : !pending_stall_limit_elapsed;
+}
+static_assert(ge_hold_gpu_watchdog_time(true, false, false, false));
+static_assert(ge_hold_gpu_watchdog_time(true, false, true, false));
+static_assert(!ge_hold_gpu_watchdog_time(true, false, false, true));
+static_assert(ge_hold_gpu_watchdog_time(true, true, false, false));
+static_assert(!ge_hold_gpu_watchdog_time(true, true, true, false));
+static_assert(!ge_hold_gpu_watchdog_time(false, false, false, false));
 }  // namespace
 
 namespace {
@@ -731,35 +772,91 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
   g_dbgnow_calls.fetch_add(1, std::memory_order_relaxed);
   ge_start_watchdog_once();
   auto* cpp = ge_cp();
-  uint32_t cpc = cpp ? cpp->swap_counter() : 0;
+  bool primary_ring_drained = cpp && cpp->primary_ring_drained();
+  uint32_t heartbeat_token = ws ? LD32(base, ws + 8u) : 0;
+  auto host_now = std::chrono::steady_clock::now();
+  thread_local GpuWatchdogDrainGraceState drain_grace;
+  bool stable_drain_grace_elapsed = false;
+  bool pending_stall_limit_elapsed = false;
 
-  // Let the title's GPU-completion poll expire only after the command
-  // processor has made authoritative progress. Two safe conditions:
-  //  (a) CP swap counter advanced past the value sampled at the matching
-  //      present -> the frame's swap executed; OR
-  //  (b) the CP read pointer caught up to the write pointer -> the CP consumed
-  //      every packet the game submitted (this frame's draws+resolve+swap), so
-  //      it is drawn. (b) eliminates the cpc-sampling race (CP finishing before
-  //      ge_diag_vdswap samples g_present_cpcnt) that intermittently left the
-  //      wait spinning forever -> the random menu freeze. The CP advances rptr
-  //      on its own worker thread and always catches up once the game stops
-  //      feeding the ring, so (b) cannot deadlock.
-  bool drawn = (cpc != g_present_cpcnt.load(std::memory_order_relaxed)) ||
-               (cpp && cpp->primary_ring_drained());
-  (drawn ? g_gpu_wait_completed_polls : g_gpu_wait_blocked_polls)
+  if (!cpp) {
+    drain_grace = {};
+  } else if (!primary_ring_drained) {
+    // Any pending sample breaks continuity. A later drained sample must earn a
+    // fresh grace period before the accumulated guest time is made visible.
+    uint32_t read_pointer = cpp->read_ptr_index();
+    bool pending_progressed = !drain_grace.observing_pending || drain_grace.wait_context != ws ||
+                              drain_grace.heartbeat_token != heartbeat_token ||
+                              drain_grace.pending_read_pointer != read_pointer;
+    drain_grace.wait_context = ws;
+    drain_grace.heartbeat_token = heartbeat_token;
+    drain_grace.observing_drain = false;
+    drain_grace.drain_release_recorded = false;
+    if (pending_progressed) {
+      drain_grace.pending_read_pointer = read_pointer;
+      drain_grace.pending_progress_at = host_now;
+      drain_grace.observing_pending = true;
+      drain_grace.pending_release_recorded = false;
+      g_gpu_wait_pending_progress_resets.fetch_add(1, std::memory_order_relaxed);
+    }
+    pending_stall_limit_elapsed =
+        drain_grace.observing_pending &&
+        host_now - drain_grace.pending_progress_at >= kGpuWatchdogPendingStallLimit;
+    if (pending_stall_limit_elapsed && !drain_grace.pending_release_recorded) {
+      drain_grace.pending_release_recorded = true;
+      g_gpu_wait_pending_stall_releases.fetch_add(1, std::memory_order_relaxed);
+    }
+  } else {
+    drain_grace.observing_pending = false;
+    drain_grace.pending_release_recorded = false;
+    bool wait_changed =
+        drain_grace.wait_context != ws || drain_grace.heartbeat_token != heartbeat_token;
+    if (wait_changed || !drain_grace.observing_drain) {
+      drain_grace.wait_context = ws;
+      drain_grace.heartbeat_token = heartbeat_token;
+      drain_grace.drained_since = host_now;
+      drain_grace.observing_drain = true;
+      drain_grace.drain_release_recorded = false;
+      g_gpu_wait_drain_grace_starts.fetch_add(1, std::memory_order_relaxed);
+    }
+    stable_drain_grace_elapsed =
+        host_now - drain_grace.drained_since >= kGpuWatchdogStableDrainGrace;
+    if (!stable_drain_grace_elapsed) {
+      g_gpu_wait_drain_grace_polls.fetch_add(1, std::memory_order_relaxed);
+    } else if (!drain_grace.drain_release_recorded) {
+      drain_grace.drain_release_recorded = true;
+      g_gpu_wait_stable_drain_releases.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  bool hold_watchdog_time =
+      ge_hold_gpu_watchdog_time(cpp != nullptr, primary_ring_drained, stable_drain_grace_elapsed,
+                                pending_stall_limit_elapsed);
+  (hold_watchdog_time ? g_gpu_wait_blocked_polls : g_gpu_wait_completed_polls)
       .fetch_add(1, std::memory_order_relaxed);
 
-  // Never acknowledge a frame on a wall-clock deadline. The Metal producer
-  // path may legitimately take longer than the title's short polling timeout,
-  // especially while compiling a new pipeline. A premature acknowledgement
-  // publishes a stale ring read pointer and lets the title overrun or drop the
-  // next submission. Also, device+10941 is title-owned synchronization state;
-  // host recovery must not set or clear its skip bits.
+  // Never let a swap-counter advance release this watchdog. XE_SWAP may be
+  // followed by the writeback/fence packets that the surrounding guest wait is
+  // polling; in that interval the swap counter has advanced while RPTR still
+  // trails WPTR. Exposing the real clock there makes sub_82198C28 hit its
+  // hardware-scale 5000-tick timeout and run the guest D3D "GPU is hung" dump
+  // even though the command processor is actively retiring the remaining
+  // packets.
   //
-  // Keep sub_82198C28's elapsed-time check below its timeout while the CP still
-  // owns work. Once either authoritative completion condition is true, restore
-  // the real timebase value and let the original routine retire its own fence.
-  if (!drawn) {
+  // A drained snapshot alone is not sufficient: the producer can append the
+  // next submission immediately after that snapshot. Releasing a large frozen
+  // time delta on that single poll recreates the false timeout before the CP
+  // can retire the new tail. Require the same wait context and saved heartbeat
+  // token to observe a continuously drained ring for a short host-scale grace.
+  // Any pending sample or new heartbeat token restarts the grace.
+  //
+  // After 60 ms of stable drain, restore the real timebase. A pending ring is
+  // held only while its read pointer continues to make progress; 30 seconds
+  // without progress restores the title's genuine hang detection. If the
+  // command processor is unavailable, preserve the original watchdog behavior
+  // as well. The title remains the sole owner of its fence, presented counter,
+  // and skip bits.
+  if (hold_watchdog_time) {
     if (ws) {
       r30.u32 = LD32(base, ws + 12u);
     }
@@ -826,17 +923,32 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
     static uint64_t previous_completed_polls = 0;
     uint64_t blocked_polls = g_gpu_wait_blocked_polls.load(std::memory_order_relaxed);
     uint64_t completed_polls = g_gpu_wait_completed_polls.load(std::memory_order_relaxed);
+    uint64_t drain_grace_polls = g_gpu_wait_drain_grace_polls.load(std::memory_order_relaxed);
+    uint64_t drain_grace_starts = g_gpu_wait_drain_grace_starts.load(std::memory_order_relaxed);
+    uint64_t stable_drain_releases =
+        g_gpu_wait_stable_drain_releases.load(std::memory_order_relaxed);
+    uint64_t pending_progress_resets =
+        g_gpu_wait_pending_progress_resets.load(std::memory_order_relaxed);
+    uint64_t pending_stall_releases =
+        g_gpu_wait_pending_stall_releases.load(std::memory_order_relaxed);
     uint32_t read_pointer = cpp ? cpp->read_ptr_index() : 0;
     uint32_t write_pointer = cpp ? cpp->write_ptr_index() : 0;
     std::fprintf(stderr,
                  "[ge] VdSwap hook present#%u dev=0x%08x cpcnt=%u ring=%u/%u drained=%u "
-                 "gpu_wait_polls(blocked=%llu/+%llu complete=%llu/+%llu)\n",
+                 "gpu_wait_polls(blocked=%llu/+%llu complete=%llu/+%llu "
+                 "drain_grace=%llu starts=%llu stable_releases=%llu "
+                 "pending_progress=%llu stall_releases=%llu)\n",
                  present_index, a1, cpc, read_pointer, write_pointer,
                  cpp && cpp->primary_ring_drained() ? 1u : 0u,
                  static_cast<unsigned long long>(blocked_polls),
                  static_cast<unsigned long long>(blocked_polls - previous_blocked_polls),
                  static_cast<unsigned long long>(completed_polls),
-                 static_cast<unsigned long long>(completed_polls - previous_completed_polls));
+                 static_cast<unsigned long long>(completed_polls - previous_completed_polls),
+                 static_cast<unsigned long long>(drain_grace_polls),
+                 static_cast<unsigned long long>(drain_grace_starts),
+                 static_cast<unsigned long long>(stable_drain_releases),
+                 static_cast<unsigned long long>(pending_progress_resets),
+                 static_cast<unsigned long long>(pending_stall_releases));
     previous_blocked_polls = blocked_polls;
     previous_completed_polls = completed_polls;
     if (a1) {
@@ -1569,6 +1681,157 @@ bool ge_auto_start_pressed(const char* mode, uint32_t input_poll) {
   return ((elapsed_ms - 2000) % 6000) < 250;
 }
 
+// Input-only mission-navigation diagnostic. This deliberately does not inspect
+// or modify title menu/mission state: GOLDENEYE_AUTO_START=menu gets the title
+// to its dossier normally, then GOLDENEYE_AUTO_MISSION=dam contributes five
+// ordinary BTN_A edges for the default path Select Mission -> Dam -> Agent ->
+// open the briefing, then contributes a normal left-stick-up cursor move before
+// the final A activates Start. Both environment variables are opt-in; neither
+// changes normal/native input.
+//
+// The state machine starts each interval from the poll that actually delivered
+// the previous edge. Consequently, even if the guest stalls across a deadline,
+// every press is followed by at least one release poll before the next press.
+enum class AutoMissionDamPhase : uint8_t {
+  kWaitForDossier,
+  kPress,
+  kRelease,
+  kStickUp,
+  kStickReleased,
+  kDone,
+};
+
+struct AutoMissionDamInput {
+  bool press_a = false;
+  bool stick_up = false;
+};
+
+struct AutoMissionDamState {
+  std::mutex mutex;
+  std::chrono::steady_clock::time_point started_at = std::chrono::steady_clock::now();
+  std::chrono::steady_clock::time_point phase_started_at = started_at;
+  AutoMissionDamPhase phase = AutoMissionDamPhase::kWaitForDossier;
+  uint32_t pulse_index = 0;
+  bool armed_logged = false;
+};
+
+AutoMissionDamInput ge_auto_mission_dam_input(const char* mode) {
+  if (!mode || std::strcmp(mode, "dam") != 0) {
+    return {};
+  }
+
+  constexpr auto kDossierSettleDelay = std::chrono::seconds(22);
+  constexpr auto kPressDuration = std::chrono::milliseconds(200);
+  constexpr auto kReleaseDuration = std::chrono::milliseconds(2500);
+  // At full deflection, 450 ms moves the 1280x720 dossier cursor roughly the
+  // 170 logical pixels (about 275 window pixels) from NEXT to START. Observe a
+  // neutral poll, then leave 750 ms for the hover/focus state to settle.
+  constexpr auto kStickUpDuration = std::chrono::milliseconds(450);
+  constexpr auto kStickReleaseSettle = std::chrono::milliseconds(750);
+  constexpr uint32_t kPulseCount = 5;
+  constexpr const char* kPulseTargets[] = {"Select Mission", "Dam", "Agent", "Open briefing",
+                                           "Start mission"};
+  static_assert(std::size(kPulseTargets) == kPulseCount);
+
+  static AutoMissionDamState state;
+  std::lock_guard<std::mutex> lock(state.mutex);
+  auto now = std::chrono::steady_clock::now();
+
+  // Edge-only logging is inherently rate-limited: one arm line, one line per
+  // press/release, and one completion line for the process lifetime.
+  if (!state.armed_logged) {
+    state.armed_logged = true;
+    std::fprintf(stderr,
+                 "[ge] GOLDENEYE_AUTO_MISSION=dam armed: input-only; waiting 22s for dossier; "
+                 "five BTN_A pulses with cursor-up before final A\n");
+    std::fflush(stderr);
+  }
+
+  switch (state.phase) {
+    case AutoMissionDamPhase::kWaitForDossier:
+      if (now - state.started_at < kDossierSettleDelay) {
+        return {};
+      }
+      state.pulse_index = 0;
+      state.phase = AutoMissionDamPhase::kPress;
+      state.phase_started_at = now;
+      std::fprintf(stderr, "[ge] GOLDENEYE_AUTO_MISSION=dam BTN_A press %u/%u target=\"%s\"\n",
+                   state.pulse_index + 1, kPulseCount, kPulseTargets[state.pulse_index]);
+      std::fflush(stderr);
+      return {.press_a = true};
+
+    case AutoMissionDamPhase::kPress:
+      if (now - state.phase_started_at < kPressDuration) {
+        return {.press_a = true};
+      }
+      // Do not clear BTN_A here: returning false merely stops contributing our
+      // bit, preserving a real controller or native keyboard A that is held.
+      state.phase = AutoMissionDamPhase::kRelease;
+      state.phase_started_at = now;
+      std::fprintf(stderr, "[ge] GOLDENEYE_AUTO_MISSION=dam BTN_A release %u/%u target=\"%s\"\n",
+                   state.pulse_index + 1, kPulseCount, kPulseTargets[state.pulse_index]);
+      if (state.pulse_index + 1 == std::size(kPulseTargets)) {
+        state.phase = AutoMissionDamPhase::kDone;
+        std::fprintf(stderr,
+                     "[ge] GOLDENEYE_AUTO_MISSION=dam complete: %u/%u pulses released; "
+                     "injector permanently idle\n",
+                     kPulseCount, kPulseCount);
+      }
+      std::fflush(stderr);
+      return {};
+
+    case AutoMissionDamPhase::kRelease:
+      if (now - state.phase_started_at < kReleaseDuration) {
+        return {};
+      }
+      if (state.pulse_index == 3) {
+        state.phase = AutoMissionDamPhase::kStickUp;
+        state.phase_started_at = now;
+        std::fprintf(stderr,
+                     "[ge] GOLDENEYE_AUTO_MISSION=dam left-stick UP press before final A "
+                     "ly=32767 duration_ms=450\n");
+        std::fflush(stderr);
+        return {.stick_up = true};
+      }
+      ++state.pulse_index;
+      state.phase = AutoMissionDamPhase::kPress;
+      state.phase_started_at = now;
+      std::fprintf(stderr, "[ge] GOLDENEYE_AUTO_MISSION=dam BTN_A press %u/%u target=\"%s\"\n",
+                   state.pulse_index + 1, kPulseCount, kPulseTargets[state.pulse_index]);
+      std::fflush(stderr);
+      return {.press_a = true};
+
+    case AutoMissionDamPhase::kStickUp:
+      if (now - state.phase_started_at < kStickUpDuration) {
+        return {.stick_up = true};
+      }
+      // As with BTN_A, release means stop contributing the synthetic axis. The
+      // freshly polled native value remains untouched on this and later polls.
+      state.phase = AutoMissionDamPhase::kStickReleased;
+      state.phase_started_at = now;
+      std::fprintf(stderr,
+                   "[ge] GOLDENEYE_AUTO_MISSION=dam left-stick UP release before final A\n");
+      std::fflush(stderr);
+      return {};
+
+    case AutoMissionDamPhase::kStickReleased:
+      if (now - state.phase_started_at < kStickReleaseSettle) {
+        return {};
+      }
+      state.pulse_index = 4;
+      state.phase = AutoMissionDamPhase::kPress;
+      state.phase_started_at = now;
+      std::fprintf(stderr, "[ge] GOLDENEYE_AUTO_MISSION=dam BTN_A press %u/%u target=\"%s\"\n",
+                   state.pulse_index + 1, kPulseCount, kPulseTargets[state.pulse_index]);
+      std::fflush(stderr);
+      return {.press_a = true};
+
+    case AutoMissionDamPhase::kDone:
+      return {};
+  }
+  return {};
+}
+
 bool ge_input_active() {  // keyboard counts only when focused + not in the menu
   return !g_mouselook_suppressed.load(std::memory_order_relaxed) && ge_game_has_focus();
 }
@@ -1693,6 +1956,23 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
         std::fprintf(stderr, "[ge] GOLDENEYE_AUTO_START=%s injecting Start\n", auto_start_mode);
         std::fflush(stderr);
       }
+    }
+  }
+
+  const char* auto_mission_mode = std::getenv("GOLDENEYE_AUTO_MISSION");
+  AutoMissionDamInput auto_mission = ge_auto_mission_dam_input(auto_mission_mode);
+  if (auto_mission.press_a) {
+    ST16(base, GE_PAD0 + 0, LD16(base, GE_PAD0 + 0) | BTN_A);
+  }
+  if (auto_mission.stick_up) {
+    // Merge in the requested positive direction instead of clearing/replacing
+    // the whole gamepad. A stronger positive native value wins (32767 is the
+    // diagnostic maximum), and release performs no write at all.
+    constexpr int16_t kAutoMissionStickUp = 32767;
+    int16_t native_ly = static_cast<int16_t>(LD16(base, GE_PAD0 + 6));
+    int16_t merged_ly = std::max(native_ly, kAutoMissionStickUp);
+    if (merged_ly != native_ly) {
+      ST16(base, GE_PAD0 + 6, static_cast<uint16_t>(merged_ly));
     }
   }
 

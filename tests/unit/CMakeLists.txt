@@ -4,6 +4,7 @@ add_executable(unit_tests
     memory/heap_allocation_test.cpp
     memory/physical_host_offset_test.cpp
     graphics/command_ring_state_test.cpp
+    graphics/metal_profile_test.cpp
     kernel/object_table_test.cpp
     core/cvar_test.cpp
     core/fiber_test.cpp
@@ -20,7 +21,15 @@ add_executable(unit_tests
     codegen/manifest_test.cpp
     rexglue/migration_scan_test.cpp
     rexglue/ui_test.cpp
+    ui/mouse_event_test.cpp
 )
+
+if(APPLE)
+    target_sources(unit_tests PRIVATE
+        ui/macos_input_util_test.cpp
+        ui/macos_key_translation_test.cpp
+    )
+endif()
 
 target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/rexglue/commands/migration_scan.cpp

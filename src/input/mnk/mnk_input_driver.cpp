@@ -365,8 +365,13 @@ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
   std::lock_guard lock(state_mutex_);
   int32_t x = e.x();
   int32_t y = e.y();
-  mouse_dx_ += x - prev_mouse_x_;
-  mouse_dy_ += y - prev_mouse_y_;
+  if (e.has_movement_delta()) {
+    mouse_dx_ += e.movement_x();
+    mouse_dy_ += e.movement_y();
+  } else {
+    mouse_dx_ += x - prev_mouse_x_;
+    mouse_dy_ += y - prev_mouse_y_;
+  }
   prev_mouse_x_ = x;
   prev_mouse_y_ = y;
 }

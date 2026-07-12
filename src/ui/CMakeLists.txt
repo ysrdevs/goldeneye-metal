@@ -156,6 +156,7 @@ if(WIN32)
 elseif(APPLE)
     target_link_libraries(rexui PUBLIC
         "-framework Cocoa"
+        "-framework CoreGraphics"
         "-framework Metal"
         "-framework QuartzCore"
     )

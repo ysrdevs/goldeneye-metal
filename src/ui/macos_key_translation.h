@@ -1,0 +1,251 @@
+#pragma once
+
+#include <cstdint>
+
+#include <rex/ui/virtual_key.h>
+
+namespace rex::ui::macos {
+
+// NSEvent key codes identify physical keys and are stable across keyboard
+// layouts. Translate them to the virtual keys used by the common UI and input
+// paths so controller key bindings retain their physical-key behavior.
+constexpr VirtualKey TranslateKeyCode(uint16_t key_code) {
+  switch (key_code) {
+    // Alphanumeric section.
+    case 0x00:
+      return VirtualKey::kA;
+    case 0x01:
+      return VirtualKey::kS;
+    case 0x02:
+      return VirtualKey::kD;
+    case 0x03:
+      return VirtualKey::kF;
+    case 0x04:
+      return VirtualKey::kH;
+    case 0x05:
+      return VirtualKey::kG;
+    case 0x06:
+      return VirtualKey::kZ;
+    case 0x07:
+      return VirtualKey::kX;
+    case 0x08:
+      return VirtualKey::kC;
+    case 0x09:
+      return VirtualKey::kV;
+    case 0x0A:
+      return VirtualKey::kOem102;
+    case 0x0B:
+      return VirtualKey::kB;
+    case 0x0C:
+      return VirtualKey::kQ;
+    case 0x0D:
+      return VirtualKey::kW;
+    case 0x0E:
+      return VirtualKey::kE;
+    case 0x0F:
+      return VirtualKey::kR;
+    case 0x10:
+      return VirtualKey::kY;
+    case 0x11:
+      return VirtualKey::kT;
+    case 0x12:
+      return VirtualKey::k1;
+    case 0x13:
+      return VirtualKey::k2;
+    case 0x14:
+      return VirtualKey::k3;
+    case 0x15:
+      return VirtualKey::k4;
+    case 0x16:
+      return VirtualKey::k6;
+    case 0x17:
+      return VirtualKey::k5;
+    case 0x18:
+      return VirtualKey::kOemPlus;
+    case 0x19:
+      return VirtualKey::k9;
+    case 0x1A:
+      return VirtualKey::k7;
+    case 0x1B:
+      return VirtualKey::kOemMinus;
+    case 0x1C:
+      return VirtualKey::k8;
+    case 0x1D:
+      return VirtualKey::k0;
+    case 0x1E:
+      return VirtualKey::kOem6;
+    case 0x1F:
+      return VirtualKey::kO;
+    case 0x20:
+      return VirtualKey::kU;
+    case 0x21:
+      return VirtualKey::kOem4;
+    case 0x22:
+      return VirtualKey::kI;
+    case 0x23:
+      return VirtualKey::kP;
+    case 0x25:
+      return VirtualKey::kL;
+    case 0x26:
+      return VirtualKey::kJ;
+    case 0x27:
+      return VirtualKey::kOem7;
+    case 0x28:
+      return VirtualKey::kK;
+    case 0x29:
+      return VirtualKey::kOem1;
+    case 0x2A:
+      return VirtualKey::kOem5;
+    case 0x2B:
+      return VirtualKey::kOemComma;
+    case 0x2C:
+      return VirtualKey::kOem2;
+    case 0x2D:
+      return VirtualKey::kN;
+    case 0x2E:
+      return VirtualKey::kM;
+    case 0x2F:
+      return VirtualKey::kOemPeriod;
+    case 0x32:
+      return VirtualKey::kOem3;
+
+    // Editing, navigation and modifiers.
+    case 0x24:
+      return VirtualKey::kReturn;
+    case 0x30:
+      return VirtualKey::kTab;
+    case 0x31:
+      return VirtualKey::kSpace;
+    case 0x33:
+      return VirtualKey::kBack;
+    case 0x35:
+      return VirtualKey::kEscape;
+    case 0x36:
+      return VirtualKey::kRWin;
+    case 0x37:
+      return VirtualKey::kLWin;
+    case 0x38:
+    case 0x3C:
+      return VirtualKey::kShift;
+    case 0x39:
+      return VirtualKey::kCapital;
+    case 0x3A:
+    case 0x3D:
+      return VirtualKey::kMenu;
+    case 0x3B:
+    case 0x3E:
+      return VirtualKey::kControl;
+    case 0x72:
+      return VirtualKey::kInsert;
+    case 0x73:
+      return VirtualKey::kHome;
+    case 0x74:
+      return VirtualKey::kPrior;
+    case 0x75:
+      return VirtualKey::kDelete;
+    case 0x77:
+      return VirtualKey::kEnd;
+    case 0x79:
+      return VirtualKey::kNext;
+    case 0x7B:
+      return VirtualKey::kLeft;
+    case 0x7C:
+      return VirtualKey::kRight;
+    case 0x7D:
+      return VirtualKey::kDown;
+    case 0x7E:
+      return VirtualKey::kUp;
+
+    // Numeric keypad and media keys.
+    case 0x41:
+      return VirtualKey::kDecimal;
+    case 0x43:
+      return VirtualKey::kMultiply;
+    case 0x45:
+      return VirtualKey::kAdd;
+    case 0x47:
+      return VirtualKey::kNumLock;
+    case 0x48:
+      return VirtualKey::kVolumeUp;
+    case 0x49:
+      return VirtualKey::kVolumeDown;
+    case 0x4A:
+      return VirtualKey::kVolumeMute;
+    case 0x4B:
+      return VirtualKey::kDivide;
+    case 0x4C:
+      return VirtualKey::kReturn;
+    case 0x4E:
+      return VirtualKey::kSubtract;
+    case 0x51:
+      return VirtualKey::kOemNecEqual;
+    case 0x52:
+      return VirtualKey::kNumpad0;
+    case 0x53:
+      return VirtualKey::kNumpad1;
+    case 0x54:
+      return VirtualKey::kNumpad2;
+    case 0x55:
+      return VirtualKey::kNumpad3;
+    case 0x56:
+      return VirtualKey::kNumpad4;
+    case 0x57:
+      return VirtualKey::kNumpad5;
+    case 0x58:
+      return VirtualKey::kNumpad6;
+    case 0x59:
+      return VirtualKey::kNumpad7;
+    case 0x5B:
+      return VirtualKey::kNumpad8;
+    case 0x5C:
+      return VirtualKey::kNumpad9;
+    case 0x5F:
+      return VirtualKey::kSeparator;
+
+    // Function keys use a non-contiguous NSEvent key-code layout.
+    case 0x40:
+      return VirtualKey::kF17;
+    case 0x4F:
+      return VirtualKey::kF18;
+    case 0x50:
+      return VirtualKey::kF19;
+    case 0x5A:
+      return VirtualKey::kF20;
+    case 0x60:
+      return VirtualKey::kF5;
+    case 0x61:
+      return VirtualKey::kF6;
+    case 0x62:
+      return VirtualKey::kF7;
+    case 0x63:
+      return VirtualKey::kF3;
+    case 0x64:
+      return VirtualKey::kF8;
+    case 0x65:
+      return VirtualKey::kF9;
+    case 0x67:
+      return VirtualKey::kF11;
+    case 0x69:
+      return VirtualKey::kF13;
+    case 0x6A:
+      return VirtualKey::kF16;
+    case 0x6B:
+      return VirtualKey::kF14;
+    case 0x6D:
+      return VirtualKey::kF10;
+    case 0x6F:
+      return VirtualKey::kF12;
+    case 0x71:
+      return VirtualKey::kF15;
+    case 0x76:
+      return VirtualKey::kF4;
+    case 0x78:
+      return VirtualKey::kF2;
+    case 0x7A:
+      return VirtualKey::kF1;
+    default:
+      return VirtualKey::kNone;
+  }
+}
+
+}  // namespace rex::ui::macos

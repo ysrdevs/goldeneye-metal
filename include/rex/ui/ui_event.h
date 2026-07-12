@@ -121,6 +121,14 @@ class MouseEvent : public UIEvent {
     kX2,
   };
 
+  struct MovementDelta {
+    // Relative motion in the same top-left-origin coordinate orientation as
+    // x() and y(). This is available on platforms that support unbounded
+    // pointer capture even when the absolute cursor position is stationary.
+    int32_t x;
+    int32_t y;
+  };
+
  public:
   // Matching Windows WHEEL_DELTA.
   static constexpr uint32_t kScrollPerDetent = 120;
@@ -128,6 +136,16 @@ class MouseEvent : public UIEvent {
   explicit MouseEvent(Window* target, Button button, int32_t x, int32_t y, int32_t scroll_x = 0,
                       int32_t scroll_y = 0)
       : UIEvent(target), button_(button), x_(x), y_(y), scroll_x_(scroll_x), scroll_y_(scroll_y) {}
+  MouseEvent(Window* target, Button button, int32_t x, int32_t y, int32_t scroll_x,
+             int32_t scroll_y, MovementDelta movement_delta)
+      : UIEvent(target),
+        button_(button),
+        x_(x),
+        y_(y),
+        scroll_x_(scroll_x),
+        scroll_y_(scroll_y),
+        has_movement_delta_(true),
+        movement_delta_(movement_delta) {}
   ~MouseEvent() override = default;
 
   bool is_handled() const { return handled_; }
@@ -138,6 +156,9 @@ class MouseEvent : public UIEvent {
   int32_t y() const { return y_; }
   int32_t scroll_x() const { return scroll_x_; }
   int32_t scroll_y() const { return scroll_y_; }
+  bool has_movement_delta() const { return has_movement_delta_; }
+  int32_t movement_x() const { return movement_delta_.x; }
+  int32_t movement_y() const { return movement_delta_.y; }
 
  private:
   bool handled_ = false;
@@ -147,6 +168,8 @@ class MouseEvent : public UIEvent {
   int32_t scroll_x_ = 0;
   // Positive is up (away from the user), negative is down (towards the user).
   int32_t scroll_y_ = 0;
+  bool has_movement_delta_ = false;
+  MovementDelta movement_delta_ = {};
 };
 
 class TouchEvent : public UIEvent {

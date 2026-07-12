@@ -35,6 +35,12 @@ struct ProbeIndexBuffer {
   uint8_t index_size = 0;
 };
 
+enum class ProbeCullMode : uint8_t {
+  kNone,
+  kFront,
+  kBack,
+};
+
 struct ProbeRasterizationState {
   double viewport_x = 0.0;
   double viewport_y = 0.0;
@@ -50,6 +56,29 @@ struct ProbeRasterizationState {
   double blend_green = 0.0;
   double blend_blue = 0.0;
   double blend_alpha = 0.0;
+  ProbeCullMode cull_mode = ProbeCullMode::kNone;
+  bool front_face_clockwise = false;
+};
+
+struct ProbeStencilFaceState {
+  // xenos::CompareFunction and xenos::StencilOp values map directly to the
+  // corresponding Metal enum values (0 through 7).
+  uint8_t compare_function = 7;
+  uint8_t stencil_failure_operation = 0;
+  uint8_t depth_failure_operation = 0;
+  uint8_t depth_stencil_pass_operation = 0;
+  uint8_t read_mask = 0xFF;
+  uint8_t write_mask = 0xFF;
+  uint8_t reference = 0;
+};
+
+struct ProbeDepthStencilState {
+  bool depth_test_enabled = false;
+  bool depth_write_enabled = false;
+  uint8_t depth_compare_function = 7;
+  bool stencil_test_enabled = false;
+  ProbeStencilFaceState front;
+  ProbeStencilFaceState back;
 };
 
 struct ProbeColorTargetState {
@@ -90,9 +119,17 @@ void* CreateRenderPipelineState(void* metal_device, void* vertex_library, void* 
                                 const ProbeColorTargetState* color_target_state = nullptr);
 void ReleaseRenderPipelineState(void* pipeline_state);
 void* CreatePipelineProbeContext(void* metal_device, std::string* error_out);
+void* CreatePipelineProbeContext(void* metal_device, void* metal_command_queue,
+                                 std::string* error_out);
 void* CreateHostRenderTargetContext(void* metal_device, std::string* error_out);
+void* CreateHostRenderTargetContext(void* metal_device, void* metal_command_queue,
+                                    std::string* error_out);
 void ResetPipelineProbeContext(void* context);
 void ReleasePipelineProbeContext(void* context);
+// Ends and commits the context's currently open draw command buffer without
+// waiting for GPU completion. Used to place an ordered shared-memory upload
+// after every draw encoded before the upload request.
+bool FinalizePipelineProbeContext(void* context, std::string* error_out);
 // Waits for all render submissions currently owned by a persistent context.
 // Normal Metal command buffers retain their encoded resources, so callers may
 // release externally supplied Metal objects after submission. Callers must not
@@ -139,7 +176,8 @@ bool RenderPipelineProbeToContext(
     uint32_t vertex_bool_loop_constants_buffer_index = UINT32_MAX,
     uint32_t fragment_bool_loop_constants_buffer_index = UINT32_MAX,
     const ProbeIndexBuffer* index_buffer = nullptr,
-    const ProbeRasterizationState* rasterization_state = nullptr);
+    const ProbeRasterizationState* rasterization_state = nullptr,
+    const ProbeDepthStencilState* depth_stencil_state = nullptr);
 bool ReadPipelineProbeContext(void* context, uint32_t width, uint32_t height,
                               std::vector<uint8_t>& bgra_out, std::string* error_out);
 // Reads a tightly packed BGRA rectangle. Like the full read, this is a fence:
@@ -184,6 +222,7 @@ bool RenderPipelineProbe(
     uint32_t vertex_bool_loop_constants_buffer_index = UINT32_MAX,
     uint32_t fragment_bool_loop_constants_buffer_index = UINT32_MAX,
     const ProbeIndexBuffer* index_buffer = nullptr,
-    const ProbeRasterizationState* rasterization_state = nullptr);
+    const ProbeRasterizationState* rasterization_state = nullptr,
+    const ProbeDepthStencilState* depth_stencil_state = nullptr);
 
 }  // namespace rex::graphics::metal

@@ -196,6 +196,8 @@ class CommandProcessor {
   virtual void MakeCoherent();
   virtual void PrepareForWait();
   virtual void ReturnFromWait();
+  virtual void OnWaitRegMemComplete(bool, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                                    uint32_t, uint64_t, uint64_t, bool, bool) {}
 
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index,
                                 uint32_t primary_buffer_ptr, uint32_t primary_buffer_size);

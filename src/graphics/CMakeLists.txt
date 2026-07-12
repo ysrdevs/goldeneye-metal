@@ -265,4 +265,21 @@ if(REXGLUE_USE_METAL)
     if(REXGLUE_BUILD_TESTS)
         add_test(NAME metal_pipeline_probe_test COMMAND metal_pipeline_probe_test)
     endif()
+
+    # Pure checked-span regression gate for direct probe texture decoding. In
+    # particular, covers Dam's near-end 8192x8191 broken-bloom descriptor.
+    add_executable(metal_texture_decode_validation_test
+        metal/texture_decode_validation_test.cpp
+    )
+    target_include_directories(metal_texture_decode_validation_test PRIVATE
+        ${REXGLUE_ROOT}/include
+    )
+    set_target_properties(metal_texture_decode_validation_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
+        CXX_STANDARD 23
+        CXX_STANDARD_REQUIRED ON
+    )
+    if(REXGLUE_BUILD_TESTS)
+        add_test(NAME metal_texture_decode_validation_test COMMAND metal_texture_decode_validation_test)
+    endif()
 endif()

@@ -12,6 +12,8 @@
 #include <rex/graphics/format/ucode.h>
 #include <rex/graphics/metal/draw_renderer.h>
 #include <rex/graphics/metal/graphics_system.h>
+#include <rex/graphics/metal/msl_compiler.h>
+#include <rex/graphics/metal/profile.h>
 #include <rex/graphics/metal/shader.h>
 #include <rex/graphics/metal/shared_memory.h>
 #include <rex/graphics/metal/texture_cache.h>
@@ -37,6 +39,10 @@ class MetalCommandProcessor final : public CommandProcessor {
   void ShutdownContext() override;
   void WriteRegister(uint32_t index, uint32_t value) override;
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
+  void OnWaitRegMemComplete(bool is_memory, uint32_t poll_address, uint32_t reference,
+                            uint32_t mask, uint32_t operation, uint32_t wait, uint32_t last_value,
+                            uint64_t poll_count, uint64_t duration_ns, bool matched,
+                            bool timed_out) override;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
@@ -70,6 +76,8 @@ class MetalCommandProcessor final : public CommandProcessor {
   void UpdateMinimalSystemConstants(xenos::PrimitiveType prim_type,
                                     const IndexBufferInfo* index_buffer_info);
   void UpdateGuestConstantBuffers();
+  void TrackPositionRegisterWrite(uint32_t index);
+  void BeginPositionRegisterSnapshot();
   bool EnsureVertexFetchRangesResident(const MetalShader& vertex_shader);
   void TryRenderPipelineProbe(
       MetalShader& vertex_shader, MetalShader& pixel_shader, void* pipeline_state,
@@ -80,6 +88,11 @@ class MetalCommandProcessor final : public CommandProcessor {
   // excluded context may be followed by a same-queue operation that provides
   // the required ordering and completion fence itself.
   bool WaitForPipelineProbeSubmissions(const char* reason, void* ordered_context = nullptr);
+  // Commits all currently open persistent render command buffers without a CPU
+  // wait. The shared-memory upload subsequently committed on the common Metal
+  // queue is therefore ordered after prior draws and before later draws.
+  bool FinalizePipelineProbeSubmissions();
+  void ReportProfileWindow();
   void* GetActiveHostRenderTargetContext() const {
     return host_render_target_context_override_ ? host_render_target_context_override_
                                                 : host_render_target_context_;
@@ -153,6 +166,9 @@ class MetalCommandProcessor final : public CommandProcessor {
                                        uint32_t source_height, uint32_t source_x, uint32_t source_y,
                                        uint32_t dest_x, uint32_t dest_y, uint32_t write_width,
                                        uint32_t write_height, xenos::Endian128 dest_endian);
+  static void ExactResolvedSurfaceWatchCallback(
+      const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
+      uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu);
   void InvalidateExactResolvedSurfaceCache(uint32_t base_physical, uint32_t length);
   bool DecodeTextureFetchToRgba(const xenos::xe_gpu_texture_fetch_t& fetch,
                                 uint32_t fallback_base_physical,
@@ -203,10 +219,28 @@ class MetalCommandProcessor final : public CommandProcessor {
   std::unordered_set<uint64_t> disabled_host_pixel_shader_hashes_;
   std::unordered_map<uint64_t, uint32_t> host_pixel_shader_draws_this_swap_;
   SpirvShaderTranslator::SystemConstants system_constants_ = {};
-  std::array<uint32_t, 512 * 4> float_constants_ = {};
   std::array<uint32_t, 32 * 6> fetch_constants_ = {};
   std::array<uint32_t, 8 + 32> bool_loop_constants_ = {};
-  std::array<uint32_t, RegisterFile::kRegisterCount> last_position_registers_ = {};
+  struct PositionRegisterRollback {
+    uint32_t index;
+    uint32_t value;
+  };
+  static constexpr size_t kPositionRegisterRollbackWordCount =
+      (RegisterFile::kRegisterCount + 63) / 64;
+  std::array<uint64_t, kPositionRegisterRollbackWordCount> last_position_register_rollback_bits_ =
+      {};
+  std::vector<PositionRegisterRollback> last_position_register_rollbacks_;
+  // Reused by the per-draw native Metal route. RenderPipelineProbeToContext
+  // snapshots CPU argument bytes and retains Metal texture objects before it
+  // returns, so these containers may be safely recycled by the next draw.
+  std::vector<std::vector<uint8_t>> vertex_texture_storage_scratch_;
+  std::vector<std::vector<uint8_t>> fragment_texture_storage_scratch_;
+  std::vector<ProbeTextureSlot> vertex_texture_slots_scratch_;
+  std::vector<ProbeTextureSlot> fragment_texture_slots_scratch_;
+  std::vector<ProbeSamplerSlot> vertex_sampler_slots_scratch_;
+  std::vector<ProbeSamplerSlot> fragment_sampler_slots_scratch_;
+  std::vector<uint32_t> vertex_float_constants_scratch_;
+  std::vector<uint32_t> fragment_float_constants_scratch_;
   string::StringBuffer ucode_disasm_buffer_;
   std::vector<MetalDrawEvent> pending_draw_events_;
   std::vector<MetalHostVertex> pending_host_vertices_;
@@ -230,12 +264,10 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint32_t draw_count = 0;
   };
   // Unlike the score-based diagnostic frame retention above, this is an exact
-  // mirror of a complete top-origin tiled resolve write. The guest byte mirror
-  // is compared before reuse so unobserved CPU writes can only cause a cache
-  // miss, never stale presentation.
+  // mirror of a complete top-origin tiled resolve write. A persistent shared-
+  // memory watch invalidates it on overlapping CPU or GPU writes.
   struct ExactResolvedSurface {
     std::vector<uint8_t> bgra;
-    std::vector<uint8_t> guest_tiled_bytes;
     // Invalidation keeps the allocations so the title's repeated partial-band
     // writes don't free and reallocate roughly 7.5 MiB before every complete
     // resolve. Only a fully republished surface may be used by swap.
@@ -244,6 +276,7 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint32_t pitch = 0;
     uint32_t bgra_height = 0;
     uint32_t surface_height = 0;
+    uint32_t tiled_extent = 0;
     xenos::Endian128 endian = xenos::Endian128::kNone;
   };
   struct HostRenderTarget {
@@ -271,6 +304,7 @@ class MetalCommandProcessor final : public CommandProcessor {
   };
   std::unordered_map<uint32_t, RetainedResolvedFrame> retained_resolve_frames_by_base_;
   ExactResolvedSurface exact_resolved_surface_;
+  SharedMemory::GlobalWatchHandle exact_resolved_surface_watch_ = nullptr;
   std::unordered_map<uint64_t, HostRenderTarget> host_render_targets_;
   std::vector<PendingReadbackResolveSlice> pending_readback_resolve_slices_;
   uint32_t latest_pipeline_probe_width_ = 0;
@@ -331,6 +365,55 @@ class MetalCommandProcessor final : public CommandProcessor {
   uint32_t host_fallback_pixel_draws_this_swap_ = 0;
   uint32_t host_pixel_skipped_vertices_this_swap_ = 0;
   uint64_t latest_texture_candidate_score_ = 0;
+  struct WaitRegMemProfileEntry {
+    bool is_memory = false;
+    uint32_t poll_address = 0;
+    uint32_t reference = 0;
+    uint32_t mask = 0;
+    uint32_t operation = 0;
+    uint32_t wait = 0;
+    uint32_t last_value = 0;
+    uint64_t call_count = 0;
+    uint64_t poll_count = 0;
+    uint64_t max_polls = 0;
+    uint64_t total_ns = 0;
+    uint64_t max_ns = 0;
+    uint64_t unmatched_count = 0;
+    uint64_t timeout_count = 0;
+  };
+  struct WaitRegMemProfileKey {
+    bool is_memory = false;
+    uint32_t poll_address = 0;
+    uint32_t reference = 0;
+    uint32_t mask = 0;
+    uint32_t operation = 0;
+    uint32_t wait = 0;
+
+    bool operator==(const WaitRegMemProfileKey& other) const {
+      return is_memory == other.is_memory && poll_address == other.poll_address &&
+             reference == other.reference && mask == other.mask && operation == other.operation &&
+             wait == other.wait;
+    }
+  };
+  struct WaitRegMemProfileKeyHash {
+    size_t operator()(const WaitRegMemProfileKey& key) const {
+      size_t hash = key.is_memory ? size_t(0x9E3779B9u) : 0;
+      auto combine = [&](uint32_t value) {
+        hash ^= size_t(value) + size_t(0x9E3779B9u) + (hash << 6) + (hash >> 2);
+      };
+      combine(key.poll_address);
+      combine(key.reference);
+      combine(key.mask);
+      combine(key.operation);
+      combine(key.wait);
+      return hash;
+    }
+  };
+  std::unordered_map<WaitRegMemProfileKey, WaitRegMemProfileEntry, WaitRegMemProfileKeyHash>
+      wait_reg_mem_profile_entries_;
+  profiling::CommandProfileWindow profile_window_;
+  uint64_t profiled_swap_count_ = 0;
+  bool profile_enabled_ = profiling::IsEnabled();
   bool logged_incomplete_ = false;
   bool last_host_render_target_probe_read_ = false;
   bool last_swap_fetch_valid_ = false;

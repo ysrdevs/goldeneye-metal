@@ -25,7 +25,8 @@ Build only the main developer targets:
 
 ```sh
 cmake --build --preset macos-arm64-release \
-  --target rexglue metal_resolve_test metal_pipeline_probe_test unit_tests --parallel
+  --target rexglue metal_resolve_test metal_pipeline_probe_test \
+  metal_texture_decode_validation_test unit_tests --parallel
 ```
 
 The Metal backend deliberately fails during configuration if SPIRV-Cross MSL support is missing.
@@ -63,17 +64,46 @@ directory. The runtime root must contain `default.xex`, `files/`, and the title'
 Missing extracted data can look like a runtime or renderer fault because optional resource loads
 resolve to null. Game data stays local and must never be committed.
 
+### Native macOS input
+
+The Cocoa window delivers physical key down/up events, buttons, wheel input, and Retina-aware
+relative mouse motion to the common keyboard/mouse input driver. Hidden capture disassociates the
+pointer so mouse-look is not clamped by a screen edge, and focus loss or teardown restores the
+system cursor. Modifier `FlagsChanged` events never query AppKit's key-down-only repeat state; a
+focused regression covers their previous-state delivery. Enable controller emulation explicitly
+and move Start away from Escape, which is also the host pause-overlay shortcut:
+
+```sh
+REX_MNK_MODE=true REX_KEYBIND_START=Return \
+./vendor/GoldenEye-Recomp/out/build/macos-arm64-release/GoldenEye \
+  --game_data_root /absolute/path/to/complete/game-data \
+  --gpu metal
+```
+
+The default gameplay bindings include Space for A, Shift for B, WASD for the left stick, the arrow
+keys for the D-pad, mouse motion for the right stick, and left/right mouse buttons for the
+right/left triggers. A compatible controller remains available through `--input_backend sdl`.
+The native input route is normal runtime input; it does not alter guest state or the graphics path.
+
 ## Tests
 
 `metal_resolve_test` allocates Metal EDRAM and destination buffers, runs the native resolve-copy
-kernel, and compares GPU output against a CPU reference byte for byte.
+kernel, and compares GPU output against a CPU reference byte for byte. Its eight tiled-write cases
+cover full and partial rectangles across all four 128-bit endian modes.
+
+`metal_texture_decode_validation_test` exercises the checked byte-layout contract used by the
+direct Metal texture decoder. It covers valid linear and tiled spans, an exact physical-memory
+boundary, arithmetic overflow, and the 8192x8191 out-of-range descriptor observed during the first
+Dam transition. It requires no game data or Metal device.
 
 `metal_pipeline_probe_test` renders through an externally owned Metal vertex buffer, samples a
 single-layer `texture2d_array`, expands a four-vertex fan through a six-entry index buffer, checks
 scissor delivery, verifies the title's source-alpha blend mode, and validates Xenos-to-Metal
-per-channel write-mask mapping. It also verifies ordered draws across queued command buffers, the
-64-draw command-buffer boundary, four retained batches, the 256-draw safety drain, explicit waits,
-reusable upload-arena lifetime across command-buffer completion, and synchronization during
+per-channel write-mask mapping. It also covers front/back culling with clockwise and
+counter-clockwise guest front faces, persistent near/far depth rejection, disabled depth writes,
+stencil replace/equal/reject, ordered draws across queued command buffers, the 64-draw
+command-buffer boundary, 256-draw oldest-buffer retirement, four upload-arena lifetimes, explicit
+waits, reusable upload-arena lifetime across command-buffer completion, and synchronization during
 shared/private regional readback, queued clear, resize, and context release. It protects the
 resource, fixed-function, and asynchronous-lifetime contracts used by translated producer draws.
 It does not replace title-level validation of texture-cache uploads, resolve coherence, or
@@ -103,8 +133,12 @@ hidden without changing execution.
 | `GOLDENEYE_AUTO_START=1` | Hold Start during the initial input window to skip startup screens |
 | `GOLDENEYE_AUTO_START=periodic` | Use monotonic-time startup input followed by recurring Start pulses for unattended title/menu traversal |
 | `GOLDENEYE_AUTO_START=menu` | Use the periodic schedule until 19 seconds, then stop before the 20-second retry so it does not immediately leave a newly reached dossier menu |
+| `GOLDENEYE_AUTO_MISSION=dam` | After a 22-second dossier delay, traverse the default route into Dam using ordinary controller input contributions |
+| `REX_MNK_MODE=true` | Enable keyboard/mouse controller emulation; required for native keyboard gameplay input |
+| `REX_KEYBIND_START=Return` | Avoid the default Escape collision with the host pause overlay while using keyboard input |
 | `REX_METAL_SHOW_FPS=false` | Hide the default-on presenter FPS overlay; its value counts guest front-buffer deliveries, not host repaints |
-| `GOLDENEYE_METAL_GPU_TILED_RESOLVE=1` | Enable the experimental GPU tiled-write resolve path; it is off by default because it has not beaten the CPU path |
+| `GOLDENEYE_METAL_PROFILE=1` | Emit low-overhead command, `WAIT_REG_MEM`, wait-reason, texture-fallback, and presenter ledgers in complete 64-swap/attempt windows |
+| `GOLDENEYE_METAL_GPU_TILED_RESOLVE=0` | Disable the default GPU tiled-write resolve path for CPU-fallback comparison |
 | `GOLDENEYE_METAL_DUMP_SHADERS=1` | Write translated/failed MSL and selected microcode dumps under `/tmp` |
 | `GOLDENEYE_METAL_DUMP_FRAMES=1` or `all` | Write all selected BGRA frame stages as PPM files under `/tmp` |
 | `GOLDENEYE_METAL_DUMP_FRAMES=N` | Write only presenter frame number `N`; this avoids the decoded-texture inspection used by an all-stage dump |
@@ -127,6 +161,23 @@ bypass resolves. Pair either mode with a numeric `GOLDENEYE_METAL_DUMP_FRAMES` v
 collecting one known presenter checkpoint, or use `1`/`all` only when every diagnostic stage is
 needed. Keep all resulting game-content captures outside the repository.
 
+Pair `GOLDENEYE_AUTO_START=menu` with `GOLDENEYE_AUTO_MISSION=dam` for the deterministic first-Dam
+route. After waiting 22 seconds for the dossier, the mission injector contributes five ordinary A
+presses, each followed by a release edge: Select Mission, Dam, Agent, open briefing, and Start
+mission. Between the fourth and fifth A presses it contributes full positive left-stick Y for
+450 ms, observes a neutral poll, and allows 750 ms for cursor focus to settle. Contributions merge
+with the current controller state, never clear native input, and become permanently idle after the
+final A release. This is an input-only rendering/performance diagnostic, not physical-input proof.
+
+`GOLDENEYE_METAL_PROFILE=1` records CPU-side duration and count aggregates without enabling verbose
+renderer logging. Every 64 command swaps it reports draw, copy, inclusive swap, fallback texture
+decode, categorized synchronization waits, and `WAIT_REG_MEM` cost. The wait ledger also reports
+the hottest sampled address, reference, mask, and poll count so a fence wait can be tied back to
+the observed guest condition. Every 64 presenter attempts it reports source reuse, drawable
+failures, upload bytes, commits, and CPU time in drawable acquisition, upload, and present
+submission. Only complete windows are emitted; present-submission time is not GPU completion or
+display latency. When the flag is absent, the timers and presenter source hashing are bypassed.
+
 The Metal presenter draws `FPS` by default after each completed guest front-buffer update. It
 counts guest-delivered frames over a monotonic interval rather than CAMetalLayer paint events, so
 window expose or repaint traffic cannot inflate the value. Set `REX_METAL_SHOW_FPS=false` to
@@ -138,9 +189,10 @@ labelled as diagnostics and must not be reported as strict-path rendering succes
 ## Metal submission and synchronization
 
 Persistent producer draws use bounded asynchronous command-buffer submission. A probe context
-batches up to 64 draws in each Metal command buffer and retains at most four committed batches,
-giving each context a 256-draw safety bound. Normal ordering on a context's Metal command queue
-preserves successive draws and clears to the same target without a CPU wait between them.
+batches up to 64 draws in each Metal command buffer and has four upload arenas. When all four are
+occupied, it retires the oldest command buffer instead of waiting for the newest; the independent
+global retained-draw ceiling is 2048. Normal ordering on the shared Metal command queue preserves
+successive draws, uploads, and clears without a CPU wait between each operation.
 
 Synchronization remains mandatory before a result is read or a resource may change underneath
 queued GPU work. The runtime therefore drains pending contexts before readback, clear, target
@@ -149,11 +201,12 @@ write commits, texture replacement, and shaders with memory-export side effects 
 the command processor. Do not remove one of these boundaries to improve a microbenchmark; validate
 ownership first.
 
-Private render-target reads use a reusable staging buffer and copy only the requested rectangle.
-The observed title frame's three resolve bands therefore transfer 256, 256, and 208 rows rather
-than independently reading the full 720-line target; the sequence's remaining full-frame readback
-stays 1280x720. Clear operations needed by the same sequence are queued in order on the context
-instead of forcing a separate CPU wait.
+Private render-target reads in the CPU fallback use a reusable staging buffer and copy only the
+requested rectangle. The observed title frame's three resolve bands therefore transfer 256, 256,
+and 208 rows rather than independently reading the full 720-line target; the sequence's remaining
+full-frame readback stays 1280x720. The default GPU tiled resolve writes the guest destination
+directly. Clear operations needed by the same sequence are queued in order on the context instead
+of forcing a separate CPU wait.
 
 Complete, top-origin, full-width resolves can populate an exact resolved-surface cache. A swap may
 reuse its host BGRA pixels only when the fetch base, pitch, dimensions, endian mode, and live guest
@@ -167,6 +220,14 @@ change. The texture cache therefore fingerprints the synchronized source span be
 uploading it again. An unchanged fingerprint re-arms tracking without another CPU untile or Metal
 `replaceRegion`; a changed source still follows the normal replacement path.
 
+The first Dam transition exposed a tiled 8192x8191 texture descriptor whose 256 MiB source extent
+started too near the end of the 512 MiB guest physical range. The texture cache rejected it, but
+the direct diagnostic/probe decoder previously translated the pointer and entered `Untile` without
+the cache's range gate. That path now checks dimensions, pitch, every multiplication and addition,
+the exact tiled or linear source span, host-size conversions, and the output allocation before any
+guest-pointer translation, scan, copy, or untile. Invalid bindings fall back to the dummy texture;
+the standalone validation test preserves the observed descriptor as a regression target.
+
 MSL resource reflection is computed once after a translation's final source sanitization. Buffer
 indices, texture-fetch mappings, interpolator locations, memory-export state, and void-fragment
 state are then read from the immutable translation record instead of rescanning MSL for every
@@ -175,16 +236,39 @@ reusable upload arenas associated with their command buffer. Arenas are recycled
 completion, preserving asynchronous resource lifetime without allocating a Metal buffer for every
 binding.
 
-`GOLDENEYE_METAL_GPU_TILED_RESOLVE=1` selects an experimental compute path that writes the Xenos
-tiled destination directly. Byte-exact coverage includes full and partial rectangles across all
-four 128-bit endian modes. The option remains off by default because current measurements did not
-show an improvement over the optimized CPU tiler; strict performance runs should record whether it
-was enabled.
+The GPU compute path writes the Xenos tiled destination directly and is enabled by default.
+Byte-exact coverage includes eight full and partial rectangle cases across all four 128-bit endian
+modes, and a live Dam proving run completed thousands of resolves with zero fallbacks. Set
+`GOLDENEYE_METAL_GPU_TILED_RESOLVE=0` only when comparing the CPU fallback, and record the opt-out
+in performance results. Further work should make resolve submission more asynchronous and reduce
+the fence wait around its consumers.
+
+Persistent Metal render contexts own private `Depth32Float_Stencil8` attachments. Normalized
+`RB_DEPTHCONTROL`, `RB_STENCILREFMASK`, and `RB_STENCILREFMASK_BF` state drives depth compare/write
+and independent front/back stencil compare, operations, masks, and references. Attachment
+load/store ordering follows the existing queued render context, and resize/reset/release drains
+pending work before changing its lifetime.
+
+This is intentionally a bounded fidelity slice. Depth attachments are still per host color-target
+context rather than shared by guest `RB_DEPTH_INFO.depth_base` / EDRAM identity. Guest `D24S8` and
+`D24FS8` both use Metal 32-bit float depth, and guest depth clear, copy, resolve, readback,
+texture-alias, MSAA, sample-mask, depth-bias, and non-solid-fill behavior remain unimplemented.
 
 The title-facing GPU-wait hook determines completion from one atomic primary-ring snapshot. A ring
 is drained only when it is configured, has a valid write pointer, and has no pending commands;
 this also handles a valid wrapped write pointer of zero without mistaking it for an uninitialized
 ring.
+
+The guest D3D watchdog uses a hardware-scale timeout that is shorter than host scheduling and Metal
+pipeline compilation. A single drained snapshot is not a safe release point because the producer
+may append the next primary-ring tail immediately afterward. The title hook therefore requires the
+same wait context and heartbeat to observe a continuously drained ring for 60 ms before restoring
+accumulated guest watchdog time. Any pending sample or heartbeat change restarts that grace. This
+does not acknowledge work: the title still owns its fence, skip bits, and presented counter, and
+the command processor still owns RPTR. While commands remain pending, held watchdog time is allowed
+only while RPTR continues to change; 30 seconds without RPTR progress restores the title's genuine
+hang detection. A 74-second proving run reached swap 4416 with zero guest GPU-hang dumps or debug
+traps, versus 14 of each in the pre-fix control.
 
 Rate-limited `IssueSwap` output includes cumulative asynchronous submission, wait, waited-command,
 and maximum-pending counters. Use those counters with a fixed swap checkpoint when comparing
@@ -194,10 +278,15 @@ The POSIX host tick count is represented in nanoseconds. Its frequency is theref
 billion ticks per second rather than derived from `clock_getres`, which reports the timer's
 precision rather than the unit of the returned count. The former calculation scaled guest time and
 the FPS display by the host timer quantum on macOS. With the corrected clock and performance
-optimizations above, verified 1280x720 captures on an Apple M3 Ultra reached the dossier menu and
-reported 30.0 and 59.9 guest-delivered frames per second in different short intervals. This is a
-major pacing improvement, but it is not a sustained-60-FPS claim. Gameplay has not been reached
-and is not confirmed correct or performant.
+optimizations above, verified 1280x720 captures on an Apple M3 Ultra reach the dossier and a clean
+real Dam briefing at roughly 60 FPS. An earlier dynamic Dam proving window measured 29.68 FPS.
+Oldest-first upload command-buffer retirement and a 2048 global retained-draw ceiling then
+produced a correct 46.5 FPS screenshot while reducing draw time from roughly 10 ms to 7.2–7.5 ms
+per swap. A later correct Dam screenshot displayed 60.0 FPS; stable complete windows reported
+roughly 6.4–6.7 ms draw, 4.2–4.35 ms copy, 1.74 ms swap, and 2.9 ms `WAIT_REG_MEM` time per swap.
+Not every Dam view sustains 60 FPS, so the primary performance target is broader-scene stability
+through asynchronous resolve work and lower fence-wait cost, followed by live physical
+keyboard/mouse gameplay validation.
 
 ## Debugging guardrails
 

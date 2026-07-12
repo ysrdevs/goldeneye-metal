@@ -32,6 +32,8 @@ using rex::graphics::metal::GetPipelineProbeContextPendingSubmissionCount;
 using rex::graphics::metal::GetPipelineProbeContextUploadStats;
 using rex::graphics::metal::PipelineProbeUploadStats;
 using rex::graphics::metal::ProbeColorTargetState;
+using rex::graphics::metal::ProbeCullMode;
+using rex::graphics::metal::ProbeDepthStencilState;
 using rex::graphics::metal::ProbeIndexBuffer;
 using rex::graphics::metal::ProbeRasterizationState;
 using rex::graphics::metal::ProbeSamplerSlot;
@@ -82,6 +84,25 @@ fragment float4 main0(FragmentInput input [[stage_in]],
                       texture2d_array<float> source [[texture(0)]],
                       sampler source_sampler [[sampler(0)]]) {
   return source.sample(source_sampler, input.uv, 0u);
+}
+)MSL";
+
+constexpr char kDepthVertexMsl[] = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+
+struct VertexOutput {
+  float4 position [[position]];
+  float2 uv [[user(locn0)]];
+};
+
+vertex VertexOutput main0(device const packed_float3* positions [[buffer(3)]],
+                          uint vertex_id [[vertex_id]]) {
+  VertexOutput output;
+  float3 position = float3(positions[vertex_id]);
+  output.position = float4(position, 1.0);
+  output.uv = position.xy * 0.5 + 0.5;
+  return output;
 }
 )MSL";
 
@@ -195,14 +216,23 @@ int RunPipelineProbeTest() {
             ? CreateRenderPipelineState(device, vertex_library, fragment_library, &error,
                                         &partial_write_target_state)
             : nullptr;
+    void* depth_vertex_library =
+        partial_write_pipeline_state ? CreateMslLibrary(device, kDepthVertexMsl, &error) : nullptr;
+    void* depth_pipeline_state =
+        depth_vertex_library
+            ? CreateRenderPipelineState(device, depth_vertex_library, fragment_library, &error)
+            : nullptr;
+    ReleaseMslLibrary(depth_vertex_library);
     ReleaseMslLibrary(vertex_library);
     ReleaseMslLibrary(fragment_library);
     auto release_pipeline_states = [&]() {
+      ReleaseRenderPipelineState(depth_pipeline_state);
       ReleaseRenderPipelineState(partial_write_pipeline_state);
       ReleaseRenderPipelineState(alpha_blend_pipeline_state);
       ReleaseRenderPipelineState(pipeline_state);
     };
-    if (!pipeline_state || !alpha_blend_pipeline_state || !partial_write_pipeline_state) {
+    if (!pipeline_state || !alpha_blend_pipeline_state || !partial_write_pipeline_state ||
+        !depth_pipeline_state) {
       std::fprintf(stderr, "[metal_pipeline_probe_test] FAIL: render pipeline: %s\n",
                    error.c_str());
       release_pipeline_states();
@@ -481,6 +511,153 @@ int RunPipelineProbeTest() {
           /*vertex_data_buffer_index=*/3, nullptr, 0, UINT32_MAX, UINT32_MAX, &fan_index_buffer);
     };
 
+    // The fan is counter-clockwise in clip space. Verify both Metal cull modes
+    // and both PA_SU_SC_MODE_CNTL::face conventions, resetting the target for
+    // each case so a culled draw can't pass by preserving earlier pixels.
+    auto render_cull_case = [&](ProbeCullMode cull_mode, bool front_face_clockwise,
+                                bool expect_visible) {
+      ProbeRasterizationState cull_state;
+      cull_state.viewport_width = kWidth;
+      cull_state.viewport_height = kHeight;
+      cull_state.scissor_width = kWidth;
+      cull_state.scissor_height = kHeight;
+      cull_state.cull_mode = cull_mode;
+      cull_state.front_face_clockwise = front_face_clockwise;
+      ResetPipelineProbeContext(context);
+      bool cull_rendered = RenderPipelineProbeToContext(
+          context, pipeline_state, kUnusedSystemConstants.data(), sizeof(kUnusedSystemConstants),
+          nullptr, 0, nullptr, 0, nullptr, 0, fan_position_buffer, nullptr, 0, 0, &texture, 1, 1,
+          /*primitive_type=TriangleList=*/4, uint32_t(kFanIndices.size()), kWidth, kHeight, &error,
+          /*vertex_shared_memory_buffer_index=*/3, UINT32_MAX, UINT32_MAX, nullptr, 0, UINT32_MAX,
+          UINT32_MAX, nullptr, &sampler, nullptr, 0, UINT32_MAX, nullptr, 0, UINT32_MAX, UINT32_MAX,
+          &external_fan_index_buffer, &cull_state);
+      std::vector<uint8_t> cull_bgra;
+      bool cull_read =
+          cull_rendered && ReadPipelineProbeContext(context, kWidth, kHeight, cull_bgra, &error);
+      const uint8_t* cull_center =
+          cull_read ? cull_bgra.data() + (size_t(kHeight / 2) * kWidth + kWidth / 2) * 4 : nullptr;
+      bool visible = cull_center && PixelNear(cull_center, kExpectedBgra);
+      return cull_read && visible == expect_visible;
+    };
+    bool cull_back_ccw_ok =
+        render_cull_case(ProbeCullMode::kBack, /*front_face_clockwise=*/false, true);
+    bool cull_front_ccw_ok =
+        render_cull_case(ProbeCullMode::kFront, /*front_face_clockwise=*/false, false);
+    bool cull_back_cw_ok =
+        render_cull_case(ProbeCullMode::kBack, /*front_face_clockwise=*/true, false);
+    bool cull_front_cw_ok =
+        render_cull_case(ProbeCullMode::kFront, /*front_face_clockwise=*/true, true);
+    bool cull_winding_ok =
+        cull_back_ccw_ok && cull_front_ccw_ok && cull_back_cw_ok && cull_front_cw_ok;
+
+    // Verify that the context-owned depth/stencil texture survives across
+    // multiple draws and that changing only the dynamic test/reference state
+    // doesn't require a new render pipeline or render pass.
+    constexpr std::array<float, 12> kNearDepthPositions = {
+        -0.8f, -0.8f, 0.25f, 0.8f, -0.8f, 0.25f, 0.8f, 0.8f, 0.25f, -0.8f, 0.8f, 0.25f,
+    };
+    constexpr std::array<float, 12> kFarDepthPositions = {
+        -0.8f, -0.8f, 0.75f, 0.8f, -0.8f, 0.75f, 0.8f, 0.8f, 0.75f, -0.8f, 0.8f, 0.75f,
+    };
+    constexpr std::array<uint8_t, 4> kGreenRgba = {32, 200, 80, 255};
+    constexpr std::array<uint8_t, 4> kRedRgba = {220, 40, 20, 255};
+    constexpr std::array<uint8_t, 4> kBlueRgba = {15, 60, 230, 255};
+    constexpr std::array<uint8_t, 4> kGreenBgra = {80, 200, 32, 255};
+    constexpr std::array<uint8_t, 4> kRedBgra = {20, 40, 220, 255};
+    auto make_solid_texture = [](const std::array<uint8_t, 4>& rgba) {
+      ProbeTextureSlot slot;
+      slot.rgba = rgba.data();
+      slot.width = 1;
+      slot.height = 1;
+      slot.bytes_per_row = 4;
+      slot.bytes_per_image = 4;
+      return slot;
+    };
+    ProbeTextureSlot green_texture = make_solid_texture(kGreenRgba);
+    ProbeTextureSlot red_texture = make_solid_texture(kRedRgba);
+    ProbeTextureSlot blue_texture = make_solid_texture(kBlueRgba);
+    ProbeRasterizationState depth_rasterization_state;
+    depth_rasterization_state.viewport_width = kWidth;
+    depth_rasterization_state.viewport_height = kHeight;
+    depth_rasterization_state.scissor_width = kWidth;
+    depth_rasterization_state.scissor_height = kHeight;
+    auto render_depth_quad = [&](const std::array<float, 12>& positions,
+                                 const ProbeTextureSlot& draw_texture,
+                                 const ProbeDepthStencilState& depth_stencil_state) {
+      return RenderPipelineProbeToContext(
+          context, depth_pipeline_state, kUnusedSystemConstants.data(),
+          sizeof(kUnusedSystemConstants), nullptr, 0, nullptr, 0, nullptr, 0, nullptr, nullptr, 0,
+          0, &draw_texture, 1, 1,
+          /*primitive_type=TriangleList=*/4, uint32_t(kFanIndices.size()), kWidth, kHeight, &error,
+          /*vertex_shared_memory_buffer_index=*/UINT32_MAX, UINT32_MAX, UINT32_MAX, nullptr, 0,
+          UINT32_MAX, UINT32_MAX, nullptr, &sampler, positions.data(), sizeof(positions),
+          /*vertex_data_buffer_index=*/3, nullptr, 0, UINT32_MAX, UINT32_MAX, &fan_index_buffer,
+          &depth_rasterization_state, &depth_stencil_state);
+    };
+    auto read_center = [&](std::vector<uint8_t>& output) {
+      bool read_ok = ReadPipelineProbeContext(context, kWidth, kHeight, output, &error);
+      return read_ok && output.size() == size_t(kWidth) * kHeight * 4
+                 ? output.data() + (size_t(kHeight / 2) * kWidth + kWidth / 2) * 4
+                 : nullptr;
+    };
+
+    ProbeDepthStencilState depth_less_write;
+    depth_less_write.depth_test_enabled = true;
+    depth_less_write.depth_write_enabled = true;
+    depth_less_write.depth_compare_function = 1;  // CompareFunction::kLess.
+    bool depth_cleared =
+        ClearPipelineProbeContext(context, kWidth, kHeight, 0.0, 0.0, 0.0, 1.0, &error);
+    bool depth_near_rendered =
+        depth_cleared && render_depth_quad(kNearDepthPositions, green_texture, depth_less_write);
+    bool depth_far_rendered =
+        depth_near_rendered && render_depth_quad(kFarDepthPositions, red_texture, depth_less_write);
+    std::vector<uint8_t> depth_bgra;
+    const uint8_t* depth_center = depth_far_rendered ? read_center(depth_bgra) : nullptr;
+    bool depth_persistence_ok = depth_center && PixelNear(depth_center, kGreenBgra);
+
+    ProbeDepthStencilState depth_less_no_write = depth_less_write;
+    depth_less_no_write.depth_write_enabled = false;
+    bool no_write_cleared =
+        depth_persistence_ok &&
+        ClearPipelineProbeContext(context, kWidth, kHeight, 0.0, 0.0, 0.0, 1.0, &error);
+    bool no_write_near_rendered =
+        no_write_cleared &&
+        render_depth_quad(kNearDepthPositions, green_texture, depth_less_no_write);
+    bool no_write_far_rendered =
+        no_write_near_rendered &&
+        render_depth_quad(kFarDepthPositions, red_texture, depth_less_write);
+    std::vector<uint8_t> no_write_bgra;
+    const uint8_t* no_write_center = no_write_far_rendered ? read_center(no_write_bgra) : nullptr;
+    bool depth_write_mask_ok = no_write_center && PixelNear(no_write_center, kRedBgra);
+
+    ProbeDepthStencilState stencil_replace;
+    stencil_replace.stencil_test_enabled = true;
+    stencil_replace.front.compare_function = 7;              // CompareFunction::kAlways.
+    stencil_replace.front.depth_stencil_pass_operation = 2;  // StencilOp::kReplace.
+    stencil_replace.front.reference = 0x5A;
+    stencil_replace.back = stencil_replace.front;
+    ProbeDepthStencilState stencil_equal = stencil_replace;
+    stencil_equal.front.compare_function = 2;  // CompareFunction::kEqual.
+    stencil_equal.front.depth_stencil_pass_operation = 0;
+    stencil_equal.front.write_mask = 0;
+    stencil_equal.back = stencil_equal.front;
+    ProbeDepthStencilState stencil_reject = stencil_equal;
+    stencil_reject.front.reference = 0x33;
+    stencil_reject.back.reference = 0x33;
+    bool stencil_cleared =
+        depth_write_mask_ok &&
+        ClearPipelineProbeContext(context, kWidth, kHeight, 0.0, 0.0, 0.0, 1.0, &error);
+    bool stencil_written =
+        stencil_cleared && render_depth_quad(kNearDepthPositions, green_texture, stencil_replace);
+    bool stencil_matched =
+        stencil_written && render_depth_quad(kNearDepthPositions, red_texture, stencil_equal);
+    bool stencil_rejected =
+        stencil_matched && render_depth_quad(kNearDepthPositions, blue_texture, stencil_reject);
+    std::vector<uint8_t> stencil_bgra;
+    const uint8_t* stencil_center = stencil_rejected ? read_center(stencil_bgra) : nullptr;
+    bool stencil_persistence_ok = stencil_center && PixelNear(stencil_center, kRedBgra);
+    bool depth_stencil_ok = depth_persistence_ok && depth_write_mask_ok && stencil_persistence_ok;
+
     // Host render targets use private Metal storage. Their regional readback
     // must enqueue the blit behind pending draws and fence both with one wait.
     void* private_context = CreateHostRenderTargetContext(device, &error);
@@ -715,7 +892,8 @@ int RunPipelineProbeTest() {
 
     // Draw 64 closes the first shared encoder / command buffer without losing
     // submission metadata. Four committed 64-draw buffers (256 draws total)
-    // trigger the bounded drain. Positions and indices are supplied as CPU
+    // recycle the oldest completed upload arena while leaving newer buffers in
+    // flight. Positions and indices are supplied as CPU
     // data here, exercising three upload-arena suballocations per draw (system
     // constants, vertices, indices). Each command buffer draws a different
     // quadrant so recycling an arena before GPU completion is visible.
@@ -774,7 +952,7 @@ int RunPipelineProbeTest() {
     bool cap_ok = cap_submissions_ok && pending_after_63 == 63 && submission_64_ok &&
                   pending_after_64 == 64 && submission_65_ok && pending_after_65 == 65 &&
                   submissions_to_255_ok && pending_after_255 == 255 && submission_256_ok &&
-                  pending_after_256 == 0 && submission_257_ok && pending_after_257 == 1 &&
+                  pending_after_256 == 192 && submission_257_ok && pending_after_257 == 1 &&
                   explicit_wait_ok && explicitly_waited == 1 && pending_after_explicit_wait == 0 &&
                   upload_quadrants_ok && upload_reuse_ok;
 
@@ -848,6 +1026,32 @@ int RunPipelineProbeTest() {
                    error.c_str());
       return 1;
     }
+    if (!cull_winding_ok) {
+      std::fprintf(stderr,
+                   "[metal_pipeline_probe_test] FAIL: cull/front-face delivery: %s "
+                   "back_ccw=%d front_ccw=%d back_cw=%d front_cw=%d\n",
+                   error.c_str(), int(cull_back_ccw_ok), int(cull_front_ccw_ok),
+                   int(cull_back_cw_ok), int(cull_front_cw_ok));
+      return 1;
+    }
+    if (!depth_stencil_ok) {
+      std::fprintf(
+          stderr,
+          "[metal_pipeline_probe_test] FAIL: persistent depth/stencil: %s "
+          "depth=(clear=%d near=%d far=%d center=%u,%u,%u,%u) "
+          "no_write=(clear=%d near=%d far=%d center=%u,%u,%u,%u) "
+          "stencil=(clear=%d write=%d match=%d reject=%d center=%u,%u,%u,%u)\n",
+          error.c_str(), int(depth_cleared), int(depth_near_rendered), int(depth_far_rendered),
+          depth_center ? depth_center[0] : 0, depth_center ? depth_center[1] : 0,
+          depth_center ? depth_center[2] : 0, depth_center ? depth_center[3] : 0,
+          int(no_write_cleared), int(no_write_near_rendered), int(no_write_far_rendered),
+          no_write_center ? no_write_center[0] : 0, no_write_center ? no_write_center[1] : 0,
+          no_write_center ? no_write_center[2] : 0, no_write_center ? no_write_center[3] : 0,
+          int(stencil_cleared), int(stencil_written), int(stencil_matched), int(stencil_rejected),
+          stencil_center ? stencil_center[0] : 0, stencil_center ? stencil_center[1] : 0,
+          stencil_center ? stencil_center[2] : 0, stencil_center ? stencil_center[3] : 0);
+      return 1;
+    }
     if (!blend_ok) {
       std::fprintf(stderr,
                    "[metal_pipeline_probe_test] FAIL: source-alpha blend: %s "
@@ -902,10 +1106,13 @@ int RunPipelineProbeTest() {
     std::fprintf(stdout,
                  "[metal_pipeline_probe_test] PASS: external MTLBuffer rasterized %zu sentinel "
                  "pixels; indexed fan remap rasterized %zu; scissor clipped its right half "
-                 "(%zu clear); ordered multi-draw batch, R/B write mask, 64-draw command buffers, "
-                 "256-draw drain cap, four upload-arena lifetimes, %llu reusable buffers for "
-                 "%llu suballocations, resize, explicit wait, and release drains matched; "
-                 "%u GPU tiled resolve cases plus invalid-input fencing matched\n",
+                 "(%zu clear); all four cull/winding combinations plus persistent depth, depth "
+                 "write masking, and stencil replace/equal/reject matched; ordered multi-draw "
+                 "batch, R/B color write mask, 64-draw command buffers, 256-draw oldest-buffer "
+                 "retirement, four upload-arena lifetimes, %llu reusable buffers for %llu "
+                 "suballocations, resize, "
+                 "explicit wait, and release drains matched; %u GPU tiled resolve cases plus "
+                 "invalid-input fencing matched\n",
                  textured_pixels, indexed_textured_pixels, clear_pixels,
                  static_cast<unsigned long long>(upload_buffer_allocation_delta),
                  static_cast<unsigned long long>(upload_suballocation_delta), tiled_case_count);

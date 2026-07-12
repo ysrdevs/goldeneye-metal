@@ -5,11 +5,12 @@ Apple Silicon and Metal rendering path. This repository contains the runtime, to
 backend, and game integration in one tree.
 
 > [!WARNING]
-> The macOS build is not playable yet. The native title path now runs continuously and presents
-> a recognizable main menu through the real Metal draw, resolve, and swap path, but interactive
-> gameplay and complete fixed-function fidelity have not been verified. Corrected-clock 1280x720
-> captures on an Apple M3 Ultra showed 30.0 and 59.9 guest frames per second at the dossier menu;
-> those are short menu-path samples, not evidence of sustained 60 FPS or performant gameplay.
+> The macOS build is not fully playable yet. The strict native path now reaches a clean Dam
+> briefing and fully rendered first-mission gameplay through real Metal draws, resolves, and
+> swaps. A deterministic input-only diagnostic performs the menu route, but physical native
+> gameplay input still needs live validation. Correct dynamic Dam captures have now displayed
+> 46.5 and 60.0 FPS, but not every view sustains 60 FPS; broader-scene pacing plus important
+> depth/MSAA fidelity gaps remain.
 
 ## Project status
 
@@ -31,7 +32,8 @@ and per-channel color-write state. Current single-sample host contexts assemble 
 sequence's three resolve bands described by its 4xMSAA layout through the normal `IssueCopy` and
 `IssueSwap` route. Ordinary persistent Metal draws are now submitted asynchronously in bounded
 queues instead of blocking the CPU after every draw: each command buffer carries up to 64 draws,
-with at most four retained batches and a 256-draw safety drain. Regional private-texture readback,
+with at most four retained batches per context. Completed upload command buffers retire from the
+oldest forward, and the global retained-draw ceiling is 2048. Regional private-texture readback,
 ordered queued clears, and an exact resolved-surface swap cache reduce avoidable synchronization
 and transfer work while preserving guest-memory validation and the true tiled surface extent.
 Texture-source fingerprints avoid redundant decode and upload work after coarse guest-memory
@@ -42,22 +44,52 @@ clock now reports the same nanosecond unit used by its tick counter, so guest ti
 FPS overlay are no longer scaled by the timer's hardware resolution. Those fixes produce a clean
 classification screen, the complete gun-barrel sequence, a shaded animated gold RARE logo, and a
 recognizable dossier-style main menu. On an Apple M3 Ultra, corrected-clock 1280x720 menu captures
-reported 30.0 and 59.9 guest-delivered frames per second in different short intervals. The next
-known gaps are culling, depth/stencil, true guest MSAA behavior, native macOS input, and validation
-of correct, sustained performance through the menu and after entering gameplay.
+reported 30.0 and 59.9 guest-delivered frames per second in different short intervals. Native
+Cocoa key and mouse events now feed the common keyboard/mouse controller driver, including hidden
+relative mouse capture, and Metal applies guest front/back culling and front-face winding for
+polygon draws. Persistent host contexts also carry private depth/stencil attachments and map guest
+Z compare/write plus front/back stencil state. A deterministic input-only route now combines
+`GOLDENEYE_AUTO_START=menu` with `GOLDENEYE_AUTO_MISSION=dam`: five ordinary A press/release
+pulses traverse the default dossier choices, with a 450 ms left-stick-up contribution before the
+final A. It reaches a clean real Dam briefing near 60 FPS and then the fully rendered first Dam
+scene. A historical proving run sustained 29.68 FPS; retiring completed upload command buffers and
+raising the global draw ceiling then produced a correct 46.5 FPS capture while reducing draw time
+from roughly 10 ms to 7.2–7.5 ms per swap. A later correct Dam capture displayed 60.0 FPS, with
+stable complete profiler windows reporting roughly 6.4–6.7 ms draw, 4.2–4.35 ms copy, 1.74 ms
+swap, and 2.9 ms `WAIT_REG_MEM` time per swap. These results establish real progress beyond the
+former 30 FPS ceiling, not sustained 60 FPS across every Dam view.
+
+The gameplay transition exposed an invalid 8192x8191 tiled texture descriptor whose source span
+extended beyond guest physical memory. The direct diagnostic decoder had bypassed the texture
+cache's range rejection and attempted to untile it. Texture decode now validates all layout
+arithmetic and source/output bounds before translating a guest pointer or allocating output, and a
+standalone regression test preserves the failing descriptor. The current priorities are
+stabilizing high frame rates across broader Dam scenes, reducing resolve and fence-wait costs,
+then validating physical native input in gameplay.
+Depth-only draw routing, guest-addressed shared depth/stencil ownership, and faithful guest MSAA
+remain open.
+
+The title's GPU-wait hook also rejects transient drained-ring snapshots before exposing accumulated
+guest watchdog time. A 74-second proving run reached normal `IssueSwap` 4416 with repeated dossier
+frames and no false D3D GPU-hang dumps or debug traps; the prior control emitted 14 of each. This
+guard changes no guest fence, ring pointer, presented counter, or render command. A pending ring
+must keep advancing RPTR to retain the host-time hold; 30 seconds without RPTR progress restores
+the title's genuine hang detection.
 
 The presenter FPS overlay is enabled by default and measures completed guest front-buffer
-deliveries, not host window repaints. Set `REX_METAL_SHOW_FPS=false` to hide it. An experimental
-GPU tiled-resolve path is available for investigation with
-`GOLDENEYE_METAL_GPU_TILED_RESOLVE=1`, but remains disabled by default because it has not
-outperformed the current CPU path.
+deliveries, not host window repaints. Set `REX_METAL_SHOW_FPS=false` to hide it. The validated GPU
+tiled-resolve path is enabled by default; set `GOLDENEYE_METAL_GPU_TILED_RESOLVE=0` to compare the
+CPU fallback. It has eight byte-exact regression cases and has completed thousands of live Dam
+resolves with zero fallbacks. Set `GOLDENEYE_METAL_PROFILE=1` for low-overhead command,
+`WAIT_REG_MEM`, wait-reason, texture-fallback, and presenter ledgers every 64 swaps or presentation
+attempts.
 
 See [the native Metal status report](docs/GOLDENEYE_NATIVE_METAL_PROJECT_STATUS.md) for the exact
 milestones, evidence, and next development priority.
 
 | Platform | Status |
 | --- | --- |
-| macOS on Apple Silicon | Active development; strict Metal rendering reaches the main menu, but gameplay is not verified |
+| macOS on Apple Silicon | Active development; strict Metal rendering reaches correct dynamic Dam gameplay with 46.5 and 60.0 FPS captures, while broader-scene stability and physical-input validation remain |
 | Windows | Existing backend code is present; this repository's current changes are not verified there |
 | Linux | Existing backend code is present; this repository's current changes are not verified there |
 
@@ -104,7 +136,8 @@ Configure and build the toolchain and Metal isolation test:
 ```sh
 cmake --preset macos-arm64-release
 cmake --build --preset macos-arm64-release \
-  --target rexglue metal_resolve_test metal_pipeline_probe_test --parallel
+  --target rexglue metal_resolve_test metal_pipeline_probe_test \
+  metal_texture_decode_validation_test --parallel
 ctest --preset macos-arm64-release --output-on-failure
 ```
 
@@ -127,17 +160,21 @@ against your complete authorized game-data directory, which must include `defaul
 and the companion title data:
 
 ```sh
+REX_MNK_MODE=true REX_KEYBIND_START=Return \
 ./vendor/GoldenEye-Recomp/out/build/macos-arm64-release/GoldenEye \
   --game_data_root /absolute/path/to/complete/game-data \
   --gpu metal
 ```
 
-The macOS window backend does not yet forward keyboard events to the guest. Add
-`--input_backend sdl` when testing with a compatible controller; use the opt-in unattended input
-diagnostic documented in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for repeatable menu captures.
+Keyboard/mouse controller emulation is opt-in. Space is A, Shift is B, WASD is the left stick,
+the arrow keys are the D-pad, the mouse is the right stick, and its left/right buttons are the
+right/left triggers. Start is rebound to Return above because the default Escape binding also
+opens the host pause overlay. Add `--input_backend sdl` instead when testing with a compatible
+controller. The unattended input diagnostic in
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) remains useful for repeatable rendering captures.
 
-These commands build the current menu-reaching prototype; they do not imply playable output. More
-diagnostics, test targets, and troubleshooting notes are in
+These commands build the current first-gameplay-reaching prototype; they do not imply fully
+playable output. More diagnostics, test targets, and troubleshooting notes are in
 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ## Game-data policy
@@ -148,10 +185,11 @@ is responsible for supplying compatible files they are legally authorized to use
 
 ## Contributing
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change. The immediate priority is stable
-interactive menu navigation and first gameplay with faithful culling, depth/stencil, and MSAA
-state: no synthetic geometry, replacement shaders, guessed command buffers, or heuristic
-presentation may count as completion evidence.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change. The immediate priority is making
+high frame rates repeatable across broader Dam views by reducing resolve and fence-wait costs,
+followed by physical native-input validation and the remaining depth/stencil and MSAA fidelity
+work. Synthetic geometry, replacement
+shaders, guessed command buffers, or heuristic presentation may not count as completion evidence.
 
 ## Licensing and trademarks
 

@@ -5,6 +5,7 @@
 
 #include <rex/cvar.h>
 #include <rex/chrono/clock.h>
+#include <rex/graphics/flags.h>
 #include <rex/logging.h>
 #include <rex/ui/surface.h>
 #include <rex/ui/surface_macos.h>
@@ -24,6 +25,8 @@ REXCVAR_DEFINE_BOOL(metal_show_fps, true, "UI/Metal",
 
 namespace rex::ui::metal {
 namespace {
+
+namespace profiling = rex::graphics::metal::profiling;
 
 constexpr const char* kGuestPresentMetalSource = R"(
 #include <metal_stdlib>
@@ -104,6 +107,31 @@ bool GetPackedBgraLayout(uint32_t width, uint32_t height, size_t& row_pitch_out,
   }
   size_out = row_pitch_out * height;
   return true;
+}
+
+uint64_t HashGuestFrame(const uint8_t* data, size_t size, uint32_t width, uint32_t height) {
+  uint64_t hash = UINT64_C(0x9E3779B185EBCA87) ^ uint64_t(size) ^ (uint64_t(width) << 32) ^ height;
+  while (size >= sizeof(uint64_t)) {
+    uint64_t word;
+    std::memcpy(&word, data, sizeof(word));
+    word ^= word >> 33;
+    word *= UINT64_C(0xC2B2AE3D27D4EB4F);
+    word ^= word >> 29;
+    hash ^= word;
+    hash =
+        ((hash << 27) | (hash >> 37)) * UINT64_C(0x9E3779B185EBCA87) + UINT64_C(0x165667B19E3779F9);
+    data += sizeof(uint64_t);
+    size -= sizeof(uint64_t);
+  }
+  uint64_t tail = 0;
+  if (size) {
+    std::memcpy(&tail, data, size);
+    hash ^= tail * UINT64_C(0xC2B2AE3D27D4EB4F);
+  }
+  hash ^= hash >> 33;
+  hash *= UINT64_C(0xFF51AFD7ED558CCD);
+  hash ^= hash >> 33;
+  return hash;
 }
 
 class MetalGuestOutputRefreshContext final : public Presenter::GuestOutputRefreshContext {
@@ -215,10 +243,77 @@ void MetalPresenter::FinalizeGuestFrameLocked() {
     }
   }
 
+  if (profile_enabled_) {
+    uint64_t source_hash = HashGuestFrame(guest_frame_bgra_.data(), guest_frame_bgra_.size(),
+                                          guest_frame_width_, guest_frame_height_);
+    bool unchanged = profile_last_source_valid_ && source_hash == profile_last_source_hash_ &&
+                     guest_frame_width_ == profile_last_source_width_ &&
+                     guest_frame_height_ == profile_last_source_height_;
+    profile_last_source_hash_ = source_hash;
+    profile_last_source_width_ = guest_frame_width_;
+    profile_last_source_height_ = guest_frame_height_;
+    profile_last_source_valid_ = true;
+    std::lock_guard<std::mutex> profile_lock(profile_mutex_);
+    profile_window_.RecordSource(unchanged);
+  }
+
   if (REXCVAR_GET(metal_show_fps)) {
     DrawGuestFpsOverlayLocked();
   }
   ++guest_frame_generation_;
+}
+
+void MetalPresenter::EndProfiledPresentAttempt(bool drawable_nil, uint64_t present_commit_ns) {
+  if (!profile_enabled_) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(profile_mutex_);
+  if (drawable_nil) {
+    profile_window_.RecordDrawableNil();
+  } else {
+    profile_window_.Record(profiling::PresenterEvent::kPresentCommit, present_commit_ns);
+    profile_window_.RecordCommit();
+  }
+  ++profiled_present_attempt_count_;
+  if (profile_window_.EndAttempt()) {
+    ReportProfileWindowLocked();
+    profile_window_.Reset();
+  }
+}
+
+void MetalPresenter::ReportProfileWindowLocked() {
+  uint64_t first_attempt = profiled_present_attempt_count_ - profile_window_.attempt_count() + 1;
+  std::fprintf(stderr,
+               "[metal-profile] presenter attempts=%llu-%llu sources=%llu unchanged_sources=%llu "
+               "drawable_nil=%llu uploads=%llu upload_bytes=%llu commits=%llu\n",
+               static_cast<unsigned long long>(first_attempt),
+               static_cast<unsigned long long>(profiled_present_attempt_count_),
+               static_cast<unsigned long long>(profile_window_.source_count()),
+               static_cast<unsigned long long>(profile_window_.unchanged_source_count()),
+               static_cast<unsigned long long>(profile_window_.drawable_nil_count()),
+               static_cast<unsigned long long>(profile_window_.upload_count()),
+               static_cast<unsigned long long>(profile_window_.upload_byte_count()),
+               static_cast<unsigned long long>(profile_window_.commit_count()));
+  for (size_t event_index = 0; event_index < size_t(profiling::PresenterEvent::kCount);
+       ++event_index) {
+    profiling::PresenterEvent event = profiling::PresenterEvent(event_index);
+    const profiling::DurationWindow& metric = profile_window_.event(event);
+    std::fprintf(
+        stderr,
+        "[metal-profile] presenter attempts=%llu-%llu event=%s calls=%llu total_ns=%llu "
+        "avg_ns_per_attempt=%llu max_call_ns=%llu max_attempt_ns=%llu "
+        "max_calls_per_attempt=%llu\n",
+        static_cast<unsigned long long>(first_attempt),
+        static_cast<unsigned long long>(profiled_present_attempt_count_),
+        profiling::PresenterEventName(event),
+        static_cast<unsigned long long>(metric.total.call_count),
+        static_cast<unsigned long long>(metric.total.total_ns),
+        static_cast<unsigned long long>(metric.total.total_ns / profile_window_.attempt_count()),
+        static_cast<unsigned long long>(metric.total.max_call_ns),
+        static_cast<unsigned long long>(metric.max_swap_ns),
+        static_cast<unsigned long long>(metric.max_calls_per_swap));
+  }
+  std::fflush(stderr);
 }
 
 void MetalPresenter::DrawGuestFpsOverlayLocked() {
@@ -310,6 +405,10 @@ MetalPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
   [layer setPixelFormat:MTLPixelFormatBGRA8Unorm];
   [layer setFramebufferOnly:NO];
   [layer setDrawableSize:CGSizeMake(new_surface_width, new_surface_height)];
+  // Match the cross-backend GPU vsync setting. CAMetalLayer defaults to
+  // display-synchronized presentation, which silently quantized a 35-55 FPS
+  // native Metal workload down to 30 FPS even when GPU vsync was disabled.
+  [layer setDisplaySyncEnabled:REXCVAR_GET(vsync) ? YES : NO];
 
   if (metal_layer_ != layer) {
     if (metal_layer_) {
@@ -319,8 +418,7 @@ MetalPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
     [(id)metal_layer_ retain];
   }
 
-  // CAMetalLayer presentation is synchronized by Core Animation.
-  is_vsync_implicit_out = true;
+  is_vsync_implicit_out = REXCVAR_GET(vsync);
   return SurfacePaintConnectResult::kSuccess;
 }
 
@@ -389,8 +487,15 @@ Presenter::PaintResult MetalPresenter::PaintAndPresentImpl(bool execute_ui_drawe
   }
 
   @autoreleasepool {
+    uint64_t next_drawable_start_ns = profile_enabled_ ? profiling::NowNs() : 0;
     id<CAMetalDrawable> drawable = [(CAMetalLayer*)metal_layer_ nextDrawable];
+    if (profile_enabled_) {
+      std::lock_guard<std::mutex> lock(profile_mutex_);
+      profile_window_.Record(profiling::PresenterEvent::kNextDrawable,
+                             profiling::ElapsedNs(next_drawable_start_ns));
+    }
     if (!drawable) {
+      EndProfiledPresentAttempt(true);
       return PaintResult::kNotPresented;
     }
 
@@ -418,10 +523,17 @@ Presenter::PaintResult MetalPresenter::PaintAndPresentImpl(bool execute_ui_drawe
         }
         if (guest_texture_ && guest_texture_generation_ != guest_frame_generation_) {
           MTLRegion region = MTLRegionMake2D(0, 0, guest_frame_width_, guest_frame_height_);
+          uint64_t upload_start_ns = profile_enabled_ ? profiling::NowNs() : 0;
           [(id<MTLTexture>)guest_texture_ replaceRegion:region
                                             mipmapLevel:0
                                               withBytes:guest_frame_bgra_.data()
                                             bytesPerRow:size_t(guest_frame_width_) * 4];
+          if (profile_enabled_) {
+            std::lock_guard<std::mutex> profile_lock(profile_mutex_);
+            profile_window_.Record(profiling::PresenterEvent::kUpload,
+                                   profiling::ElapsedNs(upload_start_ns));
+            profile_window_.RecordUpload(size_t(guest_frame_width_) * guest_frame_height_ * 4);
+          }
           guest_texture_generation_ = guest_frame_generation_;
         }
       }
@@ -457,8 +569,10 @@ Presenter::PaintResult MetalPresenter::PaintAndPresentImpl(bool execute_ui_drawe
     }
     [encoder endEncoding];
 
+    uint64_t present_start_ns = profile_enabled_ ? profiling::NowNs() : 0;
     [command_buffer presentDrawable:drawable];
     [command_buffer commit];
+    EndProfiledPresentAttempt(false, profile_enabled_ ? profiling::ElapsedNs(present_start_ns) : 0);
   }
 
   return PaintResult::kPresented;
