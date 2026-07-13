@@ -13,6 +13,7 @@
 #include <rex/input/input_driver.h>
 #include <rex/ui/window_listener.h>
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <queue>
@@ -37,6 +38,8 @@ class MnkInputDriver final : public InputDriver,
                         X_INPUT_KEYSTROKE* out_keystroke) override;
 
   void OnWindowAvailable(rex::ui::Window* window) override;
+  void OnWindowUnavailable() override;
+  void OnInputActiveChanged(bool active) override;
 
   // WindowInputListener
   void OnKeyDown(rex::ui::KeyEvent& e) override;
@@ -53,12 +56,17 @@ class MnkInputDriver final : public InputDriver,
  private:
   uint32_t UserIndex() const;
   bool IsEnabled() const;
-  void CenterCursor();
-  void UpdateMouseCapture();
+  bool IsMouseEnabled() const;
+  void CenterCursor(rex::ui::Window* window);
+  void UpdateMouseCapture(bool input_active, uint64_t observed_activity_generation);
   void SetKeyState(uint16_t vk, bool down);
   void EnqueueKeystroke(uint16_t vk_pad, bool down);
 
-  rex::ui::Window* attached_window_ = nullptr;
+  std::atomic<rex::ui::Window*> attached_window_{nullptr};
+  std::atomic<bool> closing_{false};
+  std::atomic<uint64_t> capture_request_generation_{0};
+  std::atomic<bool> host_input_active_{true};
+  std::atomic<uint64_t> input_activity_generation_{0};
 
   std::mutex state_mutex_;
   bool key_down_[256] = {};
@@ -68,8 +76,11 @@ class MnkInputDriver final : public InputDriver,
   int32_t mouse_dy_ = 0;
   int32_t prev_mouse_x_ = 0;
   int32_t prev_mouse_y_ = 0;
+  // Read and written only on the window UI thread. All common Window capture
+  // state is changed there too, so it stays serialized with ImGui capture.
   bool mouse_captured_ = false;
-  bool has_focus_ = true;
+  std::atomic<bool> mouse_capture_applied_{false};
+  std::atomic<bool> has_focus_{true};
 
   // Keystroke queue
   std::queue<X_INPUT_KEYSTROKE> keystroke_queue_;

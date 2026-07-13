@@ -44,6 +44,9 @@ X_STATUS InputSystem::Setup() {
 }
 
 void InputSystem::Shutdown() {
+  if (window_) {
+    DetachWindow();
+  }
   drivers_.clear();
 }
 
@@ -52,15 +55,31 @@ void InputSystem::AddDriver(std::unique_ptr<InputDriver> driver) {
 }
 
 void InputSystem::AttachWindow(rex::ui::Window* window) {
+  if (window_ && window_ != window) {
+    DetachWindow();
+  }
   window_ = window;
   for (auto& driver : drivers_) {
     driver->OnWindowAvailable(window);
   }
 }
 
+void InputSystem::DetachWindow() {
+  for (auto& driver : drivers_) {
+    driver->OnWindowUnavailable();
+  }
+  window_ = nullptr;
+}
+
 void InputSystem::SetActiveCallback(std::function<bool()> callback) {
   for (auto& driver : drivers_) {
     driver->set_is_active_callback(callback);
+  }
+}
+
+void InputSystem::NotifyInputActiveChanged(bool active) {
+  for (auto& driver : drivers_) {
+    driver->OnInputActiveChanged(active);
   }
 }
 

@@ -1937,12 +1937,15 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
     return;
   }
 
-  // Mouse look runs every frame here, independent of the keyboard toggle. The
-  // raw-mouse thread only accumulates deltas while the game is focused and the
-  // cursor is captured, so this is a no-op in menus / when unfocused.
+  // The direct guest-memory mouse hook is backed by Win32 raw input. macOS uses
+  // the native common MnK driver to feed the guest right stick instead; running
+  // this hook there with zero raw deltas would still alter auto-aim and gun
+  // state.
+#if defined(_WIN32)
   ge_start_mouse_once();
   if (REXCVAR_GET(ge_mouselook_enable))
     ge_mouse_camera(base);
+#endif
 
   static std::atomic<uint32_t> auto_start_poll{0};
   const char* auto_start_mode = std::getenv("GOLDENEYE_AUTO_START");

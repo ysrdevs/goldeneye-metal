@@ -7,8 +7,9 @@ backend, and game integration in one tree.
 > [!WARNING]
 > The macOS build is not fully playable yet. The strict native path now reaches a clean Dam
 > briefing and fully rendered first-mission gameplay through real Metal draws, resolves, and
-> swaps. A deterministic input-only diagnostic performs the menu route, but physical native
-> gameplay input still needs live validation. Correct dynamic Dam captures have now displayed
+> swaps. Native keyboard/mouse events now have controller-state regression coverage and a
+> double-click launcher, but physical Dam gameplay still needs final live validation. Correct
+> dynamic Dam captures have now displayed
 > 46.5 and 60.0 FPS, but not every view sustains 60 FPS; broader-scene pacing plus important
 > depth/MSAA fidelity gaps remain.
 
@@ -106,6 +107,23 @@ thirdparty/                     Pinned source dependencies managed as Git submod
 `vendor/GoldenEye-Recomp` is an ordinary source directory, not another repository or submodule.
 Generated recompilation output and game data remain local and are ignored by Git.
 
+## Launch on macOS
+
+After building the game once, double-click
+[Launch GoldenEye.command](<Launch GoldenEye.command>) in Finder. The launcher:
+
+- finds the game-data folder through the local code-generation XEX link, a saved folder,
+  or a Finder folder picker;
+- validates that `default.xex` and `files/` are present without copying game data into the repo;
+- selects native Metal and enables the macOS keyboard/mouse controller path; and
+- clears unattended input diagnostics before starting an interactive session.
+
+WASD moves, Space is A, Shift is B, Return is Start, and Escape opens the host settings menu.
+Mouse movement looks, left click fires, and right click aims. The settings menu releases the
+cursor; its Controls page changes the bindings and mouse sensitivity consumed by the macOS input
+driver. The launcher remembers a manually selected game-data folder under
+`~/Library/Application Support/GoldenEye Metal/`.
+
 ## Build on Apple Silicon
 
 ### Requirements
@@ -160,17 +178,18 @@ against your complete authorized game-data directory, which must include `defaul
 and the companion title data:
 
 ```sh
-REX_MNK_MODE=true REX_KEYBIND_START=Return \
+REX_MNK_MODE=true \
 ./vendor/GoldenEye-Recomp/out/build/macos-arm64-release/GoldenEye \
   --game_data_root /absolute/path/to/complete/game-data \
   --gpu metal
 ```
 
-Keyboard/mouse controller emulation is opt-in. Space is A, Shift is B, WASD is the left stick,
+Keyboard/mouse controller emulation is opt-in for manual launches; the Finder launcher enables it
+automatically. Space is A, Shift is B, WASD is the left stick,
 the arrow keys are the D-pad, the mouse is the right stick, and its left/right buttons are the
-right/left triggers. Start is rebound to Return above because the default Escape binding also
-opens the host pause overlay. Add `--input_backend sdl` instead when testing with a compatible
-controller. The unattended input diagnostic in
+right/left triggers. Start defaults to Return on macOS because Escape opens the host pause overlay.
+Add `--input_backend sdl` when testing with a compatible controller;
+keyboard/mouse input may remain enabled alongside it. The unattended input diagnostic in
 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) remains useful for repeatable rendering captures.
 
 These commands build the current first-gameplay-reaching prototype; they do not imply fully

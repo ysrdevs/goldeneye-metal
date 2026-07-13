@@ -110,6 +110,11 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// Called before cleanup begins. Release custom resources here.
   virtual void OnShutdown() {}
 
+  /// Whether controller input should currently reach the guest. Applications
+  /// with their own modal UI can override this to release mouse capture and
+  /// prevent UI key presses from leaking into gameplay.
+  virtual bool IsInputActive() const { return true; }
+
   /// Called after path defaults are computed, before Runtime is constructed.
   /// Override to adjust game/user/update data paths programmatically.
   virtual void OnConfigurePaths(PathConfig& paths) { (void)paths; }
@@ -192,8 +197,13 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// Persist current cvar values to the app config file (e.g. ge.toml).
   void PersistConfig();
 
+  /// Reconcile capture-based input immediately after IsInputActive changes.
+  /// This avoids waiting for the next guest poll when a host menu opens.
+  void NotifyInputActiveChanged();
+
  private:
   std::function<void(PathConfig)> MakeResumeCallback();
+  bool IsEffectiveInputActive() const;
 
   // WindowedApp overrides
   bool OnInitialize() override;

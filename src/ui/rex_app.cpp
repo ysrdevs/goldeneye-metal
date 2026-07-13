@@ -200,6 +200,12 @@ bool ReXApp::SetupEnvironment() {
   if (std::filesystem::exists(config_path_))
     rex::cvar::LoadConfig(config_path_);
 
+  // Environment variables are explicit per-launch overrides. They are applied
+  // once by the platform entry point so path cvars are available above, then
+  // again after the persisted config so a launcher can reliably select a
+  // graphics or input mode without requiring a pre-existing config edit.
+  rex::cvar::ApplyEnvironment();
+
   // Late-phase logging
   std::string log_file_cvar = REXCVAR_GET(log_file);
   std::string log_level_str = REXCVAR_GET(log_level);
@@ -296,16 +302,7 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
   if (imgui_drawer_) {
     auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
     if (input_sys) {
-      input_sys->SetActiveCallback([this]() {
-        // Don't feed input to an unfocused window (e.g. a second local instance
-        // when testing online) -- otherwise one gamepad drives every instance.
-        if (window_ && !window_->HasFocus()) {
-          return false;
-        }
-        if (!debug_overlay_ && !console_overlay_ && !settings_overlay_)
-          return true;
-        return !imgui_drawer_->GetIO().WantCaptureMouse;
-      });
+      input_sys->SetActiveCallback([this]() { return IsEffectiveInputActive(); });
     }
   }
 
@@ -478,6 +475,7 @@ bool ReXApp::SetupPresentation() {
             debug_overlay_ = std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(),
                                                                       frame_stats_provider_);
           }
+          NotifyInputActiveChanged();
         });
         rex::ui::RegisterBind("bind_console", "Backtick", "Toggle console overlay", [this] {
           if (console_overlay_) {
@@ -485,6 +483,7 @@ bool ReXApp::SetupPresentation() {
           } else {
             console_overlay_ = std::make_unique<ui::ConsoleDialog>(imgui_drawer_.get(), log_sink_);
           }
+          NotifyInputActiveChanged();
         });
         rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay", [this] {
           if (settings_overlay_) {
@@ -493,6 +492,7 @@ bool ReXApp::SetupPresentation() {
             settings_overlay_ =
                 std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
           }
+          NotifyInputActiveChanged();
         });
 
         OnCreateDialogs(imgui_drawer_.get());
@@ -594,8 +594,25 @@ void ReXApp::OnDestroy() {
   if (window_) {
     window_->SetPresenter(nullptr);
   }
+  auto* input_system = runtime_ && runtime_->input_system()
+                           ? static_cast<rex::input::InputSystem*>(runtime_->input_system())
+                           : nullptr;
+  if (input_system) {
+    // Prevent a final guest poll from recapturing the mouse while shutdown is
+    // waiting for that guest thread to exit.
+    input_system->NotifyInputActiveChanged(false);
+  }
+  // Release a guest thread waiting for a queued UI-thread transition before
+  // waiting for the guest itself. A poll may have queued one while the
+  // application-specific shutdown hook was running.
+  app_context().ExecutePendingFunctionsFromUIThread();
   if (module_thread_.joinable()) {
     module_thread_.join();
+  }
+  if (input_system) {
+    // Some quit paths (including in-game restart) do not request a native
+    // window close. Detach drivers explicitly while their Window is alive.
+    input_system->DetachWindow();
   }
   if (window_) {
     window_->RemoveInputListener(this);
@@ -616,6 +633,29 @@ void ReXApp::PersistConfig() {
   if (!config_path_.empty()) {
     rex::cvar::SaveConfig(config_path_);
   }
+}
+
+void ReXApp::NotifyInputActiveChanged() {
+  if (!runtime_ || !runtime_->input_system()) {
+    return;
+  }
+  static_cast<rex::input::InputSystem*>(runtime_->input_system())
+      ->NotifyInputActiveChanged(IsInputActive());
+}
+
+bool ReXApp::IsEffectiveInputActive() const {
+  // Don't feed input to an unfocused window (e.g. a second local instance when
+  // testing online) -- otherwise one gamepad drives every instance.
+  if (window_ && !window_->HasFocus()) {
+    return false;
+  }
+  if (!IsInputActive()) {
+    return false;
+  }
+  if (!debug_overlay_ && !console_overlay_ && !settings_overlay_) {
+    return true;
+  }
+  return imgui_drawer_ && !imgui_drawer_->GetIO().WantCaptureMouse;
 }
 
 }  // namespace rex

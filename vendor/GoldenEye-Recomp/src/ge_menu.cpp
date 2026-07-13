@@ -94,7 +94,47 @@ struct KeyBind {
   const char* label;
   const char* cvar;
 };
-// Order = display order. Right-stick (look) is the mouse, so it is not here.
+
+#if defined(__APPLE__)
+constexpr const char* kMouseSensitivityCvar = "mnk_sensitivity";
+constexpr const char* kMouseEnableCvar = "mnk_mouse_enabled";
+constexpr float kMouseSensitivityMin = 0.05f;
+constexpr float kMouseSensitivityMax = 10.0f;
+
+// macOS input is delivered by the common native keyboard/mouse driver.
+// Keep this menu pointed at the cvars that driver actually consumes.
+constexpr KeyBind kBinds[] = {
+    {"Move Forward", "keybind_lstick_up"},
+    {"Move Back", "keybind_lstick_down"},
+    {"Move Left", "keybind_lstick_left"},
+    {"Move Right", "keybind_lstick_right"},
+    {"A", "keybind_a"},
+    {"B", "keybind_b"},
+    {"X", "keybind_x"},
+    {"Y", "keybind_y"},
+    {"Left Trigger", "keybind_left_trigger"},
+    {"Right Trigger", "keybind_right_trigger"},
+    {"Left Bumper", "keybind_left_shoulder"},
+    {"Right Bumper", "keybind_right_shoulder"},
+    {"Left Stick (L3)", "keybind_lstick_press"},
+    {"Right Stick (R3)", "keybind_rstick_press"},
+    {"D-Pad Up", "keybind_dpad_up"},
+    {"D-Pad Down", "keybind_dpad_down"},
+    {"D-Pad Left", "keybind_dpad_left"},
+    {"D-Pad Right", "keybind_dpad_right"},
+    {"Start", "keybind_start"},
+    {"Back", "keybind_back"},
+    {"Look Up", "keybind_rstick_up"},
+    {"Look Down", "keybind_rstick_down"},
+    {"Look Left", "keybind_rstick_left"},
+    {"Look Right", "keybind_rstick_right"},
+};
+#else
+constexpr const char* kMouseSensitivityCvar = "ge_mouse_sens";
+constexpr const char* kMouseEnableCvar = "ge_mouselook_enable";
+constexpr float kMouseSensitivityMin = 0.05f;
+constexpr float kMouseSensitivityMax = 20.0f;
+
 constexpr KeyBind kBinds[] = {
     {"Move Forward", "ge_key_mv_up"},   {"Move Back", "ge_key_mv_down"},
     {"Move Left", "ge_key_mv_left"},    {"Move Right", "ge_key_mv_right"},
@@ -109,6 +149,7 @@ constexpr KeyBind kBinds[] = {
     {"Look Up", "ge_key_look_up"},      {"Look Down", "ge_key_look_down"},
     {"Look Left", "ge_key_look_left"},  {"Look Right", "ge_key_look_right"},
 };
+#endif
 
 // Map an ImGui key to a Windows virtual-key code (== rex VirtualKey value).
 int ImGuiKeyToVk(ImGuiKey k) {
@@ -632,13 +673,17 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
       ImGui::TextColored(ImColor(kTitle), "MOUSE LOOK");
       ImGui::Spacing();
 
-      // Mouse sensitivity -- live (the look hooks read ge_mouse_sens each frame);
-      // persisted to ge.toml on release so it survives a restart.
-      float sens = GetCvarF("ge_mouse_sens");
-      if (ImGui::SliderFloat("Mouse Sensitivity", &sens, 0.05f, 20.0f, "%.2f")) {
-        if (sens < 0.05f) sens = 0.05f;
-        if (sens > 20.0f) sens = 20.0f;
-        SetCvarF("ge_mouse_sens", sens);
+      // Sensitivity is live and persisted on release. On macOS this controls
+      // the native MnK right-stick mapping; other platforms keep the direct
+      // GoldenEye mouse-look hook.
+      float sens = GetCvarF(kMouseSensitivityCvar);
+      if (ImGui::SliderFloat("Mouse Sensitivity", &sens, kMouseSensitivityMin, kMouseSensitivityMax,
+                             "%.2f")) {
+        if (sens < kMouseSensitivityMin)
+          sens = kMouseSensitivityMin;
+        if (sens > kMouseSensitivityMax)
+          sens = kMouseSensitivityMax;
+        SetCvarF(kMouseSensitivityCvar, sens);
       }
       if (ImGui::IsItemDeactivatedAfterEdit() && callbacks_.persist_config)
         callbacks_.persist_config();
@@ -648,9 +693,9 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
       // Mouse-look toggle. ON: the mouse looks (on top of the controller -- both
       // work at once) and the cursor is captured in-game. OFF: controller only,
       // cursor free.
-      bool ml = GetCvarB("ge_mouselook_enable");
+      bool ml = GetCvarB(kMouseEnableCvar);
       if (ImGui::Checkbox("Mouse look", &ml)) {
-        SetCvarB("ge_mouselook_enable", ml);
+        SetCvarB(kMouseEnableCvar, ml);
         if (callbacks_.persist_config) callbacks_.persist_config();
       }
       ImGui::TextColored(ImColor(kInkDim),

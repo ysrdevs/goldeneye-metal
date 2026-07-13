@@ -14,6 +14,7 @@
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
+#include <atomic>
 #include <string>
 
 #include "ge_menu.h"
@@ -82,6 +83,8 @@ class GeApp : public rex::ReXApp {
 
   // Tear down the menu, overlay and keybind before the drawer is destroyed.
   void OnShutdown() override {
+    input_suppressed_.store(true, std::memory_order_release);
+    NotifyInputActiveChanged();
     rex::ui::UnregisterBind("bind_pause_menu");
     if (menu_) {
       // Direct delete (not Close()) so we don't re-enter pause bookkeeping
@@ -93,6 +96,8 @@ class GeApp : public rex::ReXApp {
   }
 
  private:
+  bool IsInputActive() const override { return !input_suppressed_.load(std::memory_order_acquire); }
+
   // ESC handler: open or close the menu. The game keeps running underneath.
   void TogglePauseMenu() {
     if (menu_) {
@@ -102,6 +107,8 @@ class GeApp : public rex::ReXApp {
     GeMenuDialog::Callbacks cb;
     cb.on_closed = [this] {
       menu_ = nullptr;
+      input_suppressed_.store(false, std::memory_order_release);
+      NotifyInputActiveChanged();
       ge::SetMouselookSuppressed(false);  // re-enable mouse-look on menu close
     };
     cb.on_quit = [this] {
@@ -138,10 +145,13 @@ class GeApp : public rex::ReXApp {
         app_context().QuitFromUIThread();
       });
     };
+    input_suppressed_.store(true, std::memory_order_release);
+    NotifyInputActiveChanged();
     ge::SetMouselookSuppressed(true);  // freeze mouse-look while the menu is up
     menu_ = new GeMenuDialog(imgui_drawer(), std::move(cb));
   }
 
+  std::atomic<bool> input_suppressed_{false};
   GeMenuDialog* menu_ = nullptr;  // non-owning; self-deletes via the drawer
   std::unique_ptr<ge::PostFxOverlay> postfx_;       // always-on filter layer
 };

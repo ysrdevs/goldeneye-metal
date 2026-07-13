@@ -39,6 +39,12 @@ class InputDriver {
                                 X_INPUT_KEYSTROKE* out_keystroke) = 0;
 
   virtual void OnWindowAvailable(rex::ui::Window* /*window*/) {}
+  virtual void OnWindowUnavailable() {}
+
+  // Called when a host UI changes whether input should reach the guest. Most
+  // drivers only need the polling callback below; capture-based drivers can
+  // use this notification to release platform state immediately.
+  virtual void OnInputActiveChanged(bool /*active*/) {}
 
   void set_is_active_callback(std::function<bool()> is_active_callback) {
     is_active_callback_ = is_active_callback;

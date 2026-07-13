@@ -112,6 +112,10 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
 }
 
 void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
+  OnWindowUnavailable();
+}
+
+void SDLInputDriver::OnWindowUnavailable() {
   if (attached_window_) {
     attached_window_->RemoveListener(this);
     if (sdl_pumpevents_queued_) {

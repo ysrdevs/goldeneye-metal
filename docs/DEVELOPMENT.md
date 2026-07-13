@@ -70,11 +70,15 @@ The Cocoa window delivers physical key down/up events, buttons, wheel input, and
 relative mouse motion to the common keyboard/mouse input driver. Hidden capture disassociates the
 pointer so mouse-look is not clamped by a screen edge, and focus loss or teardown restores the
 system cursor. Modifier `FlagsChanged` events never query AppKit's key-down-only repeat state; a
-focused regression covers their previous-state delivery. Enable controller emulation explicitly
-and move Start away from Escape, which is also the host pause-overlay shortcut:
+focused regression covers their previous-state delivery.
+
+For an ordinary interactive run, double-click `Launch GoldenEye.command` at the repository root.
+It finds a game-data folder, checks the minimum `default.xex` plus `files/` layout, supplies the
+local runtime-library path, selects Metal, enables MnK, and clears inherited auto-input
+diagnostics. Manual launches can enable the same path explicitly:
 
 ```sh
-REX_MNK_MODE=true REX_KEYBIND_START=Return \
+REX_MNK_MODE=true \
 ./vendor/GoldenEye-Recomp/out/build/macos-arm64-release/GoldenEye \
   --game_data_root /absolute/path/to/complete/game-data \
   --gpu metal
@@ -82,7 +86,14 @@ REX_MNK_MODE=true REX_KEYBIND_START=Return \
 
 The default gameplay bindings include Space for A, Shift for B, WASD for the left stick, the arrow
 keys for the D-pad, mouse motion for the right stick, and left/right mouse buttons for the
-right/left triggers. A compatible controller remains available through `--input_backend sdl`.
+right/left triggers. Start defaults to Return on macOS because Escape opens the host pause menu. A
+compatible controller remains available through `--input_backend sdl`.
+The host pause menu suppresses guest input and releases native mouse capture immediately, even
+between guest polls. On macOS its Controls page edits the common MnK bindings and sensitivity that
+are actually consumed at runtime, including optional keyboard right-stick directions. Per-launch
+environment cvars are reapplied after saved configuration, so the launcher's Metal, MnK, and
+canonical game-data selections remain authoritative for the session and for an in-game restart.
+Saving settings may also preserve non-default launcher choices in the local ignored `ge.toml`.
 The native input route is normal runtime input; it does not alter guest state or the graphics path.
 
 ## Tests
@@ -95,6 +106,12 @@ cover full and partial rectangles across all four 128-bit endian modes.
 direct Metal texture decoder. It covers valid linear and tiled spans, an exact physical-memory
 boundary, arithmetic overflow, and the 8192x8191 out-of-range descriptor observed during the first
 Dam transition. It requires no game data or Metal device.
+
+The MnK unit regressions feed native-style key, modifier, relative-motion, and button events into
+the real controller driver. They verify WASD, Shift/Return, mouse axes and triggers, optional
+keyboard right-stick binds, comma-separated alternative binds, modal suppression, and focus-loss
+clearing. Separate CTest entries check the Finder launcher's shell syntax and exercise canonical
+game-data discovery, environment precedence, paths with spaces, and diagnostic cleanup.
 
 `metal_pipeline_probe_test` renders through an externally owned Metal vertex buffer, samples a
 single-layer `texture2d_array`, expands a four-vertex fan through a six-entry index buffer, checks
@@ -135,7 +152,7 @@ hidden without changing execution.
 | `GOLDENEYE_AUTO_START=menu` | Use the periodic schedule until 19 seconds, then stop before the 20-second retry so it does not immediately leave a newly reached dossier menu |
 | `GOLDENEYE_AUTO_MISSION=dam` | After a 22-second dossier delay, traverse the default route into Dam using ordinary controller input contributions |
 | `REX_MNK_MODE=true` | Enable keyboard/mouse controller emulation; required for native keyboard gameplay input |
-| `REX_KEYBIND_START=Return` | Avoid the default Escape collision with the host pause overlay while using keyboard input |
+| `REX_KEYBIND_START=Return` | Explicitly override Start to Return; this is already the macOS default |
 | `REX_METAL_SHOW_FPS=false` | Hide the default-on presenter FPS overlay; its value counts guest front-buffer deliveries, not host repaints |
 | `GOLDENEYE_METAL_PROFILE=1` | Emit low-overhead command, `WAIT_REG_MEM`, wait-reason, texture-fallback, and presenter ledgers in complete 64-swap/attempt windows |
 | `GOLDENEYE_METAL_GPU_TILED_RESOLVE=0` | Disable the default GPU tiled-write resolve path for CPU-fallback comparison |

@@ -1,6 +1,6 @@
 # GoldenEye native Metal project status
 
-Last updated: 2026-07-12
+Last updated: 2026-07-13
 
 ## Goal
 
@@ -108,12 +108,17 @@ Native macOS input now uses a first-responder Cocoa content view and forwards ph
 key up, repeat, character, modifier, mouse button, wheel, and relative-motion events through the
 common `Window` input path. Hidden mouse capture is unbounded and restored on focus loss or
 teardown. The existing keyboard/mouse controller driver consumes those events when
-`REX_MNK_MODE=true`; focused tests cover key translation and explicit relative-motion delivery.
+`REX_MNK_MODE=true`; focused tests now feed native-style events through that real driver and verify
+WASD, Shift/Return, mouse axes/buttons, keyboard right-stick binds, modal suppression, and focus
+loss. A root Finder launcher discovers game data, checks the minimum required layout, selects
+Metal, enables MnK, and removes inherited unattended input diagnostics. The GoldenEye pause menu
+releases native capture, and its macOS Controls page now edits the common-driver cvars it actually
+consumes.
 Modifier `FlagsChanged` events avoid AppKit's key-down-only repeat selector, with a focused
 regression for their previous-state delivery.
-Start should be rebound from Escape to Return during MnK runs because Escape also opens the host
-pause overlay. This is a real input path, not a guest-state or menu-selection diagnostic. Physical
-navigation and gameplay control remain to be validated end to end.
+Start defaults to Return on macOS because Escape also opens the host pause overlay. This is a real
+input path, not a guest-state or menu-selection diagnostic. Physical navigation and gameplay
+control remain to be validated end to end.
 
 Metal now maps the guest's polygon cull-front, cull-back, and front-face winding state to the
 render encoder. Point, line, and rectangle expansion routes remain uncullable, and fully culled
@@ -264,6 +269,9 @@ longer blocked on that sequence.
 - Correct nanosecond POSIX clock frequency with unit regression coverage
 - Default-on guest-delivery FPS overlay, disableable with `REX_METAL_SHOW_FPS=false`
 - Native Cocoa keyboard and relative-mouse delivery through the common controller driver
+- Double-click macOS launcher with local game-data discovery, minimum-layout validation, and
+  automatic Metal/MnK selection
+- Controller-state input regressions plus pause-menu capture suppression and runtime macOS rebinding
 - Guest polygon cull mode and front-face winding with focused Metal regression coverage
 - Persistent per-context Metal depth/stencil state with ordered depth and stencil probe coverage
 - Stable-drain guest-watchdog timing with a zero-hang 74-second swap-4416 live proof
@@ -308,9 +316,10 @@ completion or display latency.
 
 Physical native input is the next validation boundary after that performance pass. The macOS
 window forwards keyboard and mouse events into the existing controller driver, and focused tests
-cover the host delivery path. The deterministic mission injector proves that ordinary controller
-edges can traverse the complete route, but it does not prove a person can navigate, control Bond,
-pause, resume, and recover focus through the native keyboard/mouse path.
+cover both host delivery and resulting controller state. The launcher and pause-menu integration
+remove the known configuration/capture gaps. The deterministic mission injector proves that
+ordinary controller edges can traverse the complete route, but a person still needs to confirm
+navigation, sustained Bond control, pause/resume, and focus recovery through the physical path.
 
 The remaining graphics risk is the next layer of fixed-function fidelity. Live viewport/scissor,
 current host-context ownership, the observed banded copy sequence, the title's two blend modes,
