@@ -261,6 +261,15 @@ int main(int argc, char** argv) {
         result = EXIT_SUCCESS;
       }
 
+      if (app->RequiresImmediateProcessExit()) {
+        // The accepted NSWindow close has already restored cursor and native
+        // window state. An active guest on macOS uses asynchronous thread
+        // cancellation, which may orphan non-robust mutexes and deadlock C++
+        // teardown. End at the process boundary before invoking destructors;
+        // macOS releases the remaining audio, Metal and thread resources.
+        std::_Exit(result);
+      }
+
       app->InvokeOnDestroy();
 
       // NSApplication doesn't own its delegate. Detach the raw C++ pointer

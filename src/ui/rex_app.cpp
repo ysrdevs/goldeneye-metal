@@ -593,20 +593,39 @@ void ReXApp::RequestShutdown() {
     // Keep this fallback orderly and idempotent as well.
     REXLOG_INFO("Application shutting down...");
     shutting_down_.store(true, std::memory_order_release);
+#if REX_PLATFORM_MAC
+    // macOS can't recover ordinary mutexes owned by a guest thread stopped via
+    // asynchronous pthread cancellation. Let the native entry point finish
+    // the accepted close event and end the process at the OS boundary instead
+    // of destructing a runtime containing potentially orphaned locks.
+    immediate_process_exit_.store(true, std::memory_order_release);
+#else
     if (runtime_ && runtime_->kernel_state()) {
       runtime_->kernel_state()->TerminateTitle();
     }
+#endif
     app_context().QuitFromUIThread();
   });
+}
+
+bool ReXApp::RequiresImmediateProcessExit() const {
+  return immediate_process_exit_.load(std::memory_order_acquire);
 }
 
 void ReXApp::OnClosing(ui::UIEvent& e) {
   (void)e;
   REXLOG_INFO("Window closing, shutting down...");
   shutting_down_.store(true, std::memory_order_release);
+#if REX_PLATFORM_MAC
+  // See RequestShutdown. RequestCloseImpl will restore native cursor/window
+  // state after this callback returns; the macOS main then exits the process
+  // before unsafe guest-runtime destruction begins.
+  immediate_process_exit_.store(true, std::memory_order_release);
+#else
   if (runtime_ && runtime_->kernel_state()) {
     runtime_->kernel_state()->TerminateTitle();
   }
+#endif
   app_context().QuitFromUIThread();
 }
 

@@ -136,9 +136,14 @@ and DMG notarization/stapling, Gatekeeper checks, and atomic publication of the 
 Those Apple signing, notarization, and DMG operations remain release-owner steps and have not been
 executed as part of this milestone. The custom AppKit loop now installs a standard application and
 Window menu, finishes native launch registration, and routes Command-Q, Command-W, Dock Quit, menu
-Quit, and the close button through the same guest-termination path. The in-game menu's Quit and
-restart actions use that path as well. An isolated first-run process test delivered a real macOS
-Quit event and observed the process exit in approximately 100 ms.
+Quit, and the close button through one accepted-close path. The in-game menu's Quit and restart
+actions use that path as well. Live gameplay sampling exposed an important macOS runtime boundary:
+asynchronously cancelling guest threads can strand ordinary event mutexes that macOS cannot
+recover, leaving GPU, audio, timer, and object-table workers deadlocked during C++ teardown. Active
+titles therefore finish native window and cursor cleanup, then exit at the process boundary before
+that unsafe teardown begins. A cached-game reproduction that previously remained hung after eight
+seconds now removed the process before the first 10 ms poll after a real macOS Quit event. Setup and
+initialization paths without an active title retain normal in-process destruction.
 
 Modern controller input now follows the native SDL gamepad path by default on macOS and is selected
 explicitly by the Finder launcher. SDL's bundled mappings cover DualShock 4, DualSense, Xbox One,
@@ -306,8 +311,8 @@ longer blocked on that sequence.
 - Hot-plug, four-slot compaction, fifth-pad promotion, focus-safe rumble, and virtual-device tests
 - Native macOS application launcher with exact local ZIP/STFS validation, safe atomic import,
   remembered game data, and automatic Metal/controller/MnK selection
-- Standard macOS Command-Q, Command-W, menu, Dock, and window-button shutdown routed through one
-  orderly guest-termination path
+- Standard macOS Command-Q, Command-W, menu, Dock, and window-button shutdown without a lingering
+  unresponsive process
 - Reproducible unsigned app build plus release-owner signing/notarization scripts with pinned
   macOS-14 SPIRV-Cross, stapled ZIP/DMG output, and fail-safe artifact publication
 - Build-tree `.command` launcher for local developer runs

@@ -228,6 +228,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
 
   // WindowedApp overrides
   bool OnInitialize() override;
+  bool RequiresImmediateProcessExit() const override;
   void OnDestroy() override;
 
   // WindowListener overrides
@@ -247,6 +248,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::unique_ptr<ui::Window> window_;
   std::thread module_thread_;
   std::atomic<bool> shutting_down_{false};
+  std::atomic<bool> immediate_process_exit_{false};
   std::unique_ptr<ui::ImmediateDrawer> immediate_drawer_;
   std::unique_ptr<ui::ImGuiDrawer> imgui_drawer_;
 

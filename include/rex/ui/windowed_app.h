@@ -76,6 +76,13 @@ class WindowedApp {
   // been initialized successfully (otherwise platform-specific code must call
   // OnDestroy and refuse to continue running the app).
   virtual bool OnInitialize() = 0;
+
+  // Some platform runtimes can't safely destroy an active guest in-process.
+  // Returning true asks the platform entry point to end the process after its
+  // native event loop has finished the accepted close request, without
+  // invoking OnDestroy or C++ object destructors.
+  virtual bool RequiresImmediateProcessExit() const { return false; }
+
   // See OnDestroy for more info.
   void InvokeOnDestroy() {
     // For safety and convenience of referencing objects owned by the app in
