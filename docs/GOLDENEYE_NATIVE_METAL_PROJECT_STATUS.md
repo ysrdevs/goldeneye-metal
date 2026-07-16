@@ -120,8 +120,8 @@ Start defaults to Return on macOS because Escape also opens the host pause overl
 input path, not a guest-state or menu-selection diagnostic. Physical navigation and gameplay
 control remain to be validated end to end.
 
-The release path now also produces a normal unsigned `GoldenEye Metal.app` with a native first-run
-setup window and original icon. A player can select a compatible local backup ZIP, its Xbox
+The release path now also produces a normal `GoldenEye Metal.app` with a native first-run setup
+window and original icon. A player can select a compatible local backup ZIP, its Xbox
 LIVE/STFS package, or an extracted folder. The importer hashes the complete package before the
 general container parser sees it, accepts only the supported title revision, rejects unsafe or
 case-colliding paths and unexpected size/count/depth, streams into a private staging directory,
@@ -133,9 +133,10 @@ route for better read performance. The older `.command` launcher remains a build
 convenience. `launcher/build-app.sh` now builds an audited macOS-14-compatible SPIRV-Cross copy and
 verifies the unsigned bundle. `tools/sign-notarize.sh` automates nested Developer ID signing, app
 and DMG notarization/stapling, Gatekeeper checks, and atomic publication of the final ZIP and DMG.
-Those Apple signing, notarization, and DMG operations remain release-owner steps and have not been
-executed as part of this milestone. The custom AppKit loop now installs a standard application and
-Window menu, finishes native launch registration, and routes Command-Q, Command-W, Dock Quit, menu
+The public v0.1.0 DMG and application have completed Developer ID signing, Apple notarization, and
+stapling. Those operations remain release-owner steps for future releases. The custom AppKit loop
+now installs standard application and Window menus, finishes native launch registration, and
+routes Command-Q, Command-W, Dock Quit, menu
 Quit, and the close button through one accepted-close path. The in-game menu's Quit and restart
 actions use that path as well. Live gameplay sampling exposed an important macOS runtime boundary:
 asynchronously cancelling guest threads can strand ordinary event mutexes that macOS cannot
@@ -342,7 +343,7 @@ longer blocked on that sequence.
 | E. Recognizable menu | Passed | Corrected-clock 1280x720 captures present the real dossier menu through the strict path; short samples reported 30.0 and 59.9 guest-delivered FPS |
 | F. Sustained title execution | Passed | WPTR >1088 and normal `IssueSwap` at least 4416 without scavenging, replay, forced presentation, false GPU-hang dumps, or debug traps |
 | G. First mission gameplay | Passed for deterministic input | The input-only route reaches a clean Dam briefing and fully rendered dynamic gameplay; correct captures have displayed 46.5 and 60.0 FPS, but sustained 60 across broader views remains in progress |
-| H. Native player launcher | Passed unsigned | The arm64 `.app` stages with portable runtime linkage, icon, metadata, and notices without copying an XEX, extracted assets, or standalone game-data files; the exact supported LIVE/STFS package imports and validates all 1,803 title files through the same backend used by the first-run UI |
+| H. Native player launcher | Passed in v0.1.0 | The signed and notarized arm64 `.app` ships with portable runtime linkage, icon, metadata, and notices without copying an XEX, extracted assets, or standalone game-data files; the exact supported LIVE/STFS package imports and validates all 1,803 title files through the same backend used by the first-run UI |
 
 ## Primary blocker
 
