@@ -74,11 +74,11 @@ focused regression covers their previous-state delivery.
 
 For an ordinary interactive run, double-click `Launch GoldenEye.command` at the repository root.
 It finds a game-data folder, checks the minimum `default.xex` plus `files/` layout, supplies the
-local runtime-library path, selects Metal, enables MnK, and clears inherited auto-input
-diagnostics. Manual launches can enable the same path explicitly:
+local runtime-library path, selects Metal, enables SDL gamepads and MnK together, and clears
+inherited auto-input diagnostics. Manual launches can enable the same path explicitly:
 
 ```sh
-REX_MNK_MODE=true \
+REX_INPUT_BACKEND=sdl REX_MNK_MODE=true \
 ./vendor/GoldenEye-Recomp/out/build/macos-arm64-release/GoldenEye \
   --game_data_root /absolute/path/to/complete/game-data \
   --gpu metal
@@ -86,8 +86,17 @@ REX_MNK_MODE=true \
 
 The default gameplay bindings include Space for A, Shift for B, WASD for the left stick, the arrow
 keys for the D-pad, mouse motion for the right stick, and left/right mouse buttons for the
-right/left triggers. Start defaults to Return on macOS because Escape opens the host pause menu. A
-compatible controller remains available through `--input_backend sdl`.
+right/left triggers. Start defaults to Return on macOS because Escape opens the host pause menu.
+
+The SDL gamepad backend is the runtime default. SDL's bundled mappings normalize DualShock 4,
+DualSense, Xbox One, and Xbox Series X|S pads to the guest's XInput-style state over the USB and
+Bluetooth transports exposed by macOS. Attach and removal events are handled at runtime, slots
+stay compact from player 1 through player 4, and an ignored fifth controller is promoted when a
+slot opens. Focus loss or a host overlay stops active rumble. The SDL and MnK drivers merge at the
+input-system boundary, including keystrokes, so enabling controllers does not disable native
+keyboard/mouse control. `REX_HID_MAPPINGS_FILE=/absolute/path/to/mappings.txt` may supply
+additional SDL mappings for an unusual third-party pad; the built-in mappings need no external
+database file.
 The host pause menu suppresses guest input and releases native mouse capture immediately, even
 between guest polls. On macOS its Controls page edits the common MnK bindings and sensitivity that
 are actually consumed at runtime, including optional keyboard right-stick directions. Per-launch
@@ -95,6 +104,19 @@ environment cvars are reapplied after saved configuration, so the launcher's Met
 canonical game-data selections remain authoritative for the session and for an in-game restart.
 Saving settings may also preserve non-default launcher choices in the local ignored `ge.toml`.
 The native input route is normal runtime input; it does not alter guest state or the graphics path.
+
+#### Physical controller acceptance
+
+For each available controller family, test USB and Bluetooth where the hardware supports them:
+
+1. Connect the pad before launch and confirm player 1 works through the title menu and Dam.
+2. Verify every face button, Start/Back, D-pad direction, stick and stick click, bumper, and trigger.
+3. Disconnect and reconnect during play, then repeat by connecting only after the game has started.
+4. Trigger rumble, open the host pause menu, and confirm vibration stops while input is suppressed.
+5. Switch focus away and back, then confirm neutral state, resumed control, and no stuck buttons.
+
+Record the controller model, transport, macOS version, and any missing input or rumble behavior.
+Do not turn a virtual-device pass into a physical-hardware claim.
 
 ## Tests
 
@@ -110,8 +132,13 @@ Dam transition. It requires no game data or Metal device.
 The MnK unit regressions feed native-style key, modifier, relative-motion, and button events into
 the real controller driver. They verify WASD, Shift/Return, mouse axes and triggers, optional
 keyboard right-stick binds, comma-separated alternative binds, modal suppression, and focus-loss
-clearing. Separate CTest entries check the Finder launcher's shell syntax and exercise canonical
-game-data discovery, environment precedence, paths with spaces, and diagnostic cleanup.
+clearing. SDL virtual-gamepad regressions verify representative face-button and D-pad input, both
+sticks and triggers, inactive-state suppression, attach/remove handling, four-slot assignment,
+fifth-pad promotion, reconnect, rumble values, rumble failure propagation, and lifecycle teardown. A
+separate input-system regression ensures an idle SDL pad cannot starve a simultaneous MnK
+keystroke. Separate CTest entries check the Finder launcher's shell syntax and exercise canonical
+game-data discovery, environment precedence, paths with spaces, controller/MnK selection, and
+diagnostic cleanup.
 
 `metal_pipeline_probe_test` renders through an externally owned Metal vertex buffer, samples a
 single-layer `texture2d_array`, expands a four-vertex fan through a six-entry index buffer, checks
@@ -151,7 +178,9 @@ hidden without changing execution.
 | `GOLDENEYE_AUTO_START=periodic` | Use monotonic-time startup input followed by recurring Start pulses for unattended title/menu traversal |
 | `GOLDENEYE_AUTO_START=menu` | Use the periodic schedule until 19 seconds, then stop before the 20-second retry so it does not immediately leave a newly reached dossier menu |
 | `GOLDENEYE_AUTO_MISSION=dam` | After a 22-second dossier delay, traverse the default route into Dam using ordinary controller input contributions |
+| `REX_INPUT_BACKEND=sdl` | Select SDL gamepad input; this is the runtime and Finder-launcher default |
 | `REX_MNK_MODE=true` | Enable keyboard/mouse controller emulation; required for native keyboard gameplay input |
+| `REX_HID_MAPPINGS_FILE=/path/file.txt` | Load additional SDL controller mappings; built-in mappings are used when unset |
 | `REX_KEYBIND_START=Return` | Explicitly override Start to Return; this is already the macOS default |
 | `REX_METAL_SHOW_FPS=false` | Hide the default-on presenter FPS overlay; its value counts guest front-buffer deliveries, not host repaints |
 | `GOLDENEYE_METAL_PROFILE=1` | Emit low-overhead command, `WAIT_REG_MEM`, wait-reason, texture-fallback, and presenter ledgers in complete 64-swap/attempt windows |

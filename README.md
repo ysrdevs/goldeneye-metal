@@ -7,8 +7,9 @@ backend, and game integration in one tree.
 > [!WARNING]
 > The macOS build is not fully playable yet. The strict native path now reaches a clean Dam
 > briefing and fully rendered first-mission gameplay through real Metal draws, resolves, and
-> swaps. Native keyboard/mouse events now have controller-state regression coverage and a
-> double-click launcher, but physical Dam gameplay still needs final live validation. Correct
+> swaps. Native keyboard/mouse and SDL gamepad input now have controller-state regression
+> coverage and a double-click launcher, but physical Dam gameplay still needs final live
+> validation. Correct
 > dynamic Dam captures have now displayed
 > 46.5 and 60.0 FPS, but not every view sustains 60 FPS; broader-scene pacing plus important
 > depth/MSAA fidelity gaps remain.
@@ -115,7 +116,7 @@ After building the game once, double-click
 - finds the game-data folder through the local code-generation XEX link, a saved folder,
   or a Finder folder picker;
 - validates that `default.xex` and `files/` are present without copying game data into the repo;
-- selects native Metal and enables the macOS keyboard/mouse controller path; and
+- selects native Metal, modern controller support, and the macOS keyboard/mouse path; and
 - clears unattended input diagnostics before starting an interactive session.
 
 WASD moves, Space is A, Shift is B, Return is Start, and Escape opens the host settings menu.
@@ -123,6 +124,29 @@ Mouse movement looks, left click fires, and right click aims. The settings menu 
 cursor; its Controls page changes the bindings and mouse sensitivity consumed by the macOS input
 driver. The launcher remembers a manually selected game-data folder under
 `~/Library/Application Support/GoldenEye Metal/`.
+
+### Controllers
+
+The native SDL gamepad path is enabled by default and supports the standard mappings for:
+
+- PlayStation 4 DualShock 4
+- PlayStation 5 DualSense
+- Xbox One controllers
+- Xbox Series X|S controllers
+
+Pair a wireless controller in macOS Bluetooth settings or connect it over USB, then start the
+game. Controllers can be connected or removed while the game is running. The first connected pad
+becomes player 1; the runtime maintains up to four controller slots and promotes a waiting pad if
+a slot becomes free. Keyboard and mouse remain usable at the same time.
+
+Face buttons follow their physical positions: Cross/A is guest A, Circle/B is guest B, Square/X
+is guest X, and Triangle/Y is guest Y. Options/Menu is Start, and the pad's normal select button
+(Share, Create, or View) is Back; extra capture and microphone buttons do not affect gameplay. The
+D-pad, both sticks, stick clicks, bumpers, and triggers use their standard SDL mappings. Rumble is
+forwarded when the controller and its macOS connection expose it. Automated tests cover normalized
+button/axis input, hot-plugging, slot promotion, pause suppression, rumble calls, and simultaneous
+keyboard/controller keystrokes. The USB and Bluetooth hardware matrix still needs physical
+acceptance testing across each controller family.
 
 ## Build on Apple Silicon
 
@@ -178,7 +202,7 @@ against your complete authorized game-data directory, which must include `defaul
 and the companion title data:
 
 ```sh
-REX_MNK_MODE=true \
+REX_INPUT_BACKEND=sdl REX_MNK_MODE=true \
 ./vendor/GoldenEye-Recomp/out/build/macos-arm64-release/GoldenEye \
   --game_data_root /absolute/path/to/complete/game-data \
   --gpu metal
@@ -188,8 +212,8 @@ Keyboard/mouse controller emulation is opt-in for manual launches; the Finder la
 automatically. Space is A, Shift is B, WASD is the left stick,
 the arrow keys are the D-pad, the mouse is the right stick, and its left/right buttons are the
 right/left triggers. Start defaults to Return on macOS because Escape opens the host pause overlay.
-Add `--input_backend sdl` when testing with a compatible controller;
-keyboard/mouse input may remain enabled alongside it. The unattended input diagnostic in
+The SDL controller backend is now the default, and keyboard/mouse input may remain enabled
+alongside it. The unattended input diagnostic in
 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) remains useful for repeatable rendering captures.
 
 These commands build the current first-gameplay-reaching prototype; they do not imply fully

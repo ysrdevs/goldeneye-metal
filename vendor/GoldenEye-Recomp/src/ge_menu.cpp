@@ -670,6 +670,23 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
       break;
     }
     case 2: {  // CONTROLS
+#if defined(__APPLE__)
+      ImGui::TextColored(ImColor(kTitle), "CONTROLLER");
+      ImGui::Spacing();
+      ImGui::PushStyleColor(ImGuiCol_Text, kInkDim);
+      ImGui::TextWrapped(
+          "PS4, PS5, Xbox One and Xbox Series controllers are detected automatically through "
+          "SDL over USB or Bluetooth where supported. Hot-plug is supported, rumble is used when "
+          "available, and keyboard and mouse stay active.");
+      ImGui::TextWrapped(
+          "Use the controller's south face button as A, east as B, west as X, north as Y, and "
+          "Options/Menu as Start. Escape opens these host settings.");
+      ImGui::PopStyleColor();
+      ImGui::Spacing();
+      ImGui::Separator();
+      ImGui::Spacing();
+#endif
+
       ImGui::TextColored(ImColor(kTitle), "MOUSE LOOK");
       ImGui::Spacing();
 

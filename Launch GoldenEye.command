@@ -144,6 +144,7 @@ GAME_DATA_ROOT="$(cd "$GAME_DATA_ROOT" && pwd -P)" ||
   show_error "The game-data folder is no longer available: $GAME_DATA_ROOT"
 
 export REX_GPU="metal"
+export REX_INPUT_BACKEND="sdl"
 export REX_MNK_MODE="true"
 export REX_GAME_DATA_ROOT="$GAME_DATA_ROOT"
 export DYLD_LIBRARY_PATH="$RUNTIME_DIR${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
@@ -155,7 +156,8 @@ unset GOLDENEYE_AUTO_START GOLDENEYE_AUTO_MISSION
 printf '\nGoldenEye Metal\n'
 printf '  Game data: %s (%s)\n' "$GAME_DATA_ROOT" "$GAME_DATA_SOURCE"
 printf '  Defaults:  WASD move | Space A | Shift B | Return Start | Esc settings\n'
-printf '  Mouse:     move to look | left fire | right aim\n\n'
+printf '  Mouse:     move to look | left fire | right aim\n'
+printf '  Controller: PS4, PS5, Xbox One and Xbox Series pads auto-detect\n\n'
 
 if [ "${GOLDENEYE_LAUNCHER_DRY_RUN:-0}" = "1" ]; then
   printf 'Dry run; launch command:\n  '

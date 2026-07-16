@@ -22,7 +22,9 @@ add_executable(unit_tests
     rexglue/migration_scan_test.cpp
     rexglue/ui_test.cpp
     ui/mouse_event_test.cpp
+    input/input_system_test.cpp
     input/mnk_input_driver_test.cpp
+    input/sdl_input_driver_test.cpp
 )
 
 if(APPLE)

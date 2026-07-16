@@ -44,14 +44,15 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
                         X_INPUT_KEYSTROKE* out_keystroke) override;
   void OnWindowAvailable(rex::ui::Window* window) override;
   void OnWindowUnavailable() override;
+  void OnInputActiveChanged(bool active) override;
 
  private:
   struct ControllerState {
-    SDL_Gamepad* sdl;
-    X_INPUT_CAPABILITIES caps;
-    X_INPUT_STATE state;
-    bool state_changed;
-    bool is_active;
+    SDL_Gamepad* sdl = nullptr;
+    X_INPUT_CAPABILITIES caps = {};
+    X_INPUT_STATE state = {};
+    bool state_changed = false;
+    bool is_active = true;
   };
 
   enum class RepeatState {
@@ -78,8 +79,15 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void ProcessEventLocked(const SDL_Event& event);
   void OnControllerDeviceAddedLocked(const SDL_Event& event);
   void OnControllerDeviceRemovedLocked(const SDL_Event& event);
+  void OnControllerDeviceRemappedLocked(const SDL_Event& event);
   void OnControllerDeviceAxisMotionLocked(const SDL_Event& event);
   void OnControllerDeviceButtonChangedLocked(const SDL_Event& event);
+  bool OpenControllerLocked(SDL_JoystickID instance_id);
+  void OpenUnassignedControllersLocked();
+  void CompactControllerSlotsLocked();
+  void RefreshControllerStateLocked(ControllerState& controller);
+  void StopRumble();
+  static bool SDLCALL EventWatch(void* userdata, SDL_Event* event);
 
   inline uint64_t AnalogToKeyfield(const X_INPUT_GAMEPAD& gamepad) const;
   std::optional<size_t> GetControllerIndexFromInstanceID(SDL_JoystickID instance_id);
@@ -91,9 +99,13 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   rex::ui::Window* attached_window_ = nullptr;
   bool sdl_events_initialized_;
   bool SDL_Gamepad_initialized_;
+  bool sdl_event_watch_registered_ = false;
+  std::atomic<bool> ready_{false};
+  std::atomic<bool> accepting_events_{false};
   std::atomic<int> sdl_events_unflushed_;
   std::atomic<bool> sdl_pumpevents_queued_;
   std::array<ControllerState, HID_SDL_USER_COUNT> controllers_;
+  std::mutex lifecycle_mutex_;
   std::mutex controllers_mutex_;
   std::mutex event_queue_mutex_;
   std::vector<SDL_Event> pending_events_;

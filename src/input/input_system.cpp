@@ -22,11 +22,7 @@
 #include <rex/input/xinput/xinput_input_driver.h>
 #include <rex/logging.h>
 
-#if REX_PLATFORM_MAC
-constexpr const char* kDefaultInputBackend = "none";
-#else
 constexpr const char* kDefaultInputBackend = "sdl";
-#endif
 
 REXCVAR_DEFINE_STRING(input_backend, kDefaultInputBackend, "Input",
                       "Input backend: sdl, xinput, none")
@@ -178,7 +174,7 @@ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
     if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
       any_connected = true;
     }
-    if (result == X_ERROR_SUCCESS || result == X_ERROR_EMPTY) {
+    if (result == X_ERROR_SUCCESS) {
       return result;
     }
   }

@@ -1,6 +1,6 @@
 # GoldenEye native Metal project status
 
-Last updated: 2026-07-13
+Last updated: 2026-07-15
 
 ## Goal
 
@@ -119,6 +119,19 @@ regression for their previous-state delivery.
 Start defaults to Return on macOS because Escape also opens the host pause overlay. This is a real
 input path, not a guest-state or menu-selection diagnostic. Physical navigation and gameplay
 control remain to be validated end to end.
+
+Modern controller input now follows the native SDL gamepad path by default on macOS and is selected
+explicitly by the Finder launcher. SDL's bundled mappings cover DualShock 4, DualSense, Xbox One,
+and Xbox Series X|S controllers; no separately downloaded mapping database is required for those
+families. The backend discovers already-connected pads, accepts hot-plug and removal events,
+assigns player 1 first, compacts four guest slots, and promotes a waiting fifth pad. It refreshes
+remapped state, safely ignores stale events, stops rumble on focus/modal loss and teardown, and
+uses SDL's current success semantics for vibration. Controller and MnK drivers remain active
+together, including keystroke delivery. SDL virtual-device tests exercise representative
+normalized input, inactivity/resume, repeated driver teardown, five-pad promotion, reconnect,
+rumble values, and rumble failure propagation. Physical USB and Bluetooth acceptance across at
+least one Sony and one Xbox controller remains a manual validation boundary rather than an
+automated-test claim.
 
 Metal now maps the guest's polygon cull-front, cull-back, and front-face winding state to the
 render encoder. Point, line, and rectangle expansion routes remain uncullable, and fully culled
@@ -269,8 +282,10 @@ longer blocked on that sequence.
 - Correct nanosecond POSIX clock frequency with unit regression coverage
 - Default-on guest-delivery FPS overlay, disableable with `REX_METAL_SHOW_FPS=false`
 - Native Cocoa keyboard and relative-mouse delivery through the common controller driver
+- Default-on SDL gamepad input with built-in PS4, PS5, Xbox One, and Xbox Series mappings
+- Hot-plug, four-slot compaction, fifth-pad promotion, focus-safe rumble, and virtual-device tests
 - Double-click macOS launcher with local game-data discovery, minimum-layout validation, and
-  automatic Metal/MnK selection
+  automatic Metal/controller/MnK selection
 - Controller-state input regressions plus pause-menu capture suppression and runtime macOS rebinding
 - Guest polygon cull mode and front-face winding with focused Metal regression coverage
 - Persistent per-context Metal depth/stencil state with ordered depth and stencil probe coverage
@@ -315,11 +330,13 @@ address/reference/mask/poll condition. The presenter ledger measures CPU submiss
 completion or display latency.
 
 Physical native input is the next validation boundary after that performance pass. The macOS
-window forwards keyboard and mouse events into the existing controller driver, and focused tests
-cover both host delivery and resulting controller state. The launcher and pause-menu integration
-remove the known configuration/capture gaps. The deterministic mission injector proves that
-ordinary controller edges can traverse the complete route, but a person still needs to confirm
-navigation, sustained Bond control, pause/resume, and focus recovery through the physical path.
+window forwards keyboard and mouse events into the existing controller driver, while SDL now
+normalizes modern Sony and Xbox pads into the same guest state. Focused tests cover host MnK
+delivery, controller mapping, hot-plug, slot promotion, rumble, and merged keystrokes. The launcher
+and pause-menu integration remove the known configuration/capture gaps. The deterministic mission
+injector proves that ordinary controller edges can traverse the complete route, but a person still
+needs to confirm navigation, sustained Bond control, pause/resume, focus recovery, and real USB and
+Bluetooth behavior through the physical paths.
 
 The remaining graphics risk is the next layer of fixed-function fidelity. Live viewport/scissor,
 current host-context ownership, the observed banded copy sequence, the title's two blend modes,
@@ -338,8 +355,9 @@ Work in this order:
    shader dumps and verbose diagnostics disabled, and identify which views fall below 60 FPS.
 2. Make tiled resolve submission more asynchronous and reduce the measured `WAIT_REG_MEM` fence
    cost without changing guest-visible ordering, pixels, command provenance, or safety fences.
-3. Navigate into Dam and validate gameplay with physical native keyboard/mouse input, including
-   focus loss, capture recovery, pause, and sustained player control.
+3. Navigate into Dam and validate gameplay with physical native keyboard/mouse input plus one Sony
+   and one Xbox controller over USB and Bluetooth, including hot-plug, rumble, focus loss, capture
+   recovery, pause, and sustained player control.
 4. Route depth-only draws and promote private per-context depth/stencil to guest-addressed shared
    ownership with faithful clear, copy, resolve, readback, and texture-alias behavior.
 5. Implement faithful guest MSAA and remaining polygon fill/depth-bias state, then re-evaluate

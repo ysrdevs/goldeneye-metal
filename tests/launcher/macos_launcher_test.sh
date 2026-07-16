@@ -28,6 +28,7 @@ cat >"$GAME_BINARY" <<'FAKE_GAME'
 #!/bin/bash
 {
   printf 'gpu=%s\n' "${REX_GPU:-}"
+  printf 'input_backend=%s\n' "${REX_INPUT_BACKEND:-}"
   printf 'mnk=%s\n' "${REX_MNK_MODE:-}"
   printf 'game_data_env=%s\n' "${REX_GAME_DATA_ROOT:-}"
   printf 'auto_start=%s\n' "${GOLDENEYE_AUTO_START-unset}"
@@ -44,6 +45,7 @@ chmod +x "$GAME_BINARY"
   HOME="$SANDBOX/home" \
   GOLDENEYE_GAME_DATA_ROOT="./data root" \
   REX_GAME_DATA_ROOT="$SANDBOX/wrong data" \
+  REX_INPUT_BACKEND="none" \
   GOLDENEYE_AUTO_START="periodic" \
   GOLDENEYE_AUTO_MISSION="dam" \
   GOLDENEYE_LAUNCHER_TEST_OUTPUT="$RESULT_FILE" \
@@ -54,6 +56,7 @@ chmod +x "$GAME_BINARY"
 
 EXPECTED_ROOT="$SANDBOX/data root"
 grep -Fqx 'gpu=metal' "$RESULT_FILE" || fail "Metal was not selected"
+grep -Fqx 'input_backend=sdl' "$RESULT_FILE" || fail "SDL controller input was not enabled"
 grep -Fqx 'mnk=true' "$RESULT_FILE" || fail "MnK was not enabled"
 grep -Fqx "game_data_env=$EXPECTED_ROOT" "$RESULT_FILE" ||
   fail "the validated canonical game-data root was not exported"
