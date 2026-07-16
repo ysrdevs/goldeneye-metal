@@ -50,7 +50,7 @@
 namespace ge {
 // Relaunch this same executable as a fresh, detached process. Used by the ONLINE
 // pause-menu tab's "Save & Restart": the new instance reads the just-written
-// ge.toml (new username / server / online-enable) at boot, then the caller tears
+// configuration (new username / server / online-enable) at boot, then the caller tears
 // the current process down. Launching a second instance of a running exe is fine
 // on Windows -- the image file is opened share-read.
 void LaunchSelfDetached() {

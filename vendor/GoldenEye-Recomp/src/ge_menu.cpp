@@ -739,7 +739,7 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
 
       ImGui::TextColored(ImColor(kTitle), "REBIND KEYS");
       ImGui::TextColored(ImColor(kInkDim), "(click a binding, then press the new key; Esc cancels; right-click to unbind)");
-      ImGui::TextColored(ImColor(kInkDim), "(tip: bind multiple keys to one action by comma-separating them in ge.toml, e.g. W,Up)");
+      ImGui::TextColored(ImColor(kInkDim), "(tip: bind multiple keys to one action by comma-separating them in the config file, e.g. W,Up)");
       ImGui::Spacing();
 
       const float btn_w = content_w * 0.34f;

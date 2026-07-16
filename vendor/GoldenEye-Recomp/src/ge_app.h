@@ -18,6 +18,7 @@
 #include <string>
 
 #include "ge_menu.h"
+#include "ge_launcher.h"
 #include "ge_postfx.h"
 
 // Relaunch the current executable as a fresh process (implemented in
@@ -32,25 +33,24 @@ void InitMouseLook();
 // Suppress mouse-look while the pause menu is open (cursor is needed for the
 // menu, and motion shouldn't turn into look). Implemented in ge_hooks.cpp.
 void SetMouselookSuppressed(bool suppressed);
-}
+}  // namespace ge
 
 class GeApp : public rex::ReXApp {
  public:
   using rex::ReXApp::ReXApp;
 
-  static std::unique_ptr<rex::ui::WindowedApp> Create(
-      rex::ui::WindowedAppContext& ctx) {
-    return std::unique_ptr<GeApp>(new GeApp(ctx, "ge",
-        PPCImageConfig));
+  static std::unique_ptr<rex::ui::WindowedApp> Create(rex::ui::WindowedAppContext& ctx) {
+    return std::unique_ptr<GeApp>(new GeApp(ctx, "ge", PPCImageConfig));
   }
 
   // GoldenEye boot defaults. Runs before the config file is loaded, so these
-  // are just defaults -- ge.toml (written by the in-game menu) overrides them.
+  // are just defaults -- the configuration file written by the in-game menu
+  // overrides them.
   void OnConfigurePaths(rex::PathConfig& paths) override {
-    (void)paths;
+    ge::ConfigureLauncherPaths(paths);
     // NOTE: vsync is NOT forced here. Its SDK default is false (off), so the
     // in-menu toggle persists: turning it ON differs from default -> written to
-    // ge.toml; OFF == default -> not written but still boots off. Forcing it here
+    // the config; OFF == default -> not written but still boots off. Forcing it here
     // would re-assert off every boot and the "on" choice would never survive a
     // restart (SaveConfig only writes cvars that differ from their default).
     rex::cvar::SetFlagByName("max_fps", "60");  // default 60 (clamped to native refresh)
@@ -58,7 +58,7 @@ class GeApp : public rex::ReXApp {
     rex::cvar::SetFlagByName("window_height", "1440");
     // NOTE: fullscreen is NOT forced here. Its default is set to true at the
     // framework level (window.cpp) instead. That makes "windowed" the
-    // non-default value, so toggling to windowed actually saves to ge.toml --
+    // non-default value, so toggling to windowed actually saves to the config --
     // SaveConfig only writes cvars that differ from their default. Forcing
     // fullscreen=true here would re-assert it every boot and the windowed
     // choice would never persist. The throttle is the same story: its default
@@ -66,15 +66,20 @@ class GeApp : public rex::ReXApp {
     // it is never written here (writing default==default is a no-op anyway).
   }
 
+  std::optional<rex::PathConfig> OnPreparePaths(
+      const rex::PathConfig& defaults, std::function<void(rex::PathConfig)> resume) override {
+    return ge::PrepareLauncherPaths(defaults, std::move(resume), app_context());
+  }
+
   // Register the ESC pause-menu keybind and create the always-on Post-FX
   // filter overlay once the ImGui drawer exists.
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
     // Window/taskbar title shown while running. Overrides the SDK default
-    // ("ge <build stamp>"); the internal app name stays "ge" so ge.toml and the
-    // user data dir are unchanged.
-    if (window()) window()->SetTitle("GoldenEye");
-    rex::ui::RegisterBind("bind_pause_menu", "Escape", "Pause menu",
-                          [this] { TogglePauseMenu(); });
+    // ("ge <build stamp>"); the internal app name stays "ge" for runtime
+    // identity and compatibility.
+    if (window())
+      window()->SetTitle("GoldenEye");
+    rex::ui::RegisterBind("bind_pause_menu", "Escape", "Pause menu", [this] { TogglePauseMenu(); });
     ge::InitMouseLook();  // start raw-mouse capture/look thread
     postfx_ = std::make_unique<ge::PostFxOverlay>(drawer);
     // Username/server are set in the ONLINE pause-menu tab now -- no first-boot
@@ -120,7 +125,7 @@ class GeApp : public rex::ReXApp {
     cb.get_fullscreen = [this] { return window() && window()->IsFullscreen(); };
     cb.request_fullscreen = [this](bool v) {
       // Persist the choice: update the cvar (so SaveConfig writes it) and flush
-      // ge.toml now. Without this the window changes but reverts next boot.
+      // the config now. Without this the window changes but reverts next boot.
       rex::cvar::SetFlagByName("fullscreen", v ? "true" : "false");
       PersistConfig();
       // Defer off the paint thread: applying a window/surface change from inside
@@ -128,13 +133,14 @@ class GeApp : public rex::ReXApp {
       // surface being painted and crashes. Running it from the UI loop between
       // frames is the same safe path as a normal window resize.
       app_context().CallInUIThreadDeferred([this, v] {
-        if (window()) window()->SetFullscreen(v);
+        if (window())
+          window()->SetFullscreen(v);
       });
     };
     cb.persist_config = [this] { PersistConfig(); };
     cb.request_restart = [this] {
       // ONLINE tab "Save & Restart": the menu has already persisted the cvars;
-      // launch a fresh process (which reads the new ge.toml at boot) then tear
+      // launch a fresh process (which reads the new config at boot) then tear
       // this one down. Deferred to the UI thread -- never quit/relaunch from
       // inside the paint (same reason as request_fullscreen).
       app_context().CallInUIThreadDeferred([this] {
@@ -152,6 +158,6 @@ class GeApp : public rex::ReXApp {
   }
 
   std::atomic<bool> input_suppressed_{false};
-  GeMenuDialog* menu_ = nullptr;  // non-owning; self-deletes via the drawer
-  std::unique_ptr<ge::PostFxOverlay> postfx_;       // always-on filter layer
+  GeMenuDialog* menu_ = nullptr;               // non-owning; self-deletes via the drawer
+  std::unique_ptr<ge::PostFxOverlay> postfx_;  // always-on filter layer
 };

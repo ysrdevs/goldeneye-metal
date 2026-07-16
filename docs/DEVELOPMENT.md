@@ -48,6 +48,20 @@ cmake --build vendor/GoldenEye-Recomp/out/build/macos-arm64-release \
   --target ge --parallel
 ```
 
+Create and validate the unsigned release-style application bundle with:
+
+```sh
+cmake --build vendor/GoldenEye-Recomp/out/build/macos-arm64-release \
+  --target goldeneye_macos_app_verify --parallel
+```
+
+The result is
+`vendor/GoldenEye-Recomp/out/build/macos-arm64-release/dist/GoldenEye Metal.app`. The verifier
+checks its arm64 slice, deployment metadata, portable runtime linkage, app icon, required license
+notices, and absence of recognizable game-content files. It never signs the product. See
+[MACOS_DISTRIBUTION.md](MACOS_DISTRIBUTION.md) for the release-owner signing, DMG, notarization,
+stapling, and Gatekeeper commands.
+
 The vendor preset points `REXSDK_DIR` back to the repository root, enables Metal, disables Vulkan,
 and leaves runtime profiling off. Generated files stay under `vendor/GoldenEye-Recomp/generated/`
 and must not be committed.
@@ -72,10 +86,20 @@ pointer so mouse-look is not clamped by a screen edge, and focus loss or teardow
 system cursor. Modifier `FlagsChanged` events never query AppKit's key-down-only repeat state; a
 focused regression covers their previous-state delivery.
 
-For an ordinary interactive run, double-click `Launch GoldenEye.command` at the repository root.
-It finds a game-data folder, checks the minimum `default.xex` plus `files/` layout, supplies the
-local runtime-library path, selects Metal, enables SDL gamepads and MnK together, and clears
-inherited auto-input diagnostics. Manual launches can enable the same path explicitly:
+For the packaged player experience, open `GoldenEye Metal.app`. If no valid game-data root is
+configured or cached, its native first-run window accepts a local backup ZIP, the Xbox LIVE/STFS
+package inside it, or an extracted folder. It verifies the supported package before mounting it,
+imports through a private staging directory, publishes the completed cache atomically under
+`~/Library/Application Support/GoldenEye Metal/Game Data`, and removes the temporary package. It
+does not download or upload game data. Hold Option while opening the app to show setup again and
+select a different local source. Active imports can be cancelled; the staging directory is removed
+and an existing working cache is not replaced. Strictly named interrupted-import artifacts older
+than six hours are cleaned on a later launch.
+
+For a build-tree interactive run, double-click `Launch GoldenEye.command` at the repository root.
+It finds an extracted game-data folder, checks the minimum `default.xex` plus `files/` layout,
+supplies the local runtime-library path, selects Metal, enables SDL gamepads and MnK together, and
+clears inherited auto-input diagnostics. Manual launches can enable the same path explicitly:
 
 ```sh
 REX_INPUT_BACKEND=sdl REX_MNK_MODE=true \
@@ -102,7 +126,8 @@ between guest polls. On macOS its Controls page edits the common MnK bindings an
 are actually consumed at runtime, including optional keyboard right-stick directions. Per-launch
 environment cvars are reapplied after saved configuration, so the launcher's Metal, MnK, and
 canonical game-data selections remain authoritative for the session and for an in-game restart.
-Saving settings may also preserve non-default launcher choices in the local ignored `ge.toml`.
+Saving settings may also preserve non-default launcher choices in the local ignored
+`GoldenEyeMetal.toml`.
 The native input route is normal runtime input; it does not alter guest state or the graphics path.
 
 #### Physical controller acceptance
@@ -139,6 +164,23 @@ separate input-system regression ensures an idle SDL pad cannot starve a simulta
 keystroke. Separate CTest entries check the Finder launcher's shell syntax and exercise canonical
 game-data discovery, environment precedence, paths with spaces, controller/MnK selection, and
 diagnostic cleanup.
+
+The native import backend has an excluded manual smoke target so it cannot enter an ordinary
+build or application bundle. Run it only with your own compatible local LIVE/STFS package and a
+disposable destination:
+
+```sh
+cmake --build vendor/GoldenEye-Recomp/out/build/macos-arm64-release \
+  --target goldeneye_game_data_import_smoke --parallel
+
+./vendor/GoldenEye-Recomp/out/build/macos-arm64-release/goldeneye_game_data_import_smoke \
+  /absolute/path/to/local-package /tmp/goldeneye-import-smoke
+```
+
+The tool exercises the launcher's exact package hashing, safe path plan, chunked extraction,
+post-import validation, and atomic publication. Delete the disposable destination after the test;
+never commit its output. An optional third numeric argument cancels after that many extracted
+bytes and returns status 3, allowing cleanup behavior to be tested without completing an import.
 
 `metal_pipeline_probe_test` renders through an externally owned Metal vertex buffer, samples a
 single-layer `texture2d_array`, expands a four-vertex fan through a six-entry index buffer, checks

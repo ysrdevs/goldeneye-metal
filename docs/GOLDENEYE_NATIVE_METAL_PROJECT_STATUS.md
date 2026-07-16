@@ -120,6 +120,19 @@ Start defaults to Return on macOS because Escape also opens the host pause overl
 input path, not a guest-state or menu-selection diagnostic. Physical navigation and gameplay
 control remain to be validated end to end.
 
+The release path now also produces a normal unsigned `GoldenEye Metal.app` with a native first-run
+setup window and original icon. A player can select a compatible local backup ZIP, its Xbox
+LIVE/STFS package, or an extracted folder. The importer hashes the complete package before the
+general container parser sees it, accepts only the supported title revision, rejects unsafe or
+case-colliding paths and unexpected size/count/depth, streams into a private staging directory,
+validates the result, and publishes the cache atomically under Application Support. ZIP handling
+invokes the system reader without a shell and streams only the single package member; it never
+extracts arbitrary archive paths, downloads content, or includes game data in the app. Direct STFS
+mounting remains available to the runtime, while the one-time flat import is the default player
+route for better read performance. The older `.command` launcher remains a build-tree developer
+convenience. Signing, DMG creation, and notarization are deliberately release-owner steps and have
+not been executed as part of this milestone.
+
 Modern controller input now follows the native SDL gamepad path by default on macOS and is selected
 explicitly by the Finder launcher. SDL's bundled mappings cover DualShock 4, DualSense, Xbox One,
 and Xbox Series X|S controllers; no separately downloaded mapping database is required for those
@@ -284,8 +297,9 @@ longer blocked on that sequence.
 - Native Cocoa keyboard and relative-mouse delivery through the common controller driver
 - Default-on SDL gamepad input with built-in PS4, PS5, Xbox One, and Xbox Series mappings
 - Hot-plug, four-slot compaction, fifth-pad promotion, focus-safe rumble, and virtual-device tests
-- Double-click macOS launcher with local game-data discovery, minimum-layout validation, and
-  automatic Metal/controller/MnK selection
+- Native macOS application launcher with exact local ZIP/STFS validation, safe atomic import,
+  remembered game data, and automatic Metal/controller/MnK selection
+- Build-tree `.command` launcher for local developer runs
 - Controller-state input regressions plus pause-menu capture suppression and runtime macOS rebinding
 - Guest polygon cull mode and front-face winding with focused Metal regression coverage
 - Persistent per-context Metal depth/stencil state with ordered depth and stencil probe coverage
@@ -312,6 +326,7 @@ longer blocked on that sequence.
 | E. Recognizable menu | Passed | Corrected-clock 1280x720 captures present the real dossier menu through the strict path; short samples reported 30.0 and 59.9 guest-delivered FPS |
 | F. Sustained title execution | Passed | WPTR >1088 and normal `IssueSwap` at least 4416 without scavenging, replay, forced presentation, false GPU-hang dumps, or debug traps |
 | G. First mission gameplay | Passed for deterministic input | The input-only route reaches a clean Dam briefing and fully rendered dynamic gameplay; correct captures have displayed 46.5 and 60.0 FPS, but sustained 60 across broader views remains in progress |
+| H. Native player launcher | Passed unsigned | The arm64 `.app` stages with portable runtime linkage, icon, metadata, and notices but no game content; the exact supported LIVE/STFS package imports and validates all 1,803 title files through the same backend used by the first-run UI |
 
 ## Primary blocker
 
@@ -344,8 +359,9 @@ blend constants, per-channel write masks, culling/front-face selection, and per-
 depth/stencil state are active and verified. Depth-only EDRAM draw routing, guest-addressed shared
 depth/stencil ownership, depth clear/resolve fidelity, and true guest MSAA behavior remain absent.
 The current per-color-target private depth attachment is useful but cannot establish shared-depth
-or multisample correctness. Missing game data remains a separate launch problem and must not be
-diagnosed as a renderer failure.
+or multisample correctness. The supported local-backup importer now prevents missing game data
+from silently looking like a renderer fault; unsupported or incomplete data is rejected before
+runtime initialization.
 
 ## Next development priority
 

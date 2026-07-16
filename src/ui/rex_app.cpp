@@ -44,7 +44,6 @@
 #include <fmt/format.h>
 #include <imgui.h>
 
-#include <algorithm>
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -71,7 +70,8 @@
 // the next launch). kInitOnly would reject those post-init writes.
 #if REX_HAS_METAL
 REXCVAR_DEFINE_STRING(gpu, "auto", "GPU",
-                      "Render backend: auto (macOS->Metal, NVIDIA Windows->D3D12, all else->Vulkan), d3d12, vulkan, or metal")
+                      "Render backend: auto (macOS->Metal, NVIDIA Windows->D3D12, all "
+                      "else->Vulkan), d3d12, vulkan, or metal")
     .allowed({"auto", "d3d12", "vulkan", "metal"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 #else
@@ -136,17 +136,30 @@ ReXApp::ReXApp(ui::WindowedAppContext& ctx, std::string_view name, PPCImageInfo 
 bool ReXApp::OnInitialize() {
   if (!SetupEnvironment())
     return false;
+
+  auto paths = OnPreparePaths(resolved_defaults_, MakePreparePathsResumeCallback());
+  if (!paths) {
+    // Async native launcher. No graphics/game window has been created yet;
+    // the application event loop keeps the platform UI responsive until the
+    // consumer invokes resume.
+    return true;
+  }
+
+  return ContinueInitialization(std::move(*paths));
+}
+
+bool ReXApp::ContinueInitialization(PathConfig paths) {
   if (!SetupPresentation())
     return false;
 
-  auto paths = OnFinalizePaths(resolved_defaults_, MakeResumeCallback());
-  if (!paths) {
+  auto finalized_paths = OnFinalizePaths(paths, MakeResumeCallback());
+  if (!finalized_paths) {
     // Async: consumer will invoke resume when ready. OnInitialize returns
     // true so the event loop keeps pumping (wizard dialogs render).
     return true;
   }
 
-  if (!ConstructRuntime(*paths))
+  if (!ConstructRuntime(*finalized_paths))
     return false;
   LaunchModule();
   return true;
@@ -217,7 +230,10 @@ bool ReXApp::SetupEnvironment() {
                                         log_level_str, category_levels);
   if (log_file_cvar.empty()) {
     log_config.app_name = std::string(GetName());
-    log_config.log_dir = (exe_dir / "logs").string();
+    // Application bundles are immutable after signing. Keep default logs with
+    // the rest of the per-user state instead of beside the executable.
+    const auto& writable_root = user_data_root_.empty() ? exe_dir : user_data_root_;
+    log_config.log_dir = (writable_root / "Logs").string();
   }
 
   rex::InitLogging(log_config);
@@ -233,7 +249,7 @@ bool ReXApp::SetupEnvironment() {
 
   REXLOG_INFO("{} starting", GetName());
   if (!game_data_root_.empty()) {
-    REXLOG_INFO("  Game directory: {}", game_data_root_.string());
+    REXLOG_INFO("  Game data:      {}", game_data_root_.string());
   }
   if (!user_data_root_.empty()) {
     REXLOG_INFO("  User data:      {}", user_data_root_.string());
@@ -265,12 +281,23 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
     return false;
   }
-  if (!std::filesystem::is_directory(game_data_root)) {
-    auto msg = fmt::format("--game_data_root does not exist: {}", game_data_root.string());
+  if (!std::filesystem::is_directory(game_data_root) &&
+      !std::filesystem::is_regular_file(game_data_root)) {
+    auto msg =
+        fmt::format("--game_data_root must be an extracted directory or STFS package file: {}",
+                    game_data_root.string());
     REXLOG_ERROR("{}", msg);
     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
     return false;
   }
+
+  // Path hooks may resolve game data asynchronously after SetupEnvironment.
+  // Publish the final values through the normal accessors before constructing
+  // the runtime so restarts and application-specific hooks see the same paths.
+  game_data_root_ = game_data_root;
+  user_data_root_ = paths.user_data_root;
+  update_data_root_ = paths.update_data_root;
+  cache_root_ = paths.cache_root;
 
   runtime_ = std::make_unique<rex::Runtime>(game_data_root, paths.user_data_root,
                                             paths.update_data_root, paths.cache_root);
@@ -309,28 +336,15 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
   std::string xex_image = "game:\\default.xex";
   OnLoadXexImage(xex_image);
 
-  // Mirrors the game:\ / d:\ -> game_data_root mapping in Runtime::SetupVfs.
-  {
-    constexpr std::string_view kGameDevice = "game:\\";
-    constexpr std::string_view kDDevice = "d:\\";
-    std::string_view tail = xex_image;
-    if (tail.starts_with(kGameDevice)) {
-      tail.remove_prefix(kGameDevice.size());
-    } else if (tail.starts_with(kDDevice)) {
-      tail.remove_prefix(kDDevice.size());
-    }
-    std::string host_tail{tail};
-    std::replace(host_tail.begin(), host_tail.end(), '\\', '/');
-    // Use the resolved game_data_root (which falls back to <exe-dir>/assets when
-    // --game_data_root is omitted), not the raw paths value -- otherwise a
-    // direct launch fails this pre-check with a bare relative "default.xex".
-    auto xex_host = game_data_root / host_tail;
-    if (!std::filesystem::is_regular_file(xex_host)) {
-      auto msg = fmt::format("Entrypoint XEX not found: {}", xex_host.string());
-      REXLOG_ERROR("{}", msg);
-      rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
-      return false;
-    }
+  // Resolve through the runtime VFS so this works identically for extracted
+  // directories and directly mounted STFS packages.
+  auto* xex_entry = runtime_->file_system()->ResolvePath(xex_image);
+  if (!xex_entry || (xex_entry->attributes() & rex::filesystem::kFileAttributeDirectory) != 0) {
+    auto msg = fmt::format("Entrypoint XEX not found in game data: {} ({})", xex_image,
+                           game_data_root.string());
+    REXLOG_ERROR("{}", msg);
+    rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
+    return false;
   }
 
   status = runtime_->LoadXexImage(xex_image);
@@ -548,6 +562,16 @@ std::function<void(PathConfig)> ReXApp::MakeResumeCallback() {
       return;
     }
     LaunchModule();
+  };
+}
+
+std::function<void(PathConfig)> ReXApp::MakePreparePathsResumeCallback() {
+  return [this](PathConfig paths) {
+    if (shutting_down_.load(std::memory_order_acquire))
+      return;
+    if (!ContinueInitialization(std::move(paths))) {
+      app_context().QuitFromUIThread();
+    }
   };
 }
 

@@ -1,16 +1,15 @@
 # GoldenEye Metal
 
-GoldenEye Metal is an experimental, source-only static recompilation project focused on a native
-Apple Silicon and Metal rendering path. This repository contains the runtime, toolchain, Metal
-backend, and game integration in one tree.
+GoldenEye Metal is an experimental static recompilation project focused on a native Apple Silicon
+and Metal rendering path. This repository contains the runtime, toolchain, Metal backend, native
+macOS launcher, and game integration in one tree.
 
 > [!WARNING]
 > The macOS build is not fully playable yet. The strict native path now reaches a clean Dam
 > briefing and fully rendered first-mission gameplay through real Metal draws, resolves, and
 > swaps. Native keyboard/mouse and SDL gamepad input now have controller-state regression
 > coverage and a double-click launcher, but physical Dam gameplay still needs final live
-> validation. Correct
-> dynamic Dam captures have now displayed
+> validation. Correct dynamic Dam captures have now displayed
 > 46.5 and 60.0 FPS, but not every view sustains 60 FPS; broader-scene pacing plus important
 > depth/MSAA fidelity gaps remain.
 
@@ -108,22 +107,35 @@ thirdparty/                     Pinned source dependencies managed as Git submod
 `vendor/GoldenEye-Recomp` is an ordinary source directory, not another repository or submodule.
 Generated recompilation output and game data remain local and are ignored by Git.
 
-## Launch on macOS
+## Play on macOS
 
-After building the game once, double-click
-[Launch GoldenEye.command](<Launch GoldenEye.command>) in Finder. The launcher:
+A packaged release is a normal **GoldenEye Metal.app** for Apple Silicon and macOS 14 or newer.
+Drag it to Applications and open it from Finder. On the first launch, the app asks for one of these
+local inputs:
 
-- finds the game-data folder through the local code-generation XEX link, a saved folder,
-  or a Finder folder picker;
-- validates that `default.xex` and `files/` are present without copying game data into the repo;
-- selects native Metal, modern controller support, and the macOS keyboard/mouse path; and
-- clears unattended input diagnostics before starting an interactive session.
+- your compatible original game-backup ZIP;
+- the Xbox LIVE/STFS package stored inside that backup; or
+- an already extracted game-data folder containing `default.xex`, `files/`, `music.xwb`, and
+  `sfx.xwb`.
+
+The launcher verifies the exact supported game revision before parsing or importing it. ZIPs are
+handled locally: only the package inside the selected ZIP is read, the validated game data is
+installed under `~/Library/Application Support/GoldenEye Metal/Game Data`, and the temporary
+package is deleted. Later launches start directly from that private cache. The app does not
+contain, download, or link to game content, and it never uploads the selected backup.
+Hold Option while opening the app to show the chooser again and select a different local source.
+Import can be cancelled without replacing an existing working cache. The app records the expected
+file count and byte total, checks critical resources and the executable identity on later launches,
+and automatically rebuilds a damaged cache when the verified package is selected again.
+
+Native Metal, SDL gamepads, and keyboard/mouse control are selected automatically. The current
+build is still an active-development prototype; see the warning at the top of this README before
+treating it as a finished gameplay release.
 
 WASD moves, Space is A, Shift is B, Return is Start, and Escape opens the host settings menu.
 Mouse movement looks, left click fires, and right click aims. The settings menu releases the
 cursor; its Controls page changes the bindings and mouse sensitivity consumed by the macOS input
-driver. The launcher remembers a manually selected game-data folder under
-`~/Library/Application Support/GoldenEye Metal/`.
+driver.
 
 ### Controllers
 
@@ -147,6 +159,14 @@ forwarded when the controller and its macOS connection expose it. Automated test
 button/axis input, hot-plugging, slot promotion, pause suppression, rumble calls, and simultaneous
 keyboard/controller keystrokes. The USB and Bluetooth hardware matrix still needs physical
 acceptance testing across each controller family.
+
+### Developer launcher
+
+After building the game from source, developers can also double-click
+[Launch GoldenEye.command](<Launch GoldenEye.command>) at the repository root. This script finds
+an existing extracted data folder, supplies the local build-tree library path, selects Metal and
+native input, and clears unattended diagnostics. It remains a development convenience; the
+packaged `.app` above is the release experience for nontechnical players.
 
 ## Build on Apple Silicon
 
@@ -197,6 +217,19 @@ cmake --build vendor/GoldenEye-Recomp/out/build/macos-arm64-release \
   --target ge --parallel
 ```
 
+Build and verify the unsigned native application bundle with:
+
+```sh
+cmake --build vendor/GoldenEye-Recomp/out/build/macos-arm64-release \
+  --target goldeneye_macos_app_verify --parallel
+```
+
+The result is
+`vendor/GoldenEye-Recomp/out/build/macos-arm64-release/dist/GoldenEye Metal.app`. It contains no
+game data. Release-owner commands for Developer ID signing, DMG creation, notarization, stapling,
+and final Gatekeeper checks are documented in
+[macOS application distribution](docs/MACOS_DISTRIBUTION.md).
+
 The game executable is written to its vendor build directory. Run it from the repository root
 against your complete authorized game-data directory, which must include `default.xex`, `files/`,
 and the companion title data:
@@ -208,7 +241,7 @@ REX_INPUT_BACKEND=sdl REX_MNK_MODE=true \
   --gpu metal
 ```
 
-Keyboard/mouse controller emulation is opt-in for manual launches; the Finder launcher enables it
+Keyboard/mouse controller emulation is opt-in for manual launches; both macOS launchers enable it
 automatically. Space is A, Shift is B, WASD is the left stick,
 the arrow keys are the D-pad, the mouse is the right stick, and its left/right buttons are the
 right/left triggers. Start defaults to Return on macOS because Escape opens the host pause overlay.

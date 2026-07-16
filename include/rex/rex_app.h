@@ -119,6 +119,20 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// Override to adjust game/user/update data paths programmatically.
   virtual void OnConfigurePaths(PathConfig& paths) { (void)paths; }
 
+  /// Called after path defaults and configuration are loaded, before graphics
+  /// presentation creates the game window. This is the appropriate hook for a
+  /// platform-native first-run launcher or file picker.
+  ///
+  /// Return a PathConfig to continue synchronously. Return std::nullopt and
+  /// invoke `resume(path_config)` later to continue asynchronously. `resume`
+  /// must be called on the UI thread. The default implementation passes the
+  /// resolved paths through unchanged.
+  virtual std::optional<PathConfig> OnPreparePaths(const PathConfig& defaults,
+                                                   std::function<void(PathConfig)> resume) {
+    (void)resume;
+    return defaults;
+  }
+
   /// Called after SetupPresentation returns (window and ImGui drawer are live)
   /// and before Runtime construction. Override to resolve paths from user
   /// input shown through an ImGui dialog.
@@ -202,6 +216,8 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   void NotifyInputActiveChanged();
 
  private:
+  bool ContinueInitialization(PathConfig paths);
+  std::function<void(PathConfig)> MakePreparePathsResumeCallback();
   std::function<void(PathConfig)> MakeResumeCallback();
   bool IsEffectiveInputActive() const;
 

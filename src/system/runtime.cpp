@@ -13,6 +13,7 @@
 #include <rex/cvar.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/null_device.h>
+#include <rex/filesystem/devices/stfs_container_device.h>
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
@@ -267,19 +268,34 @@ bool Runtime::SetupVfs() {
     return false;
   }
 
-  // Mount game_data_root as \Device\Harddisk0\Partition1
+  // Mount game_data_root as \Device\Harddisk0\Partition1. An extracted
+  // directory uses the host filesystem directly; a package file is mounted as
+  // a read-only STFS/SVOD container without extracting it.
   auto mount_path = "\\Device\\Harddisk0\\Partition1";
-  auto device = std::make_unique<rex::filesystem::HostPathDevice>(
-      mount_path, abs_game_root, !REXCVAR_GET(allow_game_relative_writes));
+  std::unique_ptr<rex::filesystem::Device> device;
+  const bool is_host_directory = std::filesystem::is_directory(abs_game_root);
+  if (is_host_directory) {
+    device = std::make_unique<rex::filesystem::HostPathDevice>(
+        mount_path, abs_game_root, !REXCVAR_GET(allow_game_relative_writes));
+  } else if (std::filesystem::is_regular_file(abs_game_root)) {
+    device = std::make_unique<rex::filesystem::StfsContainerDevice>(mount_path, abs_game_root);
+  } else {
+    REXSYS_ERROR("Runtime::SetupVfs: game_data_root must be a directory or STFS package file: {}",
+                 abs_game_root.string());
+    return false;
+  }
+
   if (!device->Initialize()) {
-    REXSYS_ERROR("Runtime::SetupVfs: Failed to initialize host path device");
+    REXSYS_ERROR("Runtime::SetupVfs: Failed to initialize {} game data device",
+                 is_host_directory ? "directory" : "STFS");
     return false;
   }
   if (!file_system_->RegisterDevice(std::move(device))) {
-    REXSYS_ERROR("Runtime::SetupVfs: Failed to register host path device");
+    REXSYS_ERROR("Runtime::SetupVfs: Failed to register game data device");
     return false;
   }
-  REXSYS_INFO("  Mounted {} at {}", abs_game_root.string(), mount_path);
+  REXSYS_INFO("  Mounted {} {} at {}", is_host_directory ? "directory" : "STFS package",
+              abs_game_root.string(), mount_path);
 
   // Register symbolic links for game: and D:
   file_system_->RegisterSymbolicLink("game:", mount_path);

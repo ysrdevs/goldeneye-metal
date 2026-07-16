@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>GoldenEye Metal</string>
+    <key>CFBundleExecutable</key>
+    <string>GoldenEye</string>
+    <key>CFBundleIdentifier</key>
+    <string>@GOLDENEYE_BUNDLE_IDENTIFIER@</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleIconFile</key>
+    <string>GoldenEyeMetal</string>
+    <key>CFBundleName</key>
+    <string>GoldenEye Metal</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@GOLDENEYE_VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@GOLDENEYE_BUILD_NUMBER@</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.games</string>
+    <key>LSArchitecturePriority</key>
+    <array>
+        <string>arm64</string>
+    </array>
+    <key>LSMinimumSystemVersion</key>
+    <string>@GOLDENEYE_MACOS_MIN_VERSION@</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <false/>
+    <key>LSEnvironment</key>
+    <dict>
+        <key>REX_GPU</key>
+        <string>metal</string>
+        <key>REX_INPUT_BACKEND</key>
+        <string>sdl</string>
+        <key>REX_MNK_MODE</key>
+        <string>true</string>
+    </dict>
+</dict>
+</plist>

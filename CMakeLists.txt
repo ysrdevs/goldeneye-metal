@@ -70,6 +70,16 @@ endif()
 # Root of the SDK source tree
 set(REXGLUE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 
+# Release binaries and diagnostics should identify project-relative source
+# files without publishing the build owner's home-directory path. This also
+# makes otherwise identical local release builds more reproducible.
+if(NOT MSVC)
+    add_compile_options(
+        "-ffile-prefix-map=${REXGLUE_ROOT}=."
+        "-fmacro-prefix-map=${REXGLUE_ROOT}=."
+    )
+endif()
+
 # SDK install support
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)

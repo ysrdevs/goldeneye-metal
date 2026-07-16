@@ -4,9 +4,11 @@ This directory contains the source-side game integration for GoldenEye Metal. It
 directly into the main repository and is not a separate repository or Git submodule.
 
 > [!WARNING]
-> The native Apple Silicon/Metal path is an active research prototype. It builds and passes
-> controlled GPU diagnostics. Real title PM4 now reaches Metal draws, resolve, and swap without
-> heuristic replay, but the producer render target remains black and the build is not playable.
+> The native Apple Silicon/Metal path is an active-development prototype. The strict path reaches
+> the menu, Dam briefing, and fully rendered first-mission gameplay through real Metal draws,
+> resolves, and swaps. Correct captures have displayed 46.5 and 60.0 FPS, but sustained performance
+> across broader views, physical input acceptance, depth/stencil fidelity, and guest MSAA remain in
+> progress.
 
 ## What is included
 
@@ -33,6 +35,18 @@ cmake -S vendor/GoldenEye-Recomp --preset macos-arm64-release
 cmake --build vendor/GoldenEye-Recomp/out/build/macos-arm64-release \
   --target ge --parallel
 ```
+
+Build and verify the unsigned native application bundle with:
+
+```sh
+cmake --build vendor/GoldenEye-Recomp/out/build/macos-arm64-release \
+  --target goldeneye_macos_app_verify --parallel
+```
+
+The app accepts a compatible local backup ZIP, Xbox LIVE/STFS package, or extracted game-data
+folder on first launch. It imports locally under Application Support and contains no game content
+or downloader. See the root [macOS distribution guide](../../docs/MACOS_DISTRIBUTION.md) for the
+release-owner signing, DMG, and notarization workflow.
 
 Run the resulting prototype from the repository root against the complete authorized game-data
 directory, including `default.xex`, `files/`, and the companion title data:

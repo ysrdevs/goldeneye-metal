@@ -62,6 +62,7 @@
                 "CMAKE_CXX_COMPILER": "clang++",
                 "CMAKE_CXX_STANDARD": "23",
                 "CMAKE_OSX_ARCHITECTURES": "arm64",
+                "CMAKE_OSX_DEPLOYMENT_TARGET": "14.0",
                 "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/${presetName}",
                 "REXGLUE_BUILD_TESTS": "ON",
                 "REXGLUE_BUILD_PPC_TESTS": "OFF",
