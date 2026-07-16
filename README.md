@@ -135,7 +135,8 @@ treating it as a finished gameplay release.
 WASD moves, Space is A, Shift is B, Return is Start, and Escape opens the host settings menu.
 Mouse movement looks, left click fires, and right click aims. The settings menu releases the
 cursor; its Controls page changes the bindings and mouse sensitivity consumed by the macOS input
-driver.
+driver. Command-Q, the application menu's Quit command, Command-W, and the window close button all
+use the same orderly game shutdown path.
 
 ### Controllers
 

@@ -95,8 +95,10 @@ content was staged. It intentionally does not sign anything.
 Open this unsigned build and exercise the first-launch import with a local
 backup stored outside the application before starting the release process.
 Quit, reopen it, and confirm that the imported cache launches without showing
-the setup window again. Do not modify any file inside the app after it has
-been signed.
+the setup window again. During both setup and gameplay, confirm Command-Q,
+Command-W or the red close button, the application menu's Quit item, and Dock
+Quit all end the process without Force Quit. Do not modify any file inside the
+app after it has been signed.
 
 ## 2. Store notarization credentials once
 

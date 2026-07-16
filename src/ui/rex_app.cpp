@@ -579,6 +579,27 @@ void ReXApp::OnKeyDown(ui::KeyEvent& e) {
   rex::ui::ProcessKeyEvent(e);
 }
 
+void ReXApp::RequestShutdown() {
+  app_context().CallInUIThreadDeferred([this]() {
+    if (shutting_down_.load(std::memory_order_acquire)) {
+      return;
+    }
+    if (window_ && window_->phase() == ui::Window::Phase::kOpen) {
+      window_->RequestClose();
+      return;
+    }
+
+    // A platform-native setup window may not have created the game window.
+    // Keep this fallback orderly and idempotent as well.
+    REXLOG_INFO("Application shutting down...");
+    shutting_down_.store(true, std::memory_order_release);
+    if (runtime_ && runtime_->kernel_state()) {
+      runtime_->kernel_state()->TerminateTitle();
+    }
+    app_context().QuitFromUIThread();
+  });
+}
+
 void ReXApp::OnClosing(ui::UIEvent& e) {
   (void)e;
   REXLOG_INFO("Window closing, shutting down...");

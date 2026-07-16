@@ -134,7 +134,11 @@ convenience. `launcher/build-app.sh` now builds an audited macOS-14-compatible S
 verifies the unsigned bundle. `tools/sign-notarize.sh` automates nested Developer ID signing, app
 and DMG notarization/stapling, Gatekeeper checks, and atomic publication of the final ZIP and DMG.
 Those Apple signing, notarization, and DMG operations remain release-owner steps and have not been
-executed as part of this milestone.
+executed as part of this milestone. The custom AppKit loop now installs a standard application and
+Window menu, finishes native launch registration, and routes Command-Q, Command-W, Dock Quit, menu
+Quit, and the close button through the same guest-termination path. The in-game menu's Quit and
+restart actions use that path as well. An isolated first-run process test delivered a real macOS
+Quit event and observed the process exit in approximately 100 ms.
 
 Modern controller input now follows the native SDL gamepad path by default on macOS and is selected
 explicitly by the Finder launcher. SDL's bundled mappings cover DualShock 4, DualSense, Xbox One,
@@ -302,6 +306,8 @@ longer blocked on that sequence.
 - Hot-plug, four-slot compaction, fifth-pad promotion, focus-safe rumble, and virtual-device tests
 - Native macOS application launcher with exact local ZIP/STFS validation, safe atomic import,
   remembered game data, and automatic Metal/controller/MnK selection
+- Standard macOS Command-Q, Command-W, menu, Dock, and window-button shutdown routed through one
+  orderly guest-termination path
 - Reproducible unsigned app build plus release-owner signing/notarization scripts with pinned
   macOS-14 SPIRV-Cross, stapled ZIP/DMG output, and fail-safe artifact publication
 - Build-tree `.command` launcher for local developer runs

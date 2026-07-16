@@ -116,12 +116,7 @@ class GeApp : public rex::ReXApp {
       NotifyInputActiveChanged();
       ge::SetMouselookSuppressed(false);  // re-enable mouse-look on menu close
     };
-    cb.on_quit = [this] {
-      if (runtime() && runtime()->kernel_state()) {
-        runtime()->kernel_state()->TerminateTitle();
-      }
-      app_context().QuitFromUIThread();
-    };
+    cb.on_quit = [this] { RequestShutdown(); };
     cb.get_fullscreen = [this] { return window() && window()->IsFullscreen(); };
     cb.request_fullscreen = [this](bool v) {
       // Persist the choice: update the cvar (so SaveConfig writes it) and flush
@@ -145,10 +140,7 @@ class GeApp : public rex::ReXApp {
       // inside the paint (same reason as request_fullscreen).
       app_context().CallInUIThreadDeferred([this] {
         ge::LaunchSelfDetached();
-        if (runtime() && runtime()->kernel_state()) {
-          runtime()->kernel_state()->TerminateTitle();
-        }
-        app_context().QuitFromUIThread();
+        RequestShutdown();
       });
     };
     input_suppressed_.store(true, std::memory_order_release);

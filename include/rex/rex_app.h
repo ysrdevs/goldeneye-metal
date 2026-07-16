@@ -215,6 +215,11 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// This avoids waiting for the next guest poll when a host menu opens.
   void NotifyInputActiveChanged();
 
+  /// Request an orderly application shutdown from a UI callback. The request
+  /// is deferred so callers inside a render pass don't tear down its window,
+  /// and it uses the native close path so guest termination stays centralized.
+  void RequestShutdown();
+
  private:
   bool ContinueInitialization(PathConfig paths);
   std::function<void(PathConfig)> MakePreparePathsResumeCallback();

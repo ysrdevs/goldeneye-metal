@@ -107,6 +107,10 @@ class MacOSWindow final : public Window {
       [window_ release];
       window_ = nil;
     }
+    if (metal_layer_) {
+      [metal_layer_ release];
+      metal_layer_ = nil;
+    }
     if (delegate_) {
       [delegate_ release];
       delegate_ = nil;
@@ -249,6 +253,10 @@ class MacOSWindow final : public Window {
       [device release];
       return false;
     }
+    // This class owns and explicitly releases the window. Disable AppKit's
+    // legacy release-on-close behavior to avoid an over-release during the
+    // orderly RequestClose path used by Command-Q.
+    [window_ setReleasedWhenClosed:NO];
 
     NSString* title = ToNSString(GetTitle());
     [window_ setTitle:title];
