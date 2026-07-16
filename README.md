@@ -175,15 +175,21 @@ packaged `.app` above is the release experience for nontechnical players.
 - Apple Silicon Mac and a current macOS SDK
 - Xcode Command Line Tools with AppleClang 18 or newer
 - CMake 3.25 or newer
-- SPIRV-Cross with MSL support
+- `curl` (included with macOS)
 - Git
 - A compatible Xbox 360 executable and game files that you are authorized to use
 
-Install the host build tools with Homebrew:
+Install the bootstrap/developer tools with Homebrew:
 
 ```sh
 brew install cmake spirv-cross
 ```
+
+The app build script downloads the official pinned SPIRV-Cross source archive, verifies its
+SHA-256, and builds it locally for the app's macOS 14 deployment target. This avoids accidentally
+linking the Homebrew bottle into a release when that bottle was built for a newer macOS version.
+The Homebrew copy is used only to bootstrap the raw developer build below; the release script
+overrides it with the audited local copy. The script downloads no XEX or game assets.
 
 Clone and initialize the source dependencies:
 
@@ -220,14 +226,23 @@ cmake --build vendor/GoldenEye-Recomp/out/build/macos-arm64-release \
 Build and verify the unsigned native application bundle with:
 
 ```sh
-cmake --build vendor/GoldenEye-Recomp/out/build/macos-arm64-release \
-  --target goldeneye_macos_app_verify --parallel
+./launcher/build-app.sh
 ```
 
 The result is
-`vendor/GoldenEye-Recomp/out/build/macos-arm64-release/dist/GoldenEye Metal.app`. It contains no
-game data. Release-owner commands for Developer ID signing, DMG creation, notarization, stapling,
-and final Gatekeeper checks are documented in
+`vendor/GoldenEye-Recomp/out/build/macos-arm64-release/dist/GoldenEye Metal.app`. It copies no XEX,
+extracted assets, or standalone game-data files into the bundle; the executable is built from the
+release owner's local generated integration. The release owner can create the signed, notarized,
+and stapled ZIP and DMG with:
+
+```sh
+SIGN_IDENTITY="Developer ID Application: YUVRAJ SINGH (9RCV543M32)" \
+NOTARY_PROFILE="cyberconsole-notary" \
+./tools/sign-notarize.sh
+```
+
+The release script rebuilds and verifies the app itself, so running `build-app.sh` immediately
+before it is optional. Full release behavior, credential setup, output paths, and checks are in
 [macOS application distribution](docs/MACOS_DISTRIBUTION.md).
 
 The game executable is written to its vendor build directory. Run it from the repository root

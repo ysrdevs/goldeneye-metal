@@ -8,8 +8,39 @@ vendor/GoldenEye-Recomp/out/build/macos-arm64-release/dist/GoldenEye Metal.app
 ```
 
 The bundle contains the native game executable, `librexruntime.dylib`, its
-property list, original app icon, and license notices. It does not contain an
-XEX, extracted game assets, generated game data, or a network downloader.
+property list, original app icon, and license notices. It copies no XEX,
+extracted asset tree, generated C++ source, or standalone game-data files into
+the bundle, and it has no network downloader. The native executable is built
+from the release owner's local generated integration.
+
+## Automated release-owner workflow
+
+From the repository root, run:
+
+```sh
+./launcher/build-app.sh
+SIGN_IDENTITY="Developer ID Application: YUVRAJ SINGH (9RCV543M32)" \
+NOTARY_PROFILE="cyberconsole-notary" \
+./tools/sign-notarize.sh
+```
+
+The release script invokes `build-app.sh` itself, so the first command is
+useful for testing the unsigned app but is optional immediately before the
+second command. It signs nested code before the outer app, notarizes and
+staples the app, creates the distributable ZIP from that stapled app, then
+creates, signs, notarizes, staples, and Gatekeeper-assesses the DMG. It writes:
+
+```text
+release/GoldenEye-Metal-0.1.0-macos-arm64.zip
+release/GoldenEye-Metal-0.1.0-macos-arm64.dmg
+```
+
+The scripts accept `VERSION`, `BUILD_NUMBER`, `BUNDLE_IDENTIFIER`, and
+`MACOS_DEPLOYMENT_TARGET` overrides. `release/` is ignored by Git. The scripts
+never accept an Apple password and never download an XEX or game assets. The
+release owner is responsible for confirming the right to distribute the
+compiled output produced from their local generated integration; this document
+is not legal advice.
 
 On first launch, the native setup window accepts a user-selected backup ZIP,
 its Xbox LIVE/STFS package, or an extracted game-data folder. The ZIP path is
@@ -28,10 +59,11 @@ failure or cancellation. Later launches remove strictly named abandoned import
 artifacts after a six-hour safety window and reject a cache whose marker, file
 count, byte total, executable, or critical resources no longer match.
 
-The staging step also gathers the license files for statically linked source
-dependencies and the separately installed SPIRV-Cross package. It fails if
-the SPIRV-Cross license cannot be found, preventing an incomplete binary
-distribution.
+The staging step also gathers license files for statically linked source
+dependencies. `build-app.sh` downloads a pinned official SPIRV-Cross source
+archive, verifies its SHA-256, builds it locally for the declared deployment
+target, and includes its license. It fails if that license cannot be found,
+preventing an incomplete binary distribution.
 
 The official Apple Silicon presets currently target macOS 14.0 and record the
 same minimum version in the bundle metadata. Keep the values in the root
@@ -39,37 +71,26 @@ same minimum version in the bundle metadata. Keep the values in the root
 Raise both deliberately when the native code adopts an API that requires a
 newer macOS release.
 
-All linked objects must support the advertised deployment target. In
-particular, a Homebrew SPIRV-Cross package installed on a newer macOS release
-may have been compiled for that newer release. Treat a linker warning such as
-"was built for newer macOS version" as a release blocker: rebuild
-SPIRV-Cross with `CMAKE_OSX_DEPLOYMENT_TARGET=14.0`, build the release on a
-macOS 14-compatible build host, or deliberately raise the application's
-minimum version. A final binary reporting `minos 14.0` does not by itself make
-newer static-library objects compatible with macOS 14.
+All linked objects must support the advertised deployment target. A Homebrew
+SPIRV-Cross bottle installed on a newer macOS release may target that newer
+release even when the final executable reports `minos 14.0`. The automated
+build avoids that mismatch and audits every object in the three SPIRV-Cross
+archives before configuring the app. A custom `SPIRV_CROSS_PREFIX` override is
+also audited and is rejected if any object requires a newer macOS version.
 
 ## 1. Build and verify the unsigned app
 
-Complete code generation first, then configure the release with the version,
-build number, and final bundle identifier you intend to ship:
+Complete code generation first, then run:
 
 ```sh
-cmake --preset macos-arm64-release
-cmake --build --preset macos-arm64-release \
-  --target rexruntime --parallel
-
-cmake -S vendor/GoldenEye-Recomp --preset macos-arm64-release \
-  -DGOLDENEYE_VERSION=0.1.0 \
-  -DGOLDENEYE_BUILD_NUMBER=1 \
-  -DGOLDENEYE_BUNDLE_IDENTIFIER=io.github.ysrdevs.goldeneye-metal
-
-cmake --build vendor/GoldenEye-Recomp/out/build/macos-arm64-release \
-  --target goldeneye_macos_app_verify --parallel
+./launcher/build-app.sh
 ```
 
-The verification target checks the bundle metadata, Apple Silicon slices,
-portable dynamic-library linkage and RPATH, and confirms that no recognizable
-game-content files were staged. It intentionally does not sign anything.
+The script configures the SDK and game release, builds the pinned graphics
+dependency and native runtime, then invokes `goldeneye_macos_app_verify`. The
+verification target checks bundle metadata, Apple Silicon slices, portable
+dynamic-library linkage and RPATH, and confirms that no recognizable game
+content was staged. It intentionally does not sign anything.
 
 Open this unsigned build and exercise the first-launch import with a local
 backup stored outside the application before starting the release process.
@@ -77,102 +98,43 @@ Quit, reopen it, and confirm that the imported cache launches without showing
 the setup window again. Do not modify any file inside the app after it has
 been signed.
 
-## 2. Sign the app with hardened runtime
+## 2. Store notarization credentials once
 
-The following commands are for the release owner to run. Replace the identity
-with the exact Developer ID Application identity shown by Keychain Access or
-`security find-identity -v -p codesigning`.
-
-```sh
-export APP="$PWD/vendor/GoldenEye-Recomp/out/build/macos-arm64-release/dist/GoldenEye Metal.app"
-export DEVELOPER_ID_APPLICATION='Developer ID Application: Your Name (TEAMID)'
-
-/usr/bin/codesign --force --options runtime --timestamp \
-  --sign "$DEVELOPER_ID_APPLICATION" \
-  "$APP/Contents/Frameworks/librexruntime.dylib"
-
-/usr/bin/codesign --force --options runtime --timestamp \
-  --sign "$DEVELOPER_ID_APPLICATION" \
-  "$APP"
-
-/usr/bin/codesign --verify --deep --strict --verbose=2 "$APP"
-```
-
-Sign nested code first and the outer app last. Do not use `codesign --deep` to
-perform the signing; it can conceal missing or incorrectly signed nested code.
-This application does not use the App Sandbox and currently needs no custom
-entitlements. Gatekeeper assessment is performed after notarization; an
-otherwise valid Developer ID app may still be reported as unnotarized at this
-stage.
-
-## 3. Create and sign the DMG
-
-Create a clean staging directory so the disk image contains only the app and
-an Applications shortcut:
+The existing `cyberconsole-notary` Keychain profile can be reused for this
+project because it represents the same Apple developer account and team. If it
+ever needs to be recreated, use an app-specific password and let `notarytool`
+prompt securely:
 
 ```sh
-export RELEASE_DIR="$PWD/release"
-export DMG="$RELEASE_DIR/GoldenEye-Metal-0.1.0-macos-arm64.dmg"
-export DMG_STAGE="$RELEASE_DIR/dmg-root"
-
-rm -rf "$DMG_STAGE"
-mkdir -p "$DMG_STAGE" "$RELEASE_DIR"
-/usr/bin/ditto "$APP" "$DMG_STAGE/GoldenEye Metal.app"
-ln -s /Applications "$DMG_STAGE/Applications"
-
-/usr/bin/hdiutil create \
-  -volname "GoldenEye Metal" \
-  -srcfolder "$DMG_STAGE" \
-  -format UDZO -ov "$DMG"
-
-/usr/bin/codesign --force --timestamp \
-  --sign "$DEVELOPER_ID_APPLICATION" "$DMG"
-/usr/bin/codesign --verify --verbose=2 "$DMG"
-/usr/bin/hdiutil verify "$DMG"
-```
-
-The `release/` directory is ignored by Git. Never add imported or extracted
-game data to the DMG staging directory.
-
-## 4. Store notarization credentials once
-
-Use an app-specific password for the Apple Account associated with the
-Developer ID team. This stores the credential in the login keychain rather
-than in a shell script or repository:
-
-```sh
-xcrun notarytool store-credentials "goldeneye-metal-notary" \
+xcrun notarytool store-credentials "cyberconsole-notary" \
   --apple-id "YOUR_APPLE_ACCOUNT_EMAIL" \
-  --team-id "YOUR_TEAM_ID"
+  --team-id "9RCV543M32"
 ```
 
-`notarytool` securely prompts for the app-specific password. Do not put that
-password directly on the command line, where it may remain in shell history.
-Do not commit Apple Account credentials, private keys, certificates, or
-notarization output containing private account information.
+Do not put an app-specific password directly in a command or script. Do not
+commit Apple Account credentials, private keys, certificates, or notarization
+output. The profile name is not a secret; the credential stored in Keychain is.
 
-## 5. Notarize, staple, and assess the DMG
+## 3. What the release script verifies
 
-```sh
-xcrun notarytool submit "$DMG" \
-  --keychain-profile "goldeneye-metal-notary" \
-  --wait
+The automated release deliberately performs the complete sequence:
 
-# Copy the submission ID printed above, then inspect its complete log.
-xcrun notarytool log "SUBMISSION_ID" \
-  --keychain-profile "goldeneye-metal-notary"
+1. Recreate and validate the unsigned app.
+2. Sign `librexruntime.dylib`, then the outer app, with hardened runtime and a
+   trusted timestamp. No JIT or library-validation exceptions are used.
+3. Submit a temporary app ZIP and require Apple's explicit `Accepted` status.
+4. Staple, validate, and Gatekeeper-assess the app.
+5. Create the public ZIP from the stapled app.
+6. Create a DMG containing only the stapled app and an Applications shortcut.
+7. Sign, verify, notarize, staple, validate, and Gatekeeper-assess the DMG.
 
-xcrun stapler staple "$DMG"
-xcrun stapler validate "$DMG"
-/usr/sbin/spctl --assess --type open \
-  --context context:primary-signature --verbose=4 "$DMG"
-```
-
-`notarytool submit --wait` must report `Accepted` before stapling. Inspect the
-successful log as well and confirm that the application and embedded runtime
-appear as expected. If Apple rejects the submission, use the log to correct
-the reported issue, rebuild from the unsigned app, and repeat the signing
-process.
+The Apple result plists and full notarization logs are retained under the
+ignored `release/` directory. Temporary upload and DMG-staging files are
+removed automatically. Final-looking ZIP and DMG names are replaced only after
+every signing, notarization, and validation check succeeds, so a rejected or
+invalid candidate does not overwrite the last completed release. The
+application needs no custom entitlements, and the script does not use
+`codesign --deep` to perform signing.
 
 Before publishing, mount the final DMG on a separate macOS user account or a
 clean Mac, drag the app to Applications, launch it through Finder, import only

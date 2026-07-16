@@ -1,6 +1,6 @@
 # GoldenEye native Metal project status
 
-Last updated: 2026-07-15
+Last updated: 2026-07-16
 
 ## Goal
 
@@ -130,8 +130,11 @@ invokes the system reader without a shell and streams only the single package me
 extracts arbitrary archive paths, downloads content, or includes game data in the app. Direct STFS
 mounting remains available to the runtime, while the one-time flat import is the default player
 route for better read performance. The older `.command` launcher remains a build-tree developer
-convenience. Signing, DMG creation, and notarization are deliberately release-owner steps and have
-not been executed as part of this milestone.
+convenience. `launcher/build-app.sh` now builds an audited macOS-14-compatible SPIRV-Cross copy and
+verifies the unsigned bundle. `tools/sign-notarize.sh` automates nested Developer ID signing, app
+and DMG notarization/stapling, Gatekeeper checks, and atomic publication of the final ZIP and DMG.
+Those Apple signing, notarization, and DMG operations remain release-owner steps and have not been
+executed as part of this milestone.
 
 Modern controller input now follows the native SDL gamepad path by default on macOS and is selected
 explicitly by the Finder launcher. SDL's bundled mappings cover DualShock 4, DualSense, Xbox One,
@@ -299,6 +302,8 @@ longer blocked on that sequence.
 - Hot-plug, four-slot compaction, fifth-pad promotion, focus-safe rumble, and virtual-device tests
 - Native macOS application launcher with exact local ZIP/STFS validation, safe atomic import,
   remembered game data, and automatic Metal/controller/MnK selection
+- Reproducible unsigned app build plus release-owner signing/notarization scripts with pinned
+  macOS-14 SPIRV-Cross, stapled ZIP/DMG output, and fail-safe artifact publication
 - Build-tree `.command` launcher for local developer runs
 - Controller-state input regressions plus pause-menu capture suppression and runtime macOS rebinding
 - Guest polygon cull mode and front-face winding with focused Metal regression coverage
@@ -326,7 +331,7 @@ longer blocked on that sequence.
 | E. Recognizable menu | Passed | Corrected-clock 1280x720 captures present the real dossier menu through the strict path; short samples reported 30.0 and 59.9 guest-delivered FPS |
 | F. Sustained title execution | Passed | WPTR >1088 and normal `IssueSwap` at least 4416 without scavenging, replay, forced presentation, false GPU-hang dumps, or debug traps |
 | G. First mission gameplay | Passed for deterministic input | The input-only route reaches a clean Dam briefing and fully rendered dynamic gameplay; correct captures have displayed 46.5 and 60.0 FPS, but sustained 60 across broader views remains in progress |
-| H. Native player launcher | Passed unsigned | The arm64 `.app` stages with portable runtime linkage, icon, metadata, and notices but no game content; the exact supported LIVE/STFS package imports and validates all 1,803 title files through the same backend used by the first-run UI |
+| H. Native player launcher | Passed unsigned | The arm64 `.app` stages with portable runtime linkage, icon, metadata, and notices without copying an XEX, extracted assets, or standalone game-data files; the exact supported LIVE/STFS package imports and validates all 1,803 title files through the same backend used by the first-run UI |
 
 ## Primary blocker
 
