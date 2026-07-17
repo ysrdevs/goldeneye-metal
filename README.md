@@ -3,8 +3,8 @@
 GoldenEye 007 gameplay on macOS, recompiled for Apple Silicon and rendered directly with Apple
 Metal.
 
-**[Download v0.1.0 for macOS (.dmg)](https://github.com/ysrdevs/goldeneye-metal/releases/download/v0.1.0/GoldenEye-Metal-0.1.0-macos-arm64.dmg)** ·
-[Release notes](https://github.com/ysrdevs/goldeneye-metal/releases/tag/v0.1.0) ·
+**[Download v0.1.1 for macOS (.dmg)](https://github.com/ysrdevs/goldeneye-metal/releases/download/v0.1.1/GoldenEye-Metal-0.1.1-macos-arm64.dmg)** ·
+[Release notes](https://github.com/ysrdevs/goldeneye-metal/releases/tag/v0.1.1) ·
 [Watch gameplay](https://youtu.be/VkbwbXw2tPw) ·
 [Discord](https://discord.gg/2AKEFgR7)
 
@@ -24,7 +24,7 @@ You need:
 
 To start playing:
 
-1. [Download the DMG](https://github.com/ysrdevs/goldeneye-metal/releases/download/v0.1.0/GoldenEye-Metal-0.1.0-macos-arm64.dmg).
+1. [Download the DMG](https://github.com/ysrdevs/goldeneye-metal/releases/download/v0.1.1/GoldenEye-Metal-0.1.1-macos-arm64.dmg).
 2. Open it and drag **GoldenEye Metal.app** into Applications.
 3. Launch the app and select your compatible local game backup.
 4. Wait for the one-time import. Future launches start directly from the private local copy.
@@ -97,7 +97,7 @@ the [native Metal technical status](docs/GOLDENEYE_NATIVE_METAL_PROJECT_STATUS.m
 
 | Platform | Status |
 | --- | --- |
-| Apple Silicon macOS | Active development; public v0.1.0 release reaches first-mission gameplay |
+| Apple Silicon macOS | Active development; public v0.1.1 release reaches first-mission gameplay |
 | Windows and Linux | Backend code exists, but this project's current changes are not verified there |
 
 ## Build and contribute

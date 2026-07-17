@@ -74,7 +74,7 @@ body:
     attributes:
       label: Version / Commit
       description: Version number or git commit hash
-      placeholder: v0.1.0 or abc1234
+      placeholder: v0.1.1 or abc1234
     validations:
       required: false
 
