@@ -34,6 +34,16 @@ if(APPLE)
     )
 endif()
 
+if(REXGLUE_USE_METAL)
+    target_sources(unit_tests PRIVATE
+        graphics/metal_completion_packet_test.cpp
+    )
+    target_link_libraries(unit_tests PRIVATE
+        glslang::SPIRV
+        xxHash::xxhash
+    )
+endif()
+
 target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/rexglue/commands/migration_scan.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/ui.cpp

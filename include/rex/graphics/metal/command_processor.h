@@ -27,7 +27,7 @@ namespace rex::graphics::metal {
 
 class MetalCommandProcessor final : public CommandProcessor {
  public:
-  MetalCommandProcessor(MetalGraphicsSystem* graphics_system, system::KernelState* kernel_state);
+  MetalCommandProcessor(GraphicsSystem* graphics_system, system::KernelState* kernel_state);
   ~MetalCommandProcessor() override;
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,

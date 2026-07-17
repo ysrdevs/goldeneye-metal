@@ -1382,7 +1382,7 @@ bool TransformGuestPositionForHost(const float* guest_position, reg::PA_CL_VTE_C
 
 }  // namespace
 
-MetalCommandProcessor::MetalCommandProcessor(MetalGraphicsSystem* graphics_system,
+MetalCommandProcessor::MetalCommandProcessor(GraphicsSystem* graphics_system,
                                              system::KernelState* kernel_state)
     : CommandProcessor(graphics_system, kernel_state) {}
 
@@ -2379,6 +2379,26 @@ bool MetalCommandProcessor::WriteGpuCompletionMemory(uint32_t address, const voi
     return false;
   }
 
+  // With no pending resident-to-guest publication, preserve the base command
+  // processor's immediate guest-visible EVENT_WRITE semantics. This keeps the
+  // marker before any later draw packet. Invalidate the separate resident
+  // Metal copy so a later GPU consumer reloads the marker rather than trusting
+  // stale bytes. A pending resolve is different: its completion must stay
+  // ordered behind the publication, so it takes the queued path below.
+  if (pending_gpu_tiled_resolve_publication_ranges_.empty()) {
+    if (!pending_gpu_completion_writes_.empty() && !FlushGpuCompletionMemoryWrites()) {
+      return false;
+    }
+    if (!CommandProcessor::WriteGpuCompletionMemory(physical_address, data, length)) {
+      return false;
+    }
+    if (shared_memory_) {
+      shared_memory_->MemoryInvalidationCallback(physical_address, uint32_t(length), true);
+    }
+    ++gpu_completion_write_count_;
+    return true;
+  }
+
   // If the same bytes are written twice in one ring batch, expose the earlier
   // value first. This preserves polling handshakes that use transitions on one
   // fence while still batching the hundreds of independent completion writes
@@ -2401,9 +2421,12 @@ bool MetalCommandProcessor::WriteGpuCompletionMemory(uint32_t address, const voi
   } catch (...) {
     return false;
   }
-  // Bound the amount of delayed guest-visible state even for a pathological
-  // command ring that continuously feeds itself without reaching its end.
-  return pending_gpu_completion_writes_.size() < 256 || FlushGpuCompletionMemoryWrites();
+  // A completion packet closes the ordering epoch for all GPU work before it.
+  // Deferring it across later draw or copy packets moves the guest-visible
+  // event after work that was submitted after the event, which breaks query
+  // and visibility handshakes. Keep the asynchronous GPU-ordered write, but
+  // publish each completion before processing the next packet.
+  return FlushGpuCompletionMemoryWrites();
 }
 
 bool MetalCommandProcessor::FlushGpuCompletionMemoryWrites() {
