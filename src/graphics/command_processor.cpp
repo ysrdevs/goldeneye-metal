@@ -862,6 +862,26 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   }
 }
 
+bool CommandProcessor::WriteGpuMemory(uint32_t address, const void* data, size_t length) {
+  if (!data || !length || !memory_) {
+    return false;
+  }
+  void* destination = memory_->TranslatePhysical(address);
+  if (!destination) {
+    return false;
+  }
+  std::memcpy(destination, data, length);
+  return true;
+}
+
+bool CommandProcessor::WriteGpuCompletionMemory(uint32_t address, const void* data, size_t length) {
+  return WriteGpuMemory(address, data, length);
+}
+
+bool CommandProcessor::FlushGpuCompletionMemoryWrites() {
+  return true;
+}
+
 void CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
                                              uint32_t num_registers) {
   for (uint32_t i = 0; i < num_registers; ++i) {
@@ -1599,6 +1619,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   uint32_t wait = reader->ReadAndSwap<uint32_t>();
 
   bool is_memory = (wait_info & 0x10) != 0;
+  if (is_memory && !FlushGpuCompletionMemoryWrites()) {
+    return false;
+  }
 
   // Deadlock breaker: a WAIT_REG_MEM polls a fence the guest CPU is expected to
   // write. If that CPU thread is itself parked waiting on GPU completion (the
@@ -1628,8 +1651,13 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
     ++poll_count;
     uint32_t value = 0;
     if (is_memory) {
-      value =
-          *reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
+      const volatile uint32_t* poll_value = reinterpret_cast<const volatile uint32_t*>(
+          memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
+      value = *poll_value;
+      // The value may be written by a host GPU command rather than by a C++
+      // thread. Keep every poll as an observable load and prevent later host
+      // reads from moving ahead of a matched completion value.
+      std::atomic_thread_fence(std::memory_order_acquire);
       trace_writer_.WriteMemoryRead(CpuToGpu(poll_reg_addr & ~uint32_t(0x3)), sizeof(uint32_t));
       value = xenos::GpuSwap(value, static_cast<xenos::Endian>(poll_reg_addr & 0x3));
     } else {
@@ -1758,7 +1786,9 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
   auto endianness = static_cast<xenos::Endian>(mem_addr & 0x3);
   mem_addr &= ~0x3;
   reg_val = GpuSwap(reg_val, endianness);
-  memory::store(memory_->TranslatePhysical(mem_addr), reg_val);
+  if (!WriteGpuMemory(mem_addr, &reg_val, sizeof(reg_val))) {
+    return false;
+  }
   trace_writer_.WriteMemoryWrite(CpuToGpu(mem_addr), 4);
 
   return true;
@@ -1773,7 +1803,9 @@ bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, 
     auto endianness = static_cast<xenos::Endian>(write_addr & 0x3);
     auto addr = write_addr & ~0x3;
     write_data = GpuSwap(write_data, endianness);
-    memory::store(memory_->TranslatePhysical(addr), write_data);
+    if (!WriteGpuMemory(addr, &write_data, sizeof(write_data))) {
+      return false;
+    }
     trace_writer_.WriteMemoryWrite(CpuToGpu(addr), 4);
     write_addr += 4;
   }
@@ -1836,7 +1868,9 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
       auto endianness = static_cast<xenos::Endian>(write_reg_addr & 0x3);
       write_reg_addr &= ~0x3;
       write_data = GpuSwap(write_data, endianness);
-      memory::store(memory_->TranslatePhysical(write_reg_addr), write_data);
+      if (!WriteGpuMemory(write_reg_addr, &write_data, sizeof(write_data))) {
+        return false;
+      }
       trace_writer_.WriteMemoryWrite(CpuToGpu(write_reg_addr), 4);
     } else {
       // Register.
@@ -1882,8 +1916,10 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
-  memory::store(memory_->TranslatePhysical(address), data_value);
-  trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
+  if (!WriteGpuCompletionMemory(address, &data_value, sizeof(data_value))) {
+    return false;
+  }
+  trace_writer_.WriteMemoryWrite(CpuToGpu(address), sizeof(data_value), &data_value);
   return true;
 }
 
@@ -1910,9 +1946,12 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* re
       1,                                         // max z
   };
   assert_true(endianness == xenos::Endian::k8in16);
-  memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(address), extents,
-                                     rex::countof(extents));
-  trace_writer_.WriteMemoryWrite(CpuToGpu(address), sizeof(extents));
+  uint16_t swapped_extents[rex::countof(extents)];
+  memory::copy_and_swap_16_unaligned(swapped_extents, extents, rex::countof(extents));
+  if (!WriteGpuCompletionMemory(address, swapped_extents, sizeof(swapped_extents))) {
+    return false;
+  }
+  trace_writer_.WriteMemoryWrite(CpuToGpu(address), sizeof(swapped_extents), swapped_extents);
   return true;
 }
 

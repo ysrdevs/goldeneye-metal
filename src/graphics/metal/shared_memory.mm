@@ -27,6 +27,40 @@ bool RangesOverlap(uint32_t a_start, uint32_t a_length, uint32_t b_start, uint32
   return uint64_t(a_start) < b_end && uint64_t(b_start) < a_end;
 }
 
+bool NormalizeByteRanges(const std::vector<std::pair<uint32_t, uint32_t>>& input,
+                         std::vector<std::pair<uint32_t, uint32_t>>& output) {
+  output.clear();
+  output.reserve(input.size());
+  for (const auto& range : input) {
+    if (!range.second) {
+      continue;
+    }
+    if (range.first >= SharedMemory::kBufferSize ||
+        range.second > SharedMemory::kBufferSize - range.first) {
+      output.clear();
+      return false;
+    }
+    output.push_back(range);
+  }
+  std::sort(output.begin(), output.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+  size_t merged_count = 0;
+  for (const auto& range : output) {
+    if (merged_count) {
+      auto& previous = output[merged_count - 1];
+      uint64_t previous_end = uint64_t(previous.first) + previous.second;
+      uint64_t range_end = uint64_t(range.first) + range.second;
+      if (uint64_t(range.first) <= previous_end) {
+        previous.second = uint32_t(std::max(previous_end, range_end) - previous.first);
+        continue;
+      }
+    }
+    output[merged_count++] = range;
+  }
+  output.resize(merged_count);
+  return true;
+}
+
 }  // namespace
 
 MetalSharedMemory::MetalSharedMemory(memory::Memory& memory, TraceWriter& trace_writer)
@@ -82,11 +116,23 @@ bool MetalSharedMemory::Initialize(void* metal_device) {
     [command_queue release];
     return false;
   }
+  id<MTLBuffer> guest_memory_buffer = [device newBufferWithBytesNoCopy:memory().physical_membase()
+                                                                length:kBufferSize
+                                                               options:MTLResourceStorageModeShared
+                                                           deallocator:nil];
+  if (!guest_memory_buffer) {
+    std::fprintf(stderr, "[metal] MetalSharedMemory: guest physical Metal alias unavailable; "
+                         "GPU resolve publication will use the synchronous fallback\n");
+    std::fflush(stderr);
+  } else {
+    guest_memory_buffer.label = @"ReX Metal guest physical memory alias";
+  }
   // newBufferWithLength returns a +1 object. This target is built without ARC,
   // so store that ownership directly and balance it in Shutdown(). A bridging
   // retain here would add a second reference and leak the 512 MiB buffer.
   command_queue_ = (void*)command_queue;
   buffer_ = (void*)gpu_buffer;
+  guest_memory_buffer_ = (void*)guest_memory_buffer;
   return true;
 }
 
@@ -97,6 +143,10 @@ void MetalSharedMemory::Shutdown(bool from_destructor) {
   WaitForPendingUploads();
   host_resource_mutation_callback_ = {};
   gpu_resource_mutation_callback_ = {};
+  if (guest_memory_buffer_) {
+    [(id<MTLBuffer>)guest_memory_buffer_ release];
+    guest_memory_buffer_ = nullptr;
+  }
   if (buffer_) {
     [(id<MTLBuffer>)buffer_ release];
     buffer_ = nullptr;
@@ -334,7 +384,14 @@ bool MetalSharedMemory::CommitGuestCpuWriteAsGpu(uint32_t start, uint32_t length
   }
   length = std::min(length, kBufferSize - start);
 
-  const uint8_t* guest_source = memory().TranslatePhysical<const uint8_t*>(start);
+  uint32_t original_start = start;
+  uint32_t original_length = length;
+  uint32_t page_mask = uint32_t(rex::memory::page_size()) - 1;
+  uint32_t copy_start = start & ~page_mask;
+  uint64_t copy_end_unclamped = (uint64_t(start) + length + page_mask) & ~uint64_t(page_mask);
+  uint32_t copy_end = uint32_t(std::min<uint64_t>(copy_end_unclamped, uint64_t(kBufferSize)));
+  uint32_t copy_length = copy_end - copy_start;
+  const uint8_t* guest_source = memory().TranslatePhysical<const uint8_t*>(copy_start);
   id<MTLBuffer> gpu_buffer = (id<MTLBuffer>)buffer_;
   uint8_t* buffer_contents = reinterpret_cast<uint8_t*>([gpu_buffer contents]);
   if (!guest_source || !buffer_contents) {
@@ -350,8 +407,8 @@ bool MetalSharedMemory::CommitGuestCpuWriteAsGpu(uint32_t start, uint32_t length
   // invalidates it again and the next RequestRange performs a fresh upload.
   // Texture watches only mark resources outdated here; their reload happens on
   // a later command-processor request, after this synchronous copy completes.
-  RangeWrittenByGpu(start, length);
-  std::memcpy(buffer_contents + start, guest_source, length);
+  RangeWrittenByGpu(original_start, original_length);
+  std::memcpy(buffer_contents + copy_start, guest_source, copy_length);
   return true;
 }
 
@@ -382,6 +439,178 @@ bool MetalSharedMemory::CommitGpuBufferWriteToGuest(uint32_t start, uint32_t len
   RangeWrittenByGpu(start, length);
   std::memcpy(guest_destination, buffer_contents + start, length);
   return true;
+}
+
+bool MetalSharedMemory::PublishGpuBufferWritesToGuest(
+    const std::vector<std::pair<uint32_t, uint32_t>>& byte_ranges) {
+  std::vector<std::pair<uint32_t, uint32_t>> normalized_ranges;
+  if (!NormalizeByteRanges(byte_ranges, normalized_ranges)) {
+    return false;
+  }
+  if (normalized_ranges.empty()) {
+    return true;
+  }
+  if (!buffer_) {
+    return false;
+  }
+
+  id<MTLBuffer> gpu_buffer = (id<MTLBuffer>)buffer_;
+  const uint8_t* buffer_contents = reinterpret_cast<const uint8_t*>([gpu_buffer contents]);
+  if (!buffer_contents || !SynchronizeBeforeHostResourceMutation()) {
+    return false;
+  }
+
+  // RangeWrittenByGpu was called when each producer was enqueued. Copying the
+  // already-published ranges here avoids firing watches a second time (which
+  // would invalidate exact resolve metadata after it had just been built).
+  for (const auto& range : normalized_ranges) {
+    uint8_t* guest_destination = memory().TranslatePhysical<uint8_t*>(range.first);
+    if (!guest_destination) {
+      return false;
+    }
+    std::memcpy(guest_destination, buffer_contents + range.first, range.second);
+  }
+  return true;
+}
+
+bool MetalSharedMemory::EnqueueGpuOrderedGuestMemoryWrite(uint32_t start, const void* data,
+                                                          size_t length) {
+  static const std::vector<std::pair<uint32_t, uint32_t>> no_publication_ranges;
+  return EnqueueGpuOrderedGuestMemoryPublicationAndWrite(no_publication_ranges, start, data,
+                                                         length);
+}
+
+bool MetalSharedMemory::EnqueueGpuOrderedGuestMemoryPublicationAndWrite(
+    const std::vector<std::pair<uint32_t, uint32_t>>& publication_byte_ranges,
+    uint32_t completion_start, const void* completion_data, size_t completion_length) {
+  OrderedGuestMemoryWrite write = {
+      completion_start,
+      0,
+      uint32_t(std::min<size_t>(completion_length, UINT32_MAX)),
+  };
+  if (completion_length > UINT32_MAX) {
+    return false;
+  }
+  const std::vector<OrderedGuestMemoryWrite> writes = {write};
+  return EnqueueGpuOrderedGuestMemoryPublicationAndWrites(publication_byte_ranges, writes,
+                                                          completion_data, completion_length);
+}
+
+bool MetalSharedMemory::EnqueueGpuOrderedGuestMemoryPublicationAndWrites(
+    const std::vector<std::pair<uint32_t, uint32_t>>& publication_byte_ranges,
+    const std::vector<OrderedGuestMemoryWrite>& completion_writes, const void* completion_data,
+    size_t completion_data_length) {
+  if (!completion_data || !completion_data_length || completion_writes.empty() || !buffer_ ||
+      !guest_memory_buffer_ || !command_queue_ || !metal_device_) {
+    return false;
+  }
+  std::vector<std::pair<uint32_t, uint32_t>> publication_ranges;
+  if (!NormalizeByteRanges(publication_byte_ranges, publication_ranges)) {
+    return false;
+  }
+  std::vector<std::pair<uint32_t, uint32_t>> completion_ranges;
+  completion_ranges.reserve(completion_writes.size());
+  for (const OrderedGuestMemoryWrite& write : completion_writes) {
+    if (!write.length || write.start >= kBufferSize || write.length > kBufferSize - write.start ||
+        write.data_offset > completion_data_length ||
+        write.length > completion_data_length - write.data_offset) {
+      return false;
+    }
+    completion_ranges.emplace_back(write.start, write.length);
+  }
+  // RangeWrittenByGpu protects whole host pages. Preserve every byte outside
+  // these small packet writes before each page becomes GPU-owned, otherwise a
+  // later RequestRange may trust stale resident bytes.
+  if (!RequestRanges(completion_ranges.data(), completion_ranges.size())) {
+    return false;
+  }
+  if (!ReapPendingUploads(false)) {
+    return false;
+  }
+  if ((pending_uploads_.size() >= kMaxPendingUploadCount ||
+       pending_upload_bytes_ + completion_data_length > kMaxPendingUploadBytes) &&
+      !WaitForPendingUploads()) {
+    return false;
+  }
+
+  @autoreleasepool {
+    id<MTLDevice> device = (id<MTLDevice>)metal_device_;
+    id<MTLBuffer> resident_buffer = (id<MTLBuffer>)buffer_;
+    id<MTLBuffer> guest_buffer = (id<MTLBuffer>)guest_memory_buffer_;
+    id<MTLCommandQueue> command_queue = (id<MTLCommandQueue>)command_queue_;
+    id<MTLBuffer> staging_buffer = [device newBufferWithBytes:completion_data
+                                                       length:completion_data_length
+                                                      options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> command_buffer = [command_queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit_encoder =
+        command_buffer ? [command_buffer blitCommandEncoder] : nil;
+    if (!staging_buffer || !command_buffer || !blit_encoder) {
+      if (blit_encoder) {
+        [blit_encoder endEncoding];
+      }
+      if (staging_buffer) {
+        [staging_buffer release];
+      }
+      return false;
+    }
+    command_buffer.label = publication_ranges.empty()
+                               ? @"ReX Metal ordered guest memory write"
+                               : @"ReX Metal resolve publication and completion";
+
+    // Commit all open render encoders first. Every participant uses this
+    // command queue, so publication and the completion write become the
+    // guest-visible completion point for everything encoded before this packet.
+    if (gpu_resource_mutation_callback_ && !gpu_resource_mutation_callback_()) {
+      [blit_encoder endEncoding];
+      [staging_buffer release];
+      return false;
+    }
+    for (const auto& range : publication_ranges) {
+      [blit_encoder copyFromBuffer:resident_buffer
+                      sourceOffset:range.first
+                          toBuffer:guest_buffer
+                 destinationOffset:range.first
+                              size:range.second];
+    }
+    for (const OrderedGuestMemoryWrite& write : completion_writes) {
+      [blit_encoder copyFromBuffer:staging_buffer
+                      sourceOffset:write.data_offset
+                          toBuffer:resident_buffer
+                 destinationOffset:write.start
+                              size:write.length];
+      [blit_encoder copyFromBuffer:staging_buffer
+                      sourceOffset:write.data_offset
+                          toBuffer:guest_buffer
+                 destinationOffset:write.start
+                              size:write.length];
+    }
+    [blit_encoder endEncoding];
+
+    PendingUpload pending;
+    pending.command_buffer = (void*)[command_buffer retain];
+    pending.staging_buffer = (void*)staging_buffer;
+    pending.staging_size = completion_data_length;
+    pending.byte_ranges = publication_ranges;
+    pending.byte_ranges.insert(pending.byte_ranges.end(), completion_ranges.begin(),
+                               completion_ranges.end());
+    try {
+      pending_uploads_.push_back(std::move(pending));
+    } catch (...) {
+      [(id<MTLCommandBuffer>)pending.command_buffer release];
+      [(id<MTLBuffer>)pending.staging_buffer release];
+      return false;
+    }
+
+    // Publish before commit, matching UploadRanges' invalidation race
+    // contract. If the command later fails, ReapPendingUploads invalidates the
+    // range and a future RequestRange restores it from guest memory.
+    for (const auto& range : completion_ranges) {
+      RangeWrittenByGpu(range.first, range.second);
+    }
+    [command_buffer commit];
+    pending_upload_bytes_ += completion_data_length;
+    return true;
+  }
 }
 
 }  // namespace rex::graphics::metal

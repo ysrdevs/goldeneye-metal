@@ -15,6 +15,7 @@ using rex::X_RESULT;
 using rex::X_STATUS;
 using rex::input::X_INPUT_GAMEPAD_A;
 using rex::input::X_INPUT_GAMEPAD_DPAD_UP;
+using rex::input::X_INPUT_GAMEPAD_RIGHT_SHOULDER;
 using rex::input::X_INPUT_GAMEPAD_Y;
 using rex::input::X_INPUT_STATE;
 using rex::input::X_INPUT_VIBRATION;
@@ -210,6 +211,7 @@ TEST_CASE("SDL virtual gamepad maps modern controller controls and activity", "[
   REQUIRE(fixture.Poll(0, state) == X_ERROR_SUCCESS);
 
   gamepad.SetButton(SDL_GAMEPAD_BUTTON_SOUTH, true);
+  gamepad.SetButton(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, true);
   gamepad.SetButton(SDL_GAMEPAD_BUTTON_DPAD_UP, true);
   gamepad.SetAxis(SDL_GAMEPAD_AXIS_LEFTX, 12345);
   gamepad.SetAxis(SDL_GAMEPAD_AXIS_LEFTY, -20000);
@@ -224,12 +226,18 @@ TEST_CASE("SDL virtual gamepad maps modern controller controls and activity", "[
   REQUIRE(fixture.Poll(0, state) == X_ERROR_SUCCESS);
   CHECK((state.gamepad.buttons & X_INPUT_GAMEPAD_A) != 0);
   CHECK((state.gamepad.buttons & X_INPUT_GAMEPAD_DPAD_UP) != 0);
+  CHECK((state.gamepad.buttons & X_INPUT_GAMEPAD_RIGHT_SHOULDER) != 0);
   CHECK(state.gamepad.thumb_lx == 12345);
   CHECK(state.gamepad.thumb_ly == 19999);
   CHECK(state.gamepad.thumb_rx == -16000);
   CHECK(state.gamepad.thumb_ry == -7001);
   CHECK(state.gamepad.left_trigger == 127);
   CHECK(state.gamepad.right_trigger == 255);
+
+  gamepad.SetButton(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, false);
+  gamepad.Commit();
+  REQUIRE(fixture.Poll(0, state) == X_ERROR_SUCCESS);
+  CHECK((state.gamepad.buttons & X_INPUT_GAMEPAD_RIGHT_SHOULDER) == 0);
 
   active = false;
   REQUIRE(fixture.Poll(0, state) == X_ERROR_SUCCESS);

@@ -27,6 +27,7 @@ using rex::graphics::metal::ClearPipelineProbeContext;
 using rex::graphics::metal::CreateHostRenderTargetContext;
 using rex::graphics::metal::CreateMslLibrary;
 using rex::graphics::metal::CreatePipelineProbeContext;
+using rex::graphics::metal::CreatePipelineProbeSnapshotTexture;
 using rex::graphics::metal::CreateRenderPipelineState;
 using rex::graphics::metal::GetPipelineProbeContextPendingSubmissionCount;
 using rex::graphics::metal::GetPipelineProbeContextUploadStats;
@@ -40,14 +41,17 @@ using rex::graphics::metal::ProbeSamplerSlot;
 using rex::graphics::metal::ProbeTextureSlot;
 using rex::graphics::metal::ProbeTiledResolveTarget;
 using rex::graphics::metal::QueuePipelineProbeContextClearRect;
+using rex::graphics::metal::QueuePipelineProbeSnapshotCopy;
 using rex::graphics::metal::ReadPipelineProbeContext;
 using rex::graphics::metal::ReadPipelineProbeContextRect;
 using rex::graphics::metal::ReleaseMslLibrary;
 using rex::graphics::metal::ReleasePipelineProbeContext;
+using rex::graphics::metal::ReleasePipelineProbeSnapshotTexture;
 using rex::graphics::metal::ReleaseRenderPipelineState;
 using rex::graphics::metal::RenderPipelineProbeToContext;
 using rex::graphics::metal::ResetPipelineProbeContext;
 using rex::graphics::metal::ResolvePipelineProbeContextToXenosTiled;
+using rex::graphics::metal::SharePipelineProbeDepthStencilTarget;
 using rex::graphics::metal::WaitPipelineProbeContext;
 
 constexpr uint32_t kWidth = 40;
@@ -658,9 +662,100 @@ int RunPipelineProbeTest() {
     bool stencil_persistence_ok = stencil_center && PixelNear(stencil_center, kRedBgra);
     bool depth_stencil_ok = depth_persistence_ok && depth_write_mask_ok && stencil_persistence_ok;
 
+    // Separate color targets may alias one compatible depth target. Leave the
+    // first context's near-depth draw in an open batch, then immediately draw
+    // farther geometry through the second context. The ownership handoff must
+    // commit the first batch before opening the second, and the second color
+    // target's first-pass clear must not clear already initialized shared depth.
+    id<MTLCommandQueue> shared_depth_queue = [device newCommandQueue];
+    std::string shared_depth_error;
+    void* shared_depth_context_a =
+        shared_depth_queue
+            ? CreateHostRenderTargetContext(device, shared_depth_queue, &shared_depth_error)
+            : nullptr;
+    void* shared_depth_context_b =
+        shared_depth_context_a
+            ? CreateHostRenderTargetContext(device, shared_depth_queue, &shared_depth_error)
+            : nullptr;
+    bool shared_depth_attached =
+        shared_depth_context_b &&
+        SharePipelineProbeDepthStencilTarget(shared_depth_context_b, shared_depth_context_a,
+                                             &shared_depth_error);
+    auto render_shared_depth_quad = [&](void* target_context,
+                                        const std::array<float, 12>& positions,
+                                        const ProbeTextureSlot& draw_texture) {
+      return RenderPipelineProbeToContext(
+          target_context, depth_pipeline_state, kUnusedSystemConstants.data(),
+          sizeof(kUnusedSystemConstants), nullptr, 0, nullptr, 0, nullptr, 0, nullptr, nullptr, 0,
+          0, &draw_texture, 1, 1,
+          /*primitive_type=TriangleList=*/4, uint32_t(kFanIndices.size()), kWidth, kHeight,
+          &shared_depth_error,
+          /*vertex_shared_memory_buffer_index=*/UINT32_MAX, UINT32_MAX, UINT32_MAX, nullptr, 0,
+          UINT32_MAX, UINT32_MAX, nullptr, &sampler, positions.data(), sizeof(positions),
+          /*vertex_data_buffer_index=*/3, nullptr, 0, UINT32_MAX, UINT32_MAX, &fan_index_buffer,
+          &depth_rasterization_state, &depth_less_write);
+    };
+    bool shared_depth_cleared =
+        shared_depth_attached && ClearPipelineProbeContext(shared_depth_context_a, kWidth, kHeight,
+                                                           0.0, 0.0, 0.0, 1.0, &shared_depth_error);
+    bool shared_depth_near_rendered =
+        shared_depth_cleared &&
+        render_shared_depth_quad(shared_depth_context_a, kNearDepthPositions, green_texture);
+    uint32_t shared_depth_a_pending_before_handoff =
+        GetPipelineProbeContextPendingSubmissionCount(shared_depth_context_a);
+    bool shared_depth_far_rendered =
+        shared_depth_near_rendered &&
+        render_shared_depth_quad(shared_depth_context_b, kFarDepthPositions, red_texture);
+    uint32_t shared_depth_a_pending_after_handoff =
+        GetPipelineProbeContextPendingSubmissionCount(shared_depth_context_a);
+    std::vector<uint8_t> shared_depth_bgra;
+    bool shared_depth_read = shared_depth_far_rendered &&
+                             ReadPipelineProbeContext(shared_depth_context_b, kWidth, kHeight,
+                                                      shared_depth_bgra, &shared_depth_error);
+    const uint8_t* shared_depth_center =
+        shared_depth_read && shared_depth_bgra.size() == size_t(kWidth) * kHeight * 4
+            ? shared_depth_bgra.data() + (size_t(kHeight / 2) * kWidth + kWidth / 2) * 4
+            : nullptr;
+    std::string incompatible_depth_error;
+    void* incompatible_depth_context =
+        CreateHostRenderTargetContext(device, &incompatible_depth_error);
+    bool incompatible_queue_rejected =
+        incompatible_depth_context &&
+        !SharePipelineProbeDepthStencilTarget(incompatible_depth_context, shared_depth_context_a,
+                                              &incompatible_depth_error) &&
+        !incompatible_depth_error.empty();
+    std::string incompatible_dimensions_error;
+    void* incompatible_dimensions_context =
+        shared_depth_queue ? CreateHostRenderTargetContext(device, shared_depth_queue,
+                                                           &incompatible_dimensions_error)
+                           : nullptr;
+    bool incompatible_dimensions_initialized =
+        incompatible_dimensions_context &&
+        ClearPipelineProbeContext(incompatible_dimensions_context, kWidth / 2, kHeight / 2, 0.0,
+                                  0.0, 0.0, 1.0, &incompatible_dimensions_error);
+    bool incompatible_dimensions_rejected =
+        incompatible_dimensions_initialized &&
+        !SharePipelineProbeDepthStencilTarget(incompatible_dimensions_context,
+                                              shared_depth_context_a,
+                                              &incompatible_dimensions_error) &&
+        !incompatible_dimensions_error.empty();
+    bool shared_depth_ok = shared_depth_center &&
+                           PixelNear(shared_depth_center, std::array<uint8_t, 4>{0, 0, 0, 255}) &&
+                           shared_depth_a_pending_before_handoff == 1 &&
+                           shared_depth_a_pending_after_handoff == 1 &&
+                           incompatible_queue_rejected && incompatible_dimensions_rejected;
+    ReleasePipelineProbeContext(incompatible_dimensions_context);
+    ReleasePipelineProbeContext(incompatible_depth_context);
+    ReleasePipelineProbeContext(shared_depth_context_b);
+    ReleasePipelineProbeContext(shared_depth_context_a);
+    if (shared_depth_queue) {
+      [shared_depth_queue release];
+    }
+
     // Host render targets use private Metal storage. Their regional readback
     // must enqueue the blit behind pending draws and fence both with one wait.
-    void* private_context = CreateHostRenderTargetContext(device, &error);
+    id<MTLCommandQueue> private_queue = [device newCommandQueue];
+    void* private_context = CreateHostRenderTargetContext(device, private_queue, &error);
     bool private_rendered =
         private_context &&
         render_indexed_fan_to_context(private_context, pipeline_state, &texture, kWidth, kHeight);
@@ -688,8 +783,10 @@ int RunPipelineProbeTest() {
     constexpr size_t kPartialTiledBufferOffset = 256;
     id<MTLBuffer> tiled_buffer = [device newBufferWithLength:kTiledBufferSize
                                                      options:MTLResourceStorageModeShared];
+    id<MTLBuffer> tiled_guest_mirror_buffer =
+        [device newBufferWithLength:kTiledBufferSize options:MTLResourceStorageModeShared];
     bool tiled_rendered =
-        private_region_ok && tiled_buffer &&
+        private_region_ok && tiled_buffer && tiled_guest_mirror_buffer &&
         render_indexed_fan_to_context(private_context, pipeline_state, &texture, kWidth, kHeight);
     uint32_t tiled_pending_before = GetPipelineProbeContextPendingSubmissionCount(private_context);
     uint32_t tiled_pending_after_first = UINT32_MAX;
@@ -729,23 +826,108 @@ int RunPipelineProbeTest() {
       partial_target.x = 7;
       partial_target.y = 9;
       partial_target.endian = endian;
+      partial_target.guest_memory_metal_buffer = tiled_guest_mirror_buffer;
+      partial_target.guest_memory_copy_length = kTiledBufferSize;
+      std::memset([tiled_guest_mirror_buffer contents], uint8_t(0x50 + endian), kTiledBufferSize);
       bool partial_resolved = ResolvePipelineProbeContextToXenosTiled(
           private_context, kWidth, kHeight, 18, 18, 4, 4, partial_target,
           /*bgra_out=*/nullptr, &error);
+      uint32_t partial_pending_before_wait =
+          GetPipelineProbeContextPendingSubmissionCount(private_context);
+      uint32_t partial_waited_submission_count = 0;
+      std::string partial_wait_error;
+      bool partial_waited =
+          partial_resolved && WaitPipelineProbeContext(private_context, &partial_wait_error,
+                                                       &partial_waited_submission_count);
+      uint32_t partial_pending_after_wait =
+          GetPipelineProbeContextPendingSubmissionCount(private_context);
       std::vector<uint8_t> partial_expected(kTiledBufferSize, partial_sentinel);
       const uint8_t* partial_source = indexed_bgra.data() + (size_t(18) * kWidth + 18) * 4;
       bool partial_expected_valid =
-          partial_resolved &&
+          partial_resolved && partial_pending_before_wait == 1 && partial_waited &&
+          partial_waited_submission_count == 1 && partial_pending_after_wait == 0 &&
           ApplyExpectedTiledRect(partial_expected, kPartialTiledBufferOffset, kTiledPitch, 7, 9,
                                  partial_source, kWidth, 4, 4, endian);
       bool partial_matches =
           partial_expected_valid &&
-          std::memcmp([tiled_buffer contents], partial_expected.data(), kTiledBufferSize) == 0;
+          std::memcmp([tiled_buffer contents], partial_expected.data(), kTiledBufferSize) == 0 &&
+          std::memcmp([tiled_guest_mirror_buffer contents], partial_expected.data(),
+                      kTiledBufferSize) == 0;
       tiled_resolve_ok = full_matches && partial_matches;
       tiled_case_count += full_matches ? 1 : 0;
       tiled_case_count += partial_matches ? 1 : 0;
     }
     tiled_resolve_ok = tiled_resolve_ok && tiled_pending_after_first == 0 && tiled_case_count == 8;
+
+    // The presentation snapshot must preserve the resolved image even when a
+    // color clear is queued immediately after the resolve on the same context.
+    bool snapshot_rendered =
+        tiled_resolve_ok &&
+        render_indexed_fan_to_context(private_context, pipeline_state, &texture, kWidth, kHeight);
+    std::string snapshot_error;
+    void* snapshot_texture =
+        CreatePipelineProbeSnapshotTexture(device, kWidth, kHeight, &snapshot_error);
+    ProbeTiledResolveTarget snapshot_target;
+    snapshot_target.metal_buffer = tiled_buffer;
+    snapshot_target.buffer_offset = kFullTiledBufferOffset;
+    snapshot_target.pitch = kTiledPitch;
+    snapshot_target.height = kTiledHeight;
+    snapshot_target.presentation_snapshot_texture = snapshot_texture;
+    bool snapshot_resolved = snapshot_rendered && snapshot_texture &&
+                             ResolvePipelineProbeContextToXenosTiled(
+                                 private_context, kWidth, kHeight, 0, 0, kWidth, kHeight,
+                                 snapshot_target, /*bgra_out=*/nullptr, &snapshot_error);
+    bool snapshot_clear_queued =
+        snapshot_resolved &&
+        QueuePipelineProbeContextClearRect(private_context, kWidth, kHeight, 0, 0, kWidth, kHeight,
+                                           0.0, 0.0, 0.0, 1.0, &snapshot_error);
+    bool snapshot_context_waited =
+        snapshot_clear_queued &&
+        WaitPipelineProbeContext(private_context, &snapshot_error, nullptr);
+
+    MTLTextureDescriptor* snapshot_readback_descriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                           width:kWidth
+                                                          height:kHeight
+                                                       mipmapped:NO];
+    snapshot_readback_descriptor.storageMode = MTLStorageModeShared;
+    snapshot_readback_descriptor.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> snapshot_readback_texture =
+        [device newTextureWithDescriptor:snapshot_readback_descriptor];
+    bool snapshot_copy_queued =
+        snapshot_context_waited && snapshot_readback_texture &&
+        QueuePipelineProbeSnapshotCopy(private_queue, snapshot_texture, snapshot_readback_texture,
+                                       kWidth, kHeight, &snapshot_error);
+    id<MTLCommandBuffer> snapshot_copy_fence =
+        snapshot_copy_queued ? [private_queue commandBuffer] : nil;
+    if (snapshot_copy_fence) {
+      [snapshot_copy_fence commit];
+      [snapshot_copy_fence waitUntilCompleted];
+    }
+    std::vector<uint8_t> snapshot_bgra(size_t(kWidth) * kHeight * 4);
+    if (snapshot_copy_fence && [snapshot_copy_fence status] == MTLCommandBufferStatusCompleted) {
+      [snapshot_readback_texture getBytes:snapshot_bgra.data()
+                              bytesPerRow:size_t(kWidth) * 4
+                               fromRegion:MTLRegionMake2D(0, 0, kWidth, kHeight)
+                              mipmapLevel:0];
+    } else {
+      snapshot_bgra.clear();
+    }
+    std::vector<uint8_t> cleared_after_snapshot;
+    bool snapshot_context_cleared = ReadPipelineProbeContext(
+        private_context, kWidth, kHeight, cleared_after_snapshot, &snapshot_error);
+    bool snapshot_clear_matches =
+        snapshot_context_cleared && cleared_after_snapshot.size() == size_t(kWidth) * kHeight * 4;
+    for (size_t pixel = 0; pixel < size_t(kWidth) * kHeight && snapshot_clear_matches; ++pixel) {
+      snapshot_clear_matches = PixelNear(cleared_after_snapshot.data() + pixel * 4,
+                                         std::array<uint8_t, 4>{0, 0, 0, 255});
+    }
+    bool snapshot_ok = snapshot_bgra == indexed_bgra && snapshot_clear_matches;
+    if (snapshot_readback_texture) {
+      [snapshot_readback_texture release];
+    }
+    ReleasePipelineProbeSnapshotTexture(snapshot_texture);
+    tiled_resolve_ok = tiled_resolve_ok && snapshot_ok;
 
     // Invalid metadata is still a synchronization boundary: pending render
     // work must retire without changing the destination or returning stale CPU
@@ -787,7 +969,13 @@ int RunPipelineProbeTest() {
     if (tiled_buffer) {
       [tiled_buffer release];
     }
+    if (tiled_guest_mirror_buffer) {
+      [tiled_guest_mirror_buffer release];
+    }
     ReleasePipelineProbeContext(private_context);
+    if (private_queue) {
+      [private_queue release];
+    }
     if (!private_region_ok || !tiled_resolve_ok) {
       std::fprintf(stderr,
                    "[metal_pipeline_probe_test] FAIL: private regional readback rendered=%d "
@@ -1052,6 +1240,22 @@ int RunPipelineProbeTest() {
           stencil_center ? stencil_center[2] : 0, stencil_center ? stencil_center[3] : 0);
       return 1;
     }
+    if (!shared_depth_ok) {
+      std::fprintf(stderr,
+                   "[metal_pipeline_probe_test] FAIL: shared depth/stencil ownership: %s "
+                   "attach=%d clear=%d near=%d far=%d read=%d reject_queue=%d "
+                   "reject_dimensions=%d pending_a=(%u,%u) center=%u,%u,%u,%u\n",
+                   shared_depth_error.c_str(), int(shared_depth_attached),
+                   int(shared_depth_cleared), int(shared_depth_near_rendered),
+                   int(shared_depth_far_rendered), int(shared_depth_read),
+                   int(incompatible_queue_rejected), int(incompatible_dimensions_rejected),
+                   shared_depth_a_pending_before_handoff, shared_depth_a_pending_after_handoff,
+                   shared_depth_center ? shared_depth_center[0] : 0,
+                   shared_depth_center ? shared_depth_center[1] : 0,
+                   shared_depth_center ? shared_depth_center[2] : 0,
+                   shared_depth_center ? shared_depth_center[3] : 0);
+      return 1;
+    }
     if (!blend_ok) {
       std::fprintf(stderr,
                    "[metal_pipeline_probe_test] FAIL: source-alpha blend: %s "
@@ -1106,13 +1310,14 @@ int RunPipelineProbeTest() {
     std::fprintf(stdout,
                  "[metal_pipeline_probe_test] PASS: external MTLBuffer rasterized %zu sentinel "
                  "pixels; indexed fan remap rasterized %zu; scissor clipped its right half "
-                 "(%zu clear); all four cull/winding combinations plus persistent depth, depth "
-                 "write masking, and stencil replace/equal/reject matched; ordered multi-draw "
+                 "(%zu clear); all four cull/winding combinations plus persistent and shared "
+                 "cross-color-target depth, depth write masking, and stencil "
+                 "replace/equal/reject matched; ordered multi-draw "
                  "batch, R/B color write mask, 64-draw command buffers, 256-draw oldest-buffer "
                  "retirement, four upload-arena lifetimes, %llu reusable buffers for %llu "
                  "suballocations, resize, "
-                 "explicit wait, and release drains matched; %u GPU tiled resolve cases plus "
-                 "invalid-input fencing matched\n",
+                 "explicit wait, and release drains matched; %u GPU tiled resolve cases, a "
+                 "pre-clear presentation snapshot, and invalid-input fencing matched\n",
                  textured_pixels, indexed_textured_pixels, clear_pixels,
                  static_cast<unsigned long long>(upload_buffer_allocation_delta),
                  static_cast<unsigned long long>(upload_suballocation_delta), tiled_case_count);

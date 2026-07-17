@@ -1,6 +1,6 @@
 # GoldenEye native Metal project status
 
-Last updated: 2026-07-16
+Last updated: 2026-07-17
 
 ## Goal
 
@@ -85,15 +85,40 @@ allows 750 ms for focus to settle. The injector merges these contributions with 
 state, permanently idles after the final release, and never inspects or changes title menu state,
 PM4, resolves, or presentation.
 
-That route now reaches a clean real Dam briefing at roughly 60 FPS and fully rendered first-Dam
-gameplay. An earlier dynamic 1280x720 proving window measured 29.68 FPS. Oldest-first upload
-command-buffer retirement and a 2048 global retained-draw ceiling then produced a correct 46.5 FPS
-screenshot while reducing draw time from roughly 10 ms to 7.2–7.5 ms per swap. A later correct Dam
-screenshot displayed 60.0 FPS; stable complete windows reported roughly 6.4–6.7 ms draw,
-4.2–4.35 ms copy, 1.74 ms swap, and 2.9 ms `WAIT_REG_MEM` time per swap. Color signatures continue
-changing and sampled register-color draws remain routed. These are strict rendering and
-deterministic-input proofs, not a claim that every Dam view sustains 60 FPS or that physical input
-and full playability are complete.
+That route now reaches a clean real Dam briefing and fully rendered first-Dam gameplay. An earlier
+dynamic 1280x720 proving window measured 29.68 FPS. Oldest-first upload command-buffer retirement
+and a 2048 global retained-draw ceiling then produced a correct 46.5 FPS screenshot, and a later
+correct screenshot displayed 60.0 FPS.
+
+The 2026-07-17 submission pass removed two larger synchronization costs. GPU tiled-resolve dirty
+ranges are accumulated and coalesced before they are copied from the resident Metal buffer to the
+guest alias. The title's `EVENT_WRITE_SHD` and `EVENT_WRITE_EXT` completion payloads are batched,
+then published after those resolves in the same ordered command buffer; a repeated overlapping
+completion address forces a flush so intermediate handshake transitions are not collapsed. This
+replaced hundreds of completion command buffers per frame with a small number of ordered batches.
+
+The exact full-frame path also no longer reads the resolved image back to the CPU just to upload it
+again. The resolve command buffer copies the producer image into a private presentation snapshot
+before the title-requested resolve clear. A matching `IssueSwap` copies that snapshot on the GPU
+into a three-slot presenter mailbox. The normal guest tiled resolve and completion publication
+still occur, so this remains the real resolve and `XE_SWAP` path rather than a replacement frame.
+Metadata or coherence mismatches retain the checked CPU presentation fallback.
+
+On the Apple M3 Ultra validation machine, the finalized `20260717T180143Z` benchmark discarded
+eight complete Dam windows and measured the next 48. It averaged 59.909 FPS (57.357–60.148), with
+zero full-frame presenter uploads, zero resolve fallbacks, zero unmatched waits or timeouts, and
+no nil drawables. The sample averaged about 9.12 ms draw, 0.62 ms copy, 1.17 ms swap, and 3.36 ms
+`WAIT_REG_MEM` per swap. Color signatures continue changing and sampled register-color draws
+remain routed. These are strict rendering and deterministic-input proofs, not a claim that every
+Dam view or scene is locked to 60 FPS. The lower-power base M5 MacBook Air remains a required
+retest target; the M3 Ultra result must not be generalized to it.
+
+The reproducible harness and parser are documented in [DEVELOPMENT.md](DEVELOPMENT.md). Its two
+short development runs both passed the fallback, drawable, and wait-safety gates, but their
+selected aggregates include the mission transition: `20260717T173814Z` averaged 52.482 FPS after
+two warmup windows, and `20260717T174238Z` averaged 34.916 FPS after only one. Later windows in
+those same logs reached approximately 60 FPS. These early aggregates are retained rather than
+reported as steady-state results.
 
 The first mission transition initially exposed a separate direct-decoder safety bug. A malformed
 8192x8191 tiled descriptor requested a 256 MiB source span from near the end of the 512 MiB guest
@@ -166,14 +191,17 @@ pipeline test covers front and back culling against both clockwise and counter-c
 front faces. Depth-only draw routing, polygon fill mode, shared guest depth/stencil, and faithful
 MSAA remain open.
 
-Persistent host render contexts now own private `Depth32Float_Stencil8` attachments with ordered
+Persistent host render contexts now own `Depth32Float_Stencil8` attachments with ordered
 load/store lifetime. Metal depth/stencil state maps normalized guest Z enable, writes, all compare
 functions, independent front/back stencil compares and operations, read/write masks, and
-references. The isolated probe verifies that a near depth write rejects a later far draw, disabling
-depth writes allows that far draw, and stencil replace/equal/reject persists across draws. This is
-not shared guest EDRAM ownership yet: each host color context has an independent attachment,
-`D24S8` and `D24FS8` lack 24-bit precision/alias fidelity, and guest depth clears, copies, resolves,
-readback, texture aliases, and multisampling are still absent.
+references. A conservative sharing foundation can attach two color contexts on the same Metal
+queue to one depth/stencil target, preserving depth across the handoff; the isolated probe verifies
+the handoff and rejects a different-queue share. It is deliberately not wired into title host
+render-target selection yet because that layer does not yet provide the complete guest depth
+identity needed to distinguish `RB_DEPTH_INFO`, pitch, MSAA, dimensions, and format safely.
+Sharing by resolution alone would be incorrect. `D24S8` and `D24FS8` also still lack 24-bit
+precision/alias fidelity, and guest depth clears, copies, resolves, readback, texture aliases, and
+multisampling remain absent.
 
 The title's GPU-wait hook no longer treats a swap-counter advance or one transient drained-ring
 snapshot as completion of trailing primary-ring work. The guest D3D watchdog has a hardware-scale
@@ -215,15 +243,17 @@ counter. On a timer with a multi-nanosecond quantum this accelerated guest time 
 display by the same factor. The frequency now correctly reports one billion ticks per second, and
 a regression test protects that unit contract.
 
-The presenter now draws a default-on FPS overlay into each completed guest front buffer. It counts
+The presenter now draws a default-on FPS overlay for each completed guest front buffer. It counts
 successful guest frame deliveries over a monotonic interval, not CAMetalLayer paint events, so
-window repaints cannot inflate the displayed rate. `REX_METAL_SHOW_FPS=false` hides the overlay
-without changing rendering.
+window repaints cannot inflate the displayed rate. The CPU fallback burns the overlay into its
+host image as before; the direct snapshot path uploads only a tiny overlay texture and blends it
+over the GPU mailbox image, preserving zero full-frame CPU presenter uploads.
+`REX_METAL_SHOW_FPS=false` hides the overlay without changing rendering.
 
 The opt-in profiler now reports `WAIT_REG_MEM` alongside draw, copy, swap, resource-wait, texture,
 and presenter ledgers in complete 64-swap windows. Its wait report includes the hottest sampled
-address, reference, mask, and poll count. That makes the remaining roughly 2.9 ms-per-swap fence
-cost visible without enabling high-volume renderer logs.
+address, reference, mask, and poll count. That makes the remaining fence cost—3.36 ms per swap in
+the finalized 48-window direct-snapshot sample—visible without enabling high-volume renderer logs.
 
 Menu profiling exposed three avoidable hot paths. First, 256 KiB guest-memory invalidation blocks
 could repeatedly invalidate a texture even when its own bytes were unchanged. The texture cache
@@ -234,13 +264,14 @@ per-draw source scans and temporary reflection allocations. Third, per-draw cons
 data, and nonresident indices are suballocated from reusable upload arenas whose lifetime follows
 their Metal command buffers instead of allocating a new buffer for each binding.
 
-The exact GPU tiled-write resolve is now enabled by default. Eight byte-for-byte cases cover full
-and partial rectangles across all four 128-bit endian modes, and a live Dam proving run completed
-thousands of resolves with zero fallbacks. `GOLDENEYE_METAL_GPU_TILED_RESOLVE=0` is the explicit
-CPU-path opt-out. Menu and gameplay visual parity were confirmed after enabling the default path,
-and no diagnostic rendering shortcut is part of those results. Remaining work is to make resolve
-submission more asynchronous and reduce the fence wait around its consumers, not to re-establish
-basic tiled-write correctness.
+The exact GPU tiled-write resolve is enabled by default. Eight byte-for-byte cases cover full and
+partial rectangles across all four 128-bit endian modes, and live Dam proving runs completed tens
+of thousands of resolves with zero fallbacks. Resolve writes now remain resident until an ordered
+publication boundary, where overlapping dirty ranges are coalesced before one GPU copy publishes
+them to the guest alias. The associated completion writes become visible only after publication.
+`GOLDENEYE_METAL_GPU_TILED_RESOLVE=0` is the explicit CPU-path opt-out. Menu and gameplay visual
+parity were confirmed after enabling the default path, and no diagnostic rendering shortcut is
+part of those results.
 
 The decisive geometry fault was discarded index delivery. A four-vertex title triangle fan was
 converted correctly by `PrimitiveProcessor` to the six indices `(1,2,0,2,3,0)`, but Metal issued
@@ -301,12 +332,17 @@ longer blocked on that sequence.
 - Regional private render-target readback with reusable staging and ordered queued clears
 - Exact resolved-surface swap reuse guarded by fetch metadata, guest-byte comparison, tracked
   invalidation, and the true tiled-memory extent
+- Coalesced GPU resolve publication followed by batched, GPU-ordered `EVENT_WRITE_SHD` /
+  `EVENT_WRITE_EXT` completion payloads
+- Pre-clear GPU presentation snapshots and a three-slot GPU mailbox for exact full-frame swaps,
+  with the checked CPU path retained for mismatches
 - Texture-source fingerprinting that suppresses redundant untile and upload work after coarse
   guest-memory invalidation
 - Immutable per-translation MSL reflection used directly by draw delivery
 - Reusable command-buffer-owned upload arenas for constants, CPU vertex data, and indices
 - Correct nanosecond POSIX clock frequency with unit regression coverage
-- Default-on guest-delivery FPS overlay, disableable with `REX_METAL_SHOW_FPS=false`
+- Default-on guest-delivery FPS overlay, including a tiny blended GPU-path overlay that avoids a
+  full-frame CPU upload; disableable with `REX_METAL_SHOW_FPS=false`
 - Native Cocoa keyboard and relative-mouse delivery through the common controller driver
 - Default-on SDL gamepad input with built-in PS4, PS5, Xbox One, and Xbox Series mappings
 - Hot-plug, four-slot compaction, fifth-pad promotion, focus-safe rumble, and virtual-device tests
@@ -319,14 +355,15 @@ longer blocked on that sequence.
 - Build-tree `.command` launcher for local developer runs
 - Controller-state input regressions plus pause-menu capture suppression and runtime macOS rebinding
 - Guest polygon cull mode and front-face winding with focused Metal regression coverage
-- Persistent per-context Metal depth/stencil state with ordered depth and stencil probe coverage
+- Persistent Metal depth/stencil state plus a tested conservative cross-color-context sharing
+  foundation; title guest-depth identity wiring remains open
 - Stable-drain guest-watchdog timing with a zero-hang 74-second swap-4416 live proof
 - Checked direct texture-decode bounds with the first-Dam invalid descriptor as a regression
 - Deterministic input-only dossier-to-Dam route with balanced A and left-stick contributions
 - Safe macOS modifier transitions with focused previous-state regression coverage
 - Opt-in 64-swap command, `WAIT_REG_MEM`, wait-reason, and 64-attempt presenter profiling ledgers
-- Default GPU tiled resolve with eight byte-exact cases and thousands of live resolves without a
-  fallback; `GOLDENEYE_METAL_GPU_TILED_RESOLVE=0` opts out
+- Default GPU tiled resolve with eight byte-exact cases and tens of thousands of live resolves
+  without a fallback; `GOLDENEYE_METAL_GPU_TILED_RESOLVE=0` opts out
 - Recognizable main-menu presentation through real title draws, guest-visible resolves, and normal
   `IssueSwap`
 - Fully rendered, dynamic first-Dam gameplay through the strict path, with correct 46.5 and
@@ -338,11 +375,11 @@ longer blocked on that sequence.
 | --- | --- | --- |
 | A. Controlled resolve diagnostic | Passed | Magenta resolve reaches the destination and presentation path |
 | B. Controlled render-target diagnostic | Passed | A solid Metal render target survives readback and resolve |
-| C. Real producer content | Passed for the first menu target | Real title shaders and resources produce the classification, gun-barrel and RARE sequences, then a recognizable main menu; per-context depth/stencil state is present but guest-shared EDRAM fidelity remains incomplete |
+| C. Real producer content | Passed for the first menu target | Real title shaders and resources produce the classification, gun-barrel and RARE sequences, then a recognizable main menu; depth/stencil state and a tested sharing foundation are present, but title guest-depth identity and shared EDRAM fidelity remain incomplete |
 | D. Guest-visible resolve | Passed for current producer | Nonzero producer output reaches the guest buffer and normal presenter |
 | E. Recognizable menu | Passed | Corrected-clock 1280x720 captures present the real dossier menu through the strict path; short samples reported 30.0 and 59.9 guest-delivered FPS |
 | F. Sustained title execution | Passed | WPTR >1088 and normal `IssueSwap` at least 4416 without scavenging, replay, forced presentation, false GPU-hang dumps, or debug traps |
-| G. First mission gameplay | Passed for deterministic input | The input-only route reaches a clean Dam briefing and fully rendered dynamic gameplay; correct captures have displayed 46.5 and 60.0 FPS, but sustained 60 across broader views remains in progress |
+| G. First mission gameplay | Passed for deterministic input | The input-only route reaches a clean Dam briefing and fully rendered dynamic gameplay; later complete M3 Ultra Dam windows are near 60 FPS with the exact GPU snapshot path, but broader-scene and base M5 Air stability remain in progress |
 | H. Native player launcher | Passed in v0.1.0 | The signed and notarized arm64 `.app` ships with portable runtime linkage, icon, metadata, and notices without copying an XEX, extracted assets, or standalone game-data files; the exact supported LIVE/STFS package imports and validates all 1,803 title files through the same backend used by the first-run UI |
 
 ## Primary blocker
@@ -353,13 +390,13 @@ array textures and samplers are bound, processed indices are consumed, and the t
 recognizable.
 
 The first-menu and first-gameplay rendering boundaries are resolved. The former reproducible
-30 FPS gameplay ceiling has been crossed: correct Dam captures have displayed 46.5 and 60.0 FPS,
-and stable complete windows around the latter reduced draw, copy, and swap costs to approximately
-6.4–6.7 ms, 4.2–4.35 ms, and 1.74 ms per swap. The current primary blocker is repeatability across
-broader Dam views. Resolve submission and the guest-visible fence remain synchronization targets;
-the profiler measures roughly 2.9 ms of `WAIT_REG_MEM` per swap and reports the top
-address/reference/mask/poll condition. The presenter ledger measures CPU submission calls, not GPU
-completion or display latency.
+30 FPS gameplay ceiling has been crossed. Coalesced resolve publication, batched completion writes,
+and the exact GPU snapshot mailbox remove the per-event submission storm and the full-frame
+CPU-readback/upload round trip. Later M3 Ultra Dam windows are near 60 FPS with zero full-frame
+presenter uploads, but the current primary blocker is repeatability across broader scenes and on
+the base M5 MacBook Air. `WAIT_REG_MEM` still averages about 3.36 ms per swap in the finalized
+sample. The presenter ledger measures CPU submission calls, not GPU completion or display
+latency.
 
 Physical native input is the next validation boundary after that performance pass. The macOS
 window forwards keyboard and mouse events into the existing controller driver, while SDL now
@@ -375,19 +412,20 @@ current host-context ownership, the observed banded copy sequence, the title's t
 blend constants, per-channel write masks, culling/front-face selection, and per-context
 depth/stencil state are active and verified. Depth-only EDRAM draw routing, guest-addressed shared
 depth/stencil ownership, depth clear/resolve fidelity, and true guest MSAA behavior remain absent.
-The current per-color-target private depth attachment is useful but cannot establish shared-depth
-or multisample correctness. The supported local-backup importer now prevents missing game data
-from silently looking like a renderer fault; unsupported or incomplete data is rejected before
-runtime initialization.
+The tested sharing primitive proves ordered ownership across compatible contexts, but
+command-processor wiring must first key it by complete guest depth identity. It does not yet
+establish title-level shared-depth or multisample correctness. The supported local-backup importer
+now prevents missing game data from silently looking like a renderer fault; unsupported or
+incomplete data is rejected before runtime initialization.
 
 ## Next development priority
 
 Work in this order:
 
-1. Repeat complete-window profiling across several deterministic Dam views, leaving frame and
-   shader dumps and verbose diagnostics disabled, and identify which views fall below 60 FPS.
-2. Make tiled resolve submission more asynchronous and reduce the measured `WAIT_REG_MEM` fence
-   cost without changing guest-visible ordering, pixels, command provenance, or safety fences.
+1. Re-run the deterministic benchmark on the base M5 MacBook Air, then profile several repeatable
+   Dam views on both it and the M3 Ultra to identify which scenes fall below 60 FPS.
+2. Reduce the remaining `WAIT_REG_MEM` fence cost without changing the new batched guest-visible
+   publication ordering, pixels, command provenance, or safety fences.
 3. Navigate into Dam and validate gameplay with physical native keyboard/mouse input plus one Sony
    and one Xbox controller over USB and Bluetooth, including hot-plug, rumble, focus loss, capture
    recovery, pause, and sustained player control.
@@ -396,8 +434,9 @@ Work in this order:
 5. Implement faithful guest MSAA and remaining polygon fill/depth-bias state, then re-evaluate
    resolve and fence behavior against representative gameplay workloads.
 
-Do not restore heuristic command scavenging or direct presentation shortcuts. The real ring and
-normal `XE_SWAP` path now provide the authoritative evidence needed to debug production.
+Do not restore heuristic command scavenging or diagnostic replacement presentation. The real ring,
+normal resolve, exact GPU snapshot, and normal `XE_SWAP` path now provide the authoritative
+evidence needed to debug production.
 
 ## Useful source areas
 

@@ -171,6 +171,17 @@ class CommandProcessor {
   virtual void ShutdownContext() = 0;
 
   virtual void WriteRegister(uint32_t index, uint32_t value);
+  // Writes memory as an operation performed by the emulated GPU. Backends may
+  // override this to preserve host-GPU ordering for completion packets; the
+  // default implementation writes the guest physical mapping immediately.
+  virtual bool WriteGpuMemory(uint32_t address, const void* data, size_t length);
+  // Completion writes are guest-visible fences, unlike ordinary packet memory
+  // writes. Backends with deferred host-GPU work override this hook to publish
+  // the value only after all earlier GPU work is complete.
+  virtual bool WriteGpuCompletionMemory(uint32_t address, const void* data, size_t length);
+  // Flushes completion writes deferred by a backend. Called before a
+  // command-stream wait; backends may also flush at primary-ring boundaries.
+  virtual bool FlushGpuCompletionMemoryWrites();
   uint32_t ReadRegisterValue(uint32_t index) const;
   virtual void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
   virtual void WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint32_t base,

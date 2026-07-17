@@ -50,10 +50,26 @@ vertex VertexOut guest_present_vs(uint vertex_id [[vertex_id]]) {
   return out;
 }
 
+float select_guest_component(float4 color, uint selector) {
+  switch (selector) {
+    case 0: return color.r;
+    case 1: return color.g;
+    case 2: return color.b;
+    case 3: return color.a;
+    case 5: return 1.0;
+    default: return 0.0;
+  }
+}
+
 fragment float4 guest_present_ps(VertexOut in [[stage_in]],
-                                 texture2d<float> guest_texture [[texture(0)]]) {
+                                 texture2d<float> guest_texture [[texture(0)]],
+                                 constant uint& guest_swizzle [[buffer(0)]]) {
   constexpr sampler guest_sampler(coord::normalized, address::clamp_to_edge, filter::linear);
-  return guest_texture.sample(guest_sampler, in.uv);
+  float4 color = guest_texture.sample(guest_sampler, in.uv);
+  return float4(select_guest_component(color, (guest_swizzle >> 0) & 7),
+                select_guest_component(color, (guest_swizzle >> 3) & 7),
+                select_guest_component(color, (guest_swizzle >> 6) & 7),
+                select_guest_component(color, (guest_swizzle >> 9) & 7));
 }
 )";
 
@@ -134,12 +150,6 @@ uint64_t HashGuestFrame(const uint8_t* data, size_t size, uint32_t width, uint32
   return hash;
 }
 
-class MetalGuestOutputRefreshContext final : public Presenter::GuestOutputRefreshContext {
- public:
-  explicit MetalGuestOutputRefreshContext(bool& is_8bpc_out_ref)
-      : GuestOutputRefreshContext(is_8bpc_out_ref) {}
-};
-
 }  // namespace
 
 std::unique_ptr<MetalPresenter> MetalPresenter::Create(void* metal_device,
@@ -149,6 +159,12 @@ std::unique_ptr<MetalPresenter> MetalPresenter::Create(void* metal_device,
   }
   std::unique_ptr<MetalPresenter> presenter(
       new MetalPresenter(metal_device, std::move(host_gpu_loss_callback)));
+  presenter->command_queue_ = [(id<MTLDevice>)metal_device newCommandQueue];
+  if (!presenter->command_queue_) {
+    REXLOG_ERROR("MetalPresenter: failed to create the presentation command queue");
+    return nullptr;
+  }
+  [(id<MTLCommandQueue>)presenter->command_queue_ setLabel:@"ReXGlue guest output"];
   if (!presenter->InitializeCommonSurfaceIndependent()) {
     return nullptr;
   }
@@ -162,6 +178,12 @@ MetalPresenter::MetalPresenter(void* metal_device, HostGpuLossCallback host_gpu_
 
 MetalPresenter::~MetalPresenter() {
   DisconnectPaintingFromSurfaceFromUIThreadImpl();
+  for (GuestOutputMailboxTexture& mailbox_texture : guest_output_mailbox_textures_) {
+    if (mailbox_texture.texture) {
+      [(id)mailbox_texture.texture release];
+      mailbox_texture.texture = nullptr;
+    }
+  }
   if (command_queue_) {
     [(id)command_queue_ release];
     command_queue_ = nullptr;
@@ -170,9 +192,17 @@ MetalPresenter::~MetalPresenter() {
     [(id)guest_texture_ release];
     guest_texture_ = nullptr;
   }
+  if (fps_texture_) {
+    [(id)fps_texture_ release];
+    fps_texture_ = nullptr;
+  }
   if (guest_pipeline_state_) {
     [(id)guest_pipeline_state_ release];
     guest_pipeline_state_ = nullptr;
+  }
+  if (fps_pipeline_state_) {
+    [(id)fps_pipeline_state_ release];
+    fps_pipeline_state_ = nullptr;
   }
   if (metal_device_) {
     [(id)metal_device_ release];
@@ -228,21 +258,6 @@ void MetalPresenter::UpdateGuestFrontbuffer(uint32_t width, uint32_t height,
 }
 
 void MetalPresenter::FinalizeGuestFrameLocked() {
-  uint64_t now = rex::chrono::Clock::QueryHostTickCount();
-  uint64_t tick_frequency = rex::chrono::Clock::QueryHostTickFrequency();
-  if (!guest_fps_sample_start_tick_ || now < guest_fps_sample_start_tick_) {
-    guest_fps_sample_start_tick_ = now;
-    guest_fps_sample_frame_count_ = 0;
-  } else {
-    ++guest_fps_sample_frame_count_;
-    uint64_t elapsed = now - guest_fps_sample_start_tick_;
-    if (tick_frequency && elapsed >= tick_frequency / 2) {
-      guest_fps_ = double(guest_fps_sample_frame_count_) * double(tick_frequency) / double(elapsed);
-      guest_fps_sample_start_tick_ = now;
-      guest_fps_sample_frame_count_ = 0;
-    }
-  }
-
   if (profile_enabled_) {
     uint64_t source_hash = HashGuestFrame(guest_frame_bgra_.data(), guest_frame_bgra_.size(),
                                           guest_frame_width_, guest_frame_height_);
@@ -261,6 +276,23 @@ void MetalPresenter::FinalizeGuestFrameLocked() {
     DrawGuestFpsOverlayLocked();
   }
   ++guest_frame_generation_;
+}
+
+void MetalPresenter::RecordGuestFrameArrivalLocked() {
+  uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+  uint64_t tick_frequency = rex::chrono::Clock::QueryHostTickFrequency();
+  if (!guest_fps_sample_start_tick_ || now < guest_fps_sample_start_tick_) {
+    guest_fps_sample_start_tick_ = now;
+    guest_fps_sample_frame_count_ = 0;
+  } else {
+    ++guest_fps_sample_frame_count_;
+    uint64_t elapsed = now - guest_fps_sample_start_tick_;
+    if (tick_frequency && elapsed >= tick_frequency / 2) {
+      guest_fps_ = double(guest_fps_sample_frame_count_) * double(tick_frequency) / double(elapsed);
+      guest_fps_sample_start_tick_ = now;
+      guest_fps_sample_frame_count_ = 0;
+    }
+  }
 }
 
 void MetalPresenter::EndProfiledPresentAttempt(bool drawable_nil, uint64_t present_commit_ns) {
@@ -314,6 +346,86 @@ void MetalPresenter::ReportProfileWindowLocked() {
         static_cast<unsigned long long>(metric.max_calls_per_swap));
   }
   std::fflush(stderr);
+}
+
+void MetalPresenter::BuildGuestFpsOverlayLocked(uint32_t width, uint32_t height) {
+  auto clear_overlay = [&]() {
+    if (fps_overlay_bgra_.empty() && !fps_overlay_width_ && !fps_overlay_height_ &&
+        !fps_overlay_scale_ && !fps_overlay_label_[0]) {
+      return;
+    }
+    fps_overlay_bgra_.clear();
+    fps_overlay_width_ = 0;
+    fps_overlay_height_ = 0;
+    fps_overlay_scale_ = 0;
+    fps_overlay_label_.fill(0);
+    ++fps_overlay_generation_;
+  };
+  if (!REXCVAR_GET(metal_show_fps) || !width || !height) {
+    clear_overlay();
+    return;
+  }
+
+  char label[16];
+  double displayed_fps = std::min(guest_fps_, 999.9);
+  int label_length = std::snprintf(label, sizeof(label), "FPS %.1f", displayed_fps);
+  if (label_length <= 0) {
+    clear_overlay();
+    return;
+  }
+  size_t character_count = std::min<size_t>(size_t(label_length), sizeof(label) - 1);
+  uint32_t scale = width >= 960 && height >= 540 ? 3 : (width >= 480 && height >= 270 ? 2 : 1);
+  constexpr uint32_t kGlyphWidth = 5;
+  constexpr uint32_t kGlyphHeight = 7;
+  uint32_t padding = scale * 2;
+  uint32_t character_advance = (kGlyphWidth + 1) * scale;
+  uint32_t label_width =
+      character_count ? uint32_t(character_count) * character_advance - scale : 0;
+  uint32_t box_width = label_width + padding * 2;
+  uint32_t box_height = kGlyphHeight * scale + padding * 2;
+  if (!box_width || !box_height || box_width > width || box_height > height) {
+    clear_overlay();
+    return;
+  }
+  if (!fps_overlay_bgra_.empty() && fps_overlay_width_ == box_width &&
+      fps_overlay_height_ == box_height && fps_overlay_scale_ == scale &&
+      std::strncmp(fps_overlay_label_.data(), label, fps_overlay_label_.size()) == 0) {
+    return;
+  }
+
+  fps_overlay_width_ = box_width;
+  fps_overlay_height_ = box_height;
+  fps_overlay_scale_ = scale;
+  fps_overlay_label_.fill(0);
+  std::memcpy(fps_overlay_label_.data(), label,
+              std::min(fps_overlay_label_.size() - 1, size_t(label_length)));
+  fps_overlay_bgra_.assign(size_t(box_width) * box_height * 4, 0);
+  for (size_t pixel = 0; pixel < size_t(box_width) * box_height; ++pixel) {
+    fps_overlay_bgra_[pixel * 4 + 3] = 178;
+  }
+  for (size_t character_index = 0; character_index < character_count; ++character_index) {
+    const auto& glyph = GetFpsGlyph(label[character_index]);
+    uint32_t glyph_x = padding + uint32_t(character_index) * character_advance;
+    for (uint32_t glyph_y = 0; glyph_y < kGlyphHeight; ++glyph_y) {
+      for (uint32_t glyph_x_offset = 0; glyph_x_offset < kGlyphWidth; ++glyph_x_offset) {
+        if (!(glyph[glyph_y] & (1u << (kGlyphWidth - 1 - glyph_x_offset)))) {
+          continue;
+        }
+        for (uint32_t scale_y = 0; scale_y < scale; ++scale_y) {
+          for (uint32_t scale_x = 0; scale_x < scale; ++scale_x) {
+            size_t offset = (size_t(padding + glyph_y * scale + scale_y) * box_width + glyph_x +
+                             glyph_x_offset * scale + scale_x) *
+                            4;
+            fps_overlay_bgra_[offset + 0] = 0xFF;
+            fps_overlay_bgra_[offset + 1] = 0xFF;
+            fps_overlay_bgra_[offset + 2] = 0xFF;
+            fps_overlay_bgra_[offset + 3] = 0xFF;
+          }
+        }
+      }
+    }
+  }
+  ++fps_overlay_generation_;
 }
 
 void MetalPresenter::DrawGuestFpsOverlayLocked() {
@@ -432,16 +544,90 @@ void MetalPresenter::DisconnectPaintingFromSurfaceFromUIThreadImpl() {
 bool MetalPresenter::RefreshGuestOutputImpl(
     uint32_t mailbox_index, uint32_t frontbuffer_width, uint32_t frontbuffer_height,
     std::function<bool(GuestOutputRefreshContext& context)> refresher, bool& is_8bpc_out_ref) {
-  (void)mailbox_index;
-  (void)frontbuffer_width;
-  (void)frontbuffer_height;
-  MetalGuestOutputRefreshContext context(is_8bpc_out_ref);
-  return refresher(context);
+  assert_true(mailbox_index < guest_output_mailbox_textures_.size());
+  assert_not_zero(frontbuffer_width);
+  assert_not_zero(frontbuffer_height);
+
+  GuestOutputMailboxTexture& mailbox_texture = guest_output_mailbox_textures_[mailbox_index];
+  if (mailbox_texture.texture && (mailbox_texture.width != frontbuffer_width ||
+                                  mailbox_texture.height != frontbuffer_height)) {
+    // Metal command buffers retain their referenced resources. Also, direct
+    // producers are required to use command_queue_, so replacing a free
+    // mailbox texture can't race with queued work using its previous version.
+    [(id)mailbox_texture.texture release];
+    mailbox_texture.texture = nullptr;
+    mailbox_texture.width = 0;
+    mailbox_texture.height = 0;
+  }
+  if (!mailbox_texture.texture) {
+    MTLTextureDescriptor* texture_desc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                           width:frontbuffer_width
+                                                          height:frontbuffer_height
+                                                       mipmapped:NO];
+    texture_desc.usage =
+        MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
+    texture_desc.storageMode = MTLStorageModePrivate;
+    mailbox_texture.texture = [(id<MTLDevice>)metal_device_ newTextureWithDescriptor:texture_desc];
+    if (mailbox_texture.texture) {
+      mailbox_texture.width = frontbuffer_width;
+      mailbox_texture.height = frontbuffer_height;
+      [(id<MTLTexture>)mailbox_texture.texture
+          setLabel:[NSString stringWithFormat:@"ReXGlue guest output mailbox %u", mailbox_index]];
+    } else {
+      // A missing direct texture isn't fatal to presentation. A refresher that
+      // doesn't require it may still succeed and use the CPU-upload fallback.
+      REXLOG_WARN("MetalPresenter: failed to create direct guest output texture {}x{}",
+                  frontbuffer_width, frontbuffer_height);
+    }
+  }
+
+  MetalGuestOutputRefreshContext context(is_8bpc_out_ref, mailbox_texture.texture, command_queue_);
+  bool refresher_succeeded = refresher(context);
+  if (refresher_succeeded && context.direct_valid()) {
+    // The presentation snapshot is produced on the renderer queue, then read
+    // by a copy submitted to command_queue_. Metal's automatic hazard tracking
+    // doesn't order conflicting accesses across queues. Complete that copy
+    // before returning to the renderer so it may safely reuse its snapshot
+    // texture for the next frame.
+    id<MTLCommandBuffer> direct_refresh_completion =
+        [(id<MTLCommandQueue>)command_queue_ commandBuffer];
+    if (direct_refresh_completion) {
+      direct_refresh_completion.label = @"ReXGlue direct guest output refresh completion";
+      [direct_refresh_completion commit];
+      [direct_refresh_completion waitUntilCompleted];
+    }
+    if (!direct_refresh_completion ||
+        [direct_refresh_completion status] != MTLCommandBufferStatusCompleted) {
+      NSError* error = direct_refresh_completion ? [direct_refresh_completion error] : nil;
+      const char* error_text = error ? [[error localizedDescription] UTF8String] : "unknown error";
+      REXLOG_WARN("MetalPresenter: direct guest output copy did not complete: {}", error_text);
+      refresher_succeeded = false;
+    }
+  }
+  mailbox_texture.direct_valid = refresher_succeeded && context.direct_valid();
+  mailbox_texture.guest_swizzle = mailbox_texture.direct_valid ? context.guest_swizzle() : 0x688;
+  if (refresher_succeeded) {
+    {
+      std::lock_guard<std::mutex> lock(guest_frame_mutex_);
+      RecordGuestFrameArrivalLocked();
+      BuildGuestFpsOverlayLocked(frontbuffer_width, frontbuffer_height);
+    }
+    if (profile_enabled_ && mailbox_texture.direct_valid) {
+      std::lock_guard<std::mutex> profile_lock(profile_mutex_);
+      profile_window_.RecordSource(false);
+    }
+  }
+  return refresher_succeeded;
 }
 
 bool MetalPresenter::EnsureGuestPipeline() {
   if (guest_pipeline_state_) {
     return true;
+  }
+  if (fps_pipeline_state_) {
+    [(id)fps_pipeline_state_ release];
+    fps_pipeline_state_ = nullptr;
   }
 
   id<MTLDevice> device = (id<MTLDevice>)metal_device_;
@@ -460,16 +646,43 @@ bool MetalPresenter::EnsureGuestPipeline() {
   descriptor.vertexFunction = vertex_function;
   descriptor.fragmentFunction = fragment_function;
   descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-  guest_pipeline_state_ = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+  NSError* guest_pipeline_error = nil;
+  guest_pipeline_state_ = [device newRenderPipelineStateWithDescriptor:descriptor
+                                                                 error:&guest_pipeline_error];
+
+  descriptor.colorAttachments[0].blendingEnabled = YES;
+  descriptor.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+  descriptor.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+  descriptor.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+  descriptor.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+  descriptor.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+  descriptor.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+  NSError* fps_pipeline_error = nil;
+  fps_pipeline_state_ = [device newRenderPipelineStateWithDescriptor:descriptor
+                                                               error:&fps_pipeline_error];
   [descriptor release];
   [vertex_function release];
   [fragment_function release];
   [library release];
 
   if (!guest_pipeline_state_) {
-    const char* error_text = error ? [[error localizedDescription] UTF8String] : "unknown error";
+    const char* error_text = guest_pipeline_error
+                                 ? [[guest_pipeline_error localizedDescription] UTF8String]
+                                 : "unknown error";
     REXLOG_ERROR("MetalPresenter: failed to create guest present pipeline: {}", error_text);
+    if (fps_pipeline_state_) {
+      [(id)fps_pipeline_state_ release];
+      fps_pipeline_state_ = nullptr;
+    }
     return false;
+  }
+  if (!fps_pipeline_state_) {
+    const char* error_text = fps_pipeline_error
+                                 ? [[fps_pipeline_error localizedDescription] UTF8String]
+                                 : "unknown error";
+    REXLOG_WARN("MetalPresenter: failed to create FPS overlay pipeline; continuing "
+                "without the overlay: {}",
+                error_text);
   }
   return true;
 }
@@ -480,10 +693,7 @@ Presenter::PaintResult MetalPresenter::PaintAndPresentImpl(bool execute_ui_drawe
     return PaintResult::kPresented;
   }
   if (!command_queue_) {
-    command_queue_ = [(id<MTLDevice>)metal_device_ newCommandQueue];
-    if (!command_queue_) {
-      return PaintResult::kNotPresented;
-    }
+    return PaintResult::kNotPresented;
   }
 
   @autoreleasepool {
@@ -501,7 +711,25 @@ Presenter::PaintResult MetalPresenter::PaintAndPresentImpl(bool execute_ui_drawe
 
     id<MTLCommandBuffer> command_buffer = [(id<MTLCommandQueue>)command_queue_ commandBuffer];
 
-    {
+    id<MTLTexture> source_texture = nil;
+    uint32_t source_guest_swizzle = 0x688;
+    // Preserve UpdateGuestFrontbuffer as a self-contained fallback, including
+    // before the first successful mailbox publication.
+    bool use_cpu_fallback = true;
+    uint32_t guest_output_mailbox_index;
+    std::unique_lock<std::mutex> guest_output_consumer_lock(
+        ConsumeGuestOutput(guest_output_mailbox_index, nullptr, nullptr));
+    if (guest_output_mailbox_index != UINT32_MAX) {
+      const GuestOutputMailboxTexture& mailbox_texture =
+          guest_output_mailbox_textures_[guest_output_mailbox_index];
+      if (mailbox_texture.texture && mailbox_texture.direct_valid) {
+        source_texture = [(id<MTLTexture>)mailbox_texture.texture retain];
+        source_guest_swizzle = mailbox_texture.guest_swizzle;
+        use_cpu_fallback = false;
+      }
+    }
+
+    if (use_cpu_fallback) {
       std::lock_guard<std::mutex> lock(guest_frame_mutex_);
       if (!guest_frame_bgra_.empty() && guest_frame_width_ && guest_frame_height_) {
         if (!guest_texture_ || guest_texture_width_ != guest_frame_width_ ||
@@ -536,6 +764,48 @@ Presenter::PaintResult MetalPresenter::PaintAndPresentImpl(bool execute_ui_drawe
           }
           guest_texture_generation_ = guest_frame_generation_;
         }
+        if (guest_texture_) {
+          source_texture = [(id<MTLTexture>)guest_texture_ retain];
+        }
+      }
+    }
+
+    bool source_direct = source_texture && !use_cpu_fallback;
+    id<MTLTexture> fps_texture = nil;
+    uint32_t fps_width = 0;
+    uint32_t fps_height = 0;
+    if (source_direct && REXCVAR_GET(metal_show_fps)) {
+      std::lock_guard<std::mutex> lock(guest_frame_mutex_);
+      if (!fps_overlay_bgra_.empty() && fps_overlay_width_ && fps_overlay_height_) {
+        if (!fps_texture_ || fps_texture_generation_ != fps_overlay_generation_) {
+          MTLTextureDescriptor* texture_desc =
+              [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                 width:fps_overlay_width_
+                                                                height:fps_overlay_height_
+                                                             mipmapped:NO];
+          texture_desc.usage = MTLTextureUsageShaderRead;
+          texture_desc.storageMode = MTLStorageModeShared;
+          id<MTLTexture> new_fps_texture =
+              [(id<MTLDevice>)metal_device_ newTextureWithDescriptor:texture_desc];
+          if (new_fps_texture) {
+            [new_fps_texture setLabel:@"ReXGlue guest FPS overlay"];
+            [new_fps_texture
+                replaceRegion:MTLRegionMake2D(0, 0, fps_overlay_width_, fps_overlay_height_)
+                  mipmapLevel:0
+                    withBytes:fps_overlay_bgra_.data()
+                  bytesPerRow:size_t(fps_overlay_width_) * 4];
+            if (fps_texture_) {
+              [(id)fps_texture_ release];
+            }
+            fps_texture_ = new_fps_texture;
+            fps_texture_generation_ = fps_overlay_generation_;
+          }
+        }
+        if (fps_texture_ && fps_texture_generation_ == fps_overlay_generation_) {
+          fps_texture = [(id<MTLTexture>)fps_texture_ retain];
+          fps_width = fps_overlay_width_;
+          fps_height = fps_overlay_height_;
+        }
       }
     }
 
@@ -546,12 +816,12 @@ Presenter::PaintResult MetalPresenter::PaintAndPresentImpl(bool execute_ui_drawe
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
     pass.colorAttachments[0].clearColor = MTLClearColorMake(0.015, 0.015, 0.018, 1.0);
     id<MTLRenderCommandEncoder> encoder = [command_buffer renderCommandEncoderWithDescriptor:pass];
-    if (guest_texture_) {
+    if (source_texture) {
       if (EnsureGuestPipeline()) {
         double drawable_width = double([drawable_texture width]);
         double drawable_height = double([drawable_texture height]);
-        double guest_width = double([(id<MTLTexture>)guest_texture_ width]);
-        double guest_height = double([(id<MTLTexture>)guest_texture_ height]);
+        double guest_width = double([source_texture width]);
+        double guest_height = double([source_texture height]);
         double scale = std::min(drawable_width / guest_width, drawable_height / guest_height);
         double viewport_width = guest_width * scale;
         double viewport_height = guest_height * scale;
@@ -563,8 +833,32 @@ Presenter::PaintResult MetalPresenter::PaintAndPresentImpl(bool execute_ui_drawe
                                 1.0};
         [encoder setViewport:viewport];
         [encoder setRenderPipelineState:(id<MTLRenderPipelineState>)guest_pipeline_state_];
-        [encoder setFragmentTexture:(id<MTLTexture>)guest_texture_ atIndex:0];
+        [encoder setFragmentTexture:source_texture atIndex:0];
+        [encoder setFragmentBytes:&source_guest_swizzle
+                           length:sizeof(source_guest_swizzle)
+                          atIndex:0];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        if (fps_pipeline_state_ && fps_texture && fps_width && fps_height) {
+          double overlay_margin_guest =
+              guest_width >= 960.0 && guest_height >= 540.0
+                  ? 6.0
+                  : (guest_width >= 480.0 && guest_height >= 270.0 ? 4.0 : 2.0);
+          MTLViewport fps_viewport = {
+              viewport.originX + viewport.width -
+                  (double(fps_width) + overlay_margin_guest) * scale,
+              viewport.originY + overlay_margin_guest * scale,
+              double(fps_width) * scale,
+              double(fps_height) * scale,
+              0.0,
+              1.0,
+          };
+          uint32_t identity_swizzle = 0x688;
+          [encoder setViewport:fps_viewport];
+          [encoder setRenderPipelineState:(id<MTLRenderPipelineState>)fps_pipeline_state_];
+          [encoder setFragmentTexture:fps_texture atIndex:0];
+          [encoder setFragmentBytes:&identity_swizzle length:sizeof(identity_swizzle) atIndex:0];
+          [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        }
       }
     }
     [encoder endEncoding];
@@ -572,6 +866,16 @@ Presenter::PaintResult MetalPresenter::PaintAndPresentImpl(bool execute_ui_drawe
     uint64_t present_start_ns = profile_enabled_ ? profiling::NowNs() : 0;
     [command_buffer presentDrawable:drawable];
     [command_buffer commit];
+    // Keep the mailbox image acquired until the read has been committed. This
+    // prevents another consumer from releasing the slot back to a producer
+    // early enough for its next write to be committed first.
+    guest_output_consumer_lock.unlock();
+    if (source_texture) {
+      [source_texture release];
+    }
+    if (fps_texture) {
+      [fps_texture release];
+    }
     EndProfiledPresentAttempt(false, profile_enabled_ ? profiling::ElapsedNs(present_start_ns) : 0);
   }
 

@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <rex/graphics/command_processor.h>
@@ -38,6 +39,10 @@ class MetalCommandProcessor final : public CommandProcessor {
   bool SetupContext() override;
   void ShutdownContext() override;
   void WriteRegister(uint32_t index, uint32_t value) override;
+  bool WriteGpuCompletionMemory(uint32_t address, const void* data, size_t length) override;
+  bool FlushGpuCompletionMemoryWrites() override;
+  void PrepareForWait() override;
+  void OnPrimaryBufferEnd() override;
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
   void OnWaitRegMemComplete(bool is_memory, uint32_t poll_address, uint32_t reference,
                             uint32_t mask, uint32_t operation, uint32_t wait, uint32_t last_value,
@@ -103,6 +108,7 @@ class MetalCommandProcessor final : public CommandProcessor {
   bool DumpHostRenderTargetToEdram(const HostRenderTarget& target);
   bool ResolveEdramToBgra(const draw_util::ResolveInfo& resolve_info, uint32_t width,
                           uint32_t height, std::vector<uint8_t>& bgra_out);
+  bool PublishPendingGpuTiledResolveRangesToGuest();
   uint64_t GetHostRenderTargetKey(uint32_t rt_index) const;
   HostRenderTarget* FindHostRenderTarget(uint32_t rt_index);
   HostRenderTarget* FindHostRenderTargetForResolve(uint32_t rt_index, uint32_t color_base,
@@ -166,6 +172,11 @@ class MetalCommandProcessor final : public CommandProcessor {
                                        uint32_t source_height, uint32_t source_x, uint32_t source_y,
                                        uint32_t dest_x, uint32_t dest_y, uint32_t write_width,
                                        uint32_t write_height, xenos::Endian128 dest_endian);
+  bool EnsureExactResolvedSurfaceSnapshot(uint32_t width, uint32_t height);
+  void UpdateExactResolvedSurfaceGpuCache(uint32_t dest_base, uint32_t pitch,
+                                          uint32_t surface_height, uint32_t snapshot_width,
+                                          uint32_t snapshot_height, xenos::Endian128 dest_endian);
+  void ReleaseExactResolvedSurfaceSnapshot();
   static void ExactResolvedSurfaceWatchCallback(
       const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
       uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu);
@@ -268,6 +279,7 @@ class MetalCommandProcessor final : public CommandProcessor {
   // memory watch invalidates it on overlapping CPU or GPU writes.
   struct ExactResolvedSurface {
     std::vector<uint8_t> bgra;
+    void* metal_texture = nullptr;
     // Invalidation keeps the allocations so the title's repeated partial-band
     // writes don't free and reallocate roughly 7.5 MiB before every complete
     // resolve. Only a fully republished surface may be used by swap.
@@ -277,6 +289,9 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint32_t bgra_height = 0;
     uint32_t surface_height = 0;
     uint32_t tiled_extent = 0;
+    uint32_t texture_width = 0;
+    uint32_t texture_height = 0;
+    bool gpu_snapshot = false;
     xenos::Endian128 endian = xenos::Endian128::kNone;
   };
   struct HostRenderTarget {
@@ -302,11 +317,23 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint32_t bgra_width = 0;
     uint32_t bgra_height = 0;
   };
+  struct PendingGpuCompletionWrite {
+    static constexpr size_t kMaxDataLength = 16;
+    uint32_t address = 0;
+    uint32_t length = 0;
+    std::array<uint8_t, kMaxDataLength> data = {};
+  };
   std::unordered_map<uint32_t, RetainedResolvedFrame> retained_resolve_frames_by_base_;
   ExactResolvedSurface exact_resolved_surface_;
   SharedMemory::GlobalWatchHandle exact_resolved_surface_watch_ = nullptr;
   std::unordered_map<uint64_t, HostRenderTarget> host_render_targets_;
   std::vector<PendingReadbackResolveSlice> pending_readback_resolve_slices_;
+  // GPU tiled resolves stay resident until the next guest-visible completion
+  // event. All ranges before that event are coalesced into one Metal blit
+  // command, avoiding a large mirror command per resolve.
+  std::vector<std::pair<uint32_t, uint32_t>> pending_gpu_tiled_resolve_publication_ranges_;
+  std::vector<PendingGpuCompletionWrite> pending_gpu_completion_writes_;
+  std::vector<uint8_t> pending_gpu_completion_staging_;
   uint32_t latest_pipeline_probe_width_ = 0;
   uint32_t latest_pipeline_probe_height_ = 0;
   uint32_t latest_host_render_target_width_ = 0;
@@ -361,6 +388,12 @@ class MetalCommandProcessor final : public CommandProcessor {
   uint64_t gpu_tiled_resolve_count_ = 0;
   uint64_t gpu_tiled_resolve_pixel_count_ = 0;
   uint64_t gpu_tiled_resolve_fallback_count_ = 0;
+  uint64_t gpu_publication_event_count_ = 0;
+  uint64_t gpu_publication_input_range_count_ = 0;
+  uint64_t gpu_publication_merged_range_count_ = 0;
+  uint64_t gpu_publication_byte_count_ = 0;
+  uint64_t gpu_completion_write_count_ = 0;
+  uint64_t gpu_completion_batch_count_ = 0;
   uint32_t host_pixel_draws_this_swap_ = 0;
   uint32_t host_fallback_pixel_draws_this_swap_ = 0;
   uint32_t host_pixel_skipped_vertices_this_swap_ = 0;
@@ -413,6 +446,7 @@ class MetalCommandProcessor final : public CommandProcessor {
       wait_reg_mem_profile_entries_;
   profiling::CommandProfileWindow profile_window_;
   uint64_t profiled_swap_count_ = 0;
+  uint64_t profile_window_start_ns_ = 0;
   bool profile_enabled_ = profiling::IsEnabled();
   bool logged_incomplete_ = false;
   bool last_host_render_target_probe_read_ = false;

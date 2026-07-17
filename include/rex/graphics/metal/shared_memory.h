@@ -14,6 +14,12 @@ namespace rex::graphics::metal {
 
 class MetalSharedMemory final : public SharedMemory {
  public:
+  struct OrderedGuestMemoryWrite {
+    uint32_t start = 0;
+    uint32_t data_offset = 0;
+    uint32_t length = 0;
+  };
+
   using HostResourceMutationCallback = std::function<bool()>;
   using GpuResourceMutationCallback = std::function<bool()>;
 
@@ -42,6 +48,11 @@ class MetalSharedMemory final : public SharedMemory {
   // The command queue used for shared-memory uploads. Persistent render
   // contexts retain this queue so uploads and draws have one total GPU order.
   void* command_queue() const { return command_queue_; }
+  // Persistent no-copy MTLBuffer alias of the 512 MiB guest physical mapping.
+  // Optional: initialization of the resident buffer may still succeed on a
+  // platform that rejects this alias, in which case callers use the
+  // synchronous publication fallback.
+  void* guest_memory_buffer() const { return guest_memory_buffer_; }
 
   // Installs the command-processor synchronization callback used before the
   // CPU reads or mutates resources that may still be referenced by Metal
@@ -66,6 +77,30 @@ class MetalSharedMemory final : public SharedMemory {
   // preceding RequestRange through this call. Unlike CommitGuestCpuWriteAsGpu,
   // this copies Metal -> guest and does not copy the same bytes back again.
   bool CommitGpuBufferWriteToGuest(uint32_t start, uint32_t length);
+  // Batched version for ranges that have already been passed to
+  // RangeWrittenByGpu. It performs one synchronization before copying all
+  // ranges, avoiding a queue drain per resolve at an explicit frame fence.
+  bool PublishGpuBufferWritesToGuest(const std::vector<std::pair<uint32_t, uint32_t>>& byte_ranges);
+
+  // Enqueues a small GPU packet write to both the resident shared-memory buffer
+  // and the no-copy guest physical alias on command_queue(). This preserves the
+  // ordering of EVENT_WRITE_SHD completion words behind earlier Metal work
+  // without blocking the command-processor thread.
+  bool EnqueueGpuOrderedGuestMemoryWrite(uint32_t start, const void* data, size_t length);
+  // Publishes all GPU-produced resident ranges to the guest alias in the same
+  // command buffer immediately before the completion write. The input ranges
+  // must already have been passed to RangeWrittenByGpu, and must not be carried
+  // across completion events.
+  bool EnqueueGpuOrderedGuestMemoryPublicationAndWrite(
+      const std::vector<std::pair<uint32_t, uint32_t>>& publication_byte_ranges,
+      uint32_t completion_start, const void* completion_data, size_t completion_length);
+  // Batched form used at command-ring boundaries. All writes are encoded in
+  // descriptor order after the publication blits, and their source bytes are
+  // slices of completion_data.
+  bool EnqueueGpuOrderedGuestMemoryPublicationAndWrites(
+      const std::vector<std::pair<uint32_t, uint32_t>>& publication_byte_ranges,
+      const std::vector<OrderedGuestMemoryWrite>& completion_writes, const void* completion_data,
+      size_t completion_data_length);
 
  protected:
   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
@@ -84,6 +119,7 @@ class MetalSharedMemory final : public SharedMemory {
   TraceWriter& trace_writer_;      // Records uploaded ranges into the GPU trace.
   void* metal_device_ = nullptr;   // Non-owning id<MTLDevice>.
   void* buffer_ = nullptr;         // Owned id<MTLBuffer>, MTLStorageModeShared.
+  void* guest_memory_buffer_ = nullptr;  // Owned no-copy id<MTLBuffer>.
   void* command_queue_ = nullptr;  // Owned id<MTLCommandQueue>.
   HostResourceMutationCallback host_resource_mutation_callback_;
   GpuResourceMutationCallback gpu_resource_mutation_callback_;

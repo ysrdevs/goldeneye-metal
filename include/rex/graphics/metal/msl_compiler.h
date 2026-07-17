@@ -89,9 +89,9 @@ struct ProbeColorTargetState {
 };
 
 struct ProbeTiledResolveTarget {
-  // Existing caller-owned id<MTLBuffer>. The helper does not retain it after
-  // returning, and the buffer must use CPU-visible shared storage if the caller
-  // intends to consume the resolved bytes on the CPU.
+  // Existing caller-owned resident id<MTLBuffer>. Submitted Metal command
+  // buffers retain it for their in-flight lifetime. It must use shared storage
+  // if the caller intends to consume the resolved bytes on the CPU.
   void* metal_buffer = nullptr;
   // Byte offset of the start of the tiled surface in metal_buffer.
   size_t buffer_offset = 0;
@@ -102,6 +102,26 @@ struct ProbeTiledResolveTarget {
   // xenos::Endian128 values supported by 32bpp resolves: kNone, k8in16,
   // k8in32, and k16in32 (0 through 3).
   uint32_t endian = 0;
+  // Optional no-copy MTLBuffer alias of guest physical memory. If supplied,
+  // the resolve command mirrors a resident-buffer byte range into it after the
+  // tiled compute pass, preserving GPU ordering without a CPU memcpy.
+  void* guest_memory_metal_buffer = nullptr;
+  uint32_t guest_memory_copy_source_offset = 0;
+  uint32_t guest_memory_copy_destination_offset = 0;
+  uint32_t guest_memory_copy_length = 0;
+  // Optional notification for a deferred resolve that fails after this
+  // function has returned success. The callback is invoked when the owning
+  // command buffer is consumed, before its retained resources are released.
+  void (*async_failure_callback)(void* context, uint32_t start, uint32_t length) = nullptr;
+  void* async_failure_callback_context = nullptr;
+  uint32_t async_failure_start = 0;
+  uint32_t async_failure_length = 0;
+  // Optional caller-owned BGRA8 texture receiving the untiled resolved color
+  // before any later render-target clear. The destination origin defaults to
+  // the top-left and the copied size is resolve_width x resolve_height.
+  void* presentation_snapshot_texture = nullptr;
+  uint32_t presentation_snapshot_x = 0;
+  uint32_t presentation_snapshot_y = 0;
 };
 
 struct PipelineProbeUploadStats {
@@ -123,6 +143,21 @@ void* CreatePipelineProbeContext(void* metal_device, void* metal_command_queue,
                                  std::string* error_out);
 void* CreateHostRenderTargetContext(void* metal_device, std::string* error_out);
 void* CreateHostRenderTargetContext(void* metal_device, void* metal_command_queue,
+                                    std::string* error_out);
+// Makes destination_context use source_context's persistent depth/stencil
+// target while retaining its own color target. Both contexts must use the same
+// Metal device and command queue. Existing destination work is drained before
+// ownership changes; later switches between the contexts finalize the previous
+// open draw batch so shared depth/stencil accesses stay in guest draw order.
+bool SharePipelineProbeDepthStencilTarget(void* destination_context, void* source_context,
+                                          std::string* error_out);
+void* CreatePipelineProbeSnapshotTexture(void* metal_device, uint32_t width, uint32_t height,
+                                         std::string* error_out);
+void ReleasePipelineProbeSnapshotTexture(void* snapshot_texture);
+// Enqueues and commits a full rectangular texture copy on the supplied queue.
+// The source must be complete before a different queue is used.
+bool QueuePipelineProbeSnapshotCopy(void* metal_command_queue, void* source_texture,
+                                    void* destination_texture, uint32_t width, uint32_t height,
                                     std::string* error_out);
 void ResetPipelineProbeContext(void* context);
 void ReleasePipelineProbeContext(void* context);
@@ -187,13 +222,13 @@ bool ReadPipelineProbeContextRect(void* context, uint32_t width, uint32_t height
                                   std::vector<uint8_t>& bgra_out, std::string* error_out);
 // Resolves a BGRA8 rectangle from the persistent render texture into an
 // externally owned MTLBuffer using the exact Xenos 32bpp tiled layout. Pending
-// render work, the texture-to-staging blit, and the compute conversion are
-// ordered on the context's queue and completed with one CPU wait. Like Read,
-// this is a fence even when metadata or bounds are invalid. If bgra_out is not
-// null, it receives the same rectangle as tightly packed raw BGRA bytes;
-// otherwise no CPU-side output vector is allocated or copied. If a submitted
-// Metal command fails, the destination may be partially modified even though
-// this returns false, so callers must invalidate or restore the target range.
+// render work, texture-to-staging blit, compute conversion, and optional guest
+// mirror copy are ordered on the context's queue. If bgra_out is null, valid
+// work is queued asynchronously and counted by
+// GetPipelineProbeContextPendingSubmissionCount; callers must later wait the
+// context before treating completion as successful. If bgra_out is non-null,
+// this remains a fence and returns the rectangle as tightly packed raw BGRA.
+// Invalid metadata is also a fence so earlier work is never abandoned.
 bool ResolvePipelineProbeContextToXenosTiled(void* context, uint32_t width, uint32_t height,
                                              uint32_t source_x, uint32_t source_y,
                                              uint32_t resolve_width, uint32_t resolve_height,

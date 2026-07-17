@@ -187,13 +187,15 @@ single-layer `texture2d_array`, expands a four-vertex fan through a six-entry in
 scissor delivery, verifies the title's source-alpha blend mode, and validates Xenos-to-Metal
 per-channel write-mask mapping. It also covers front/back culling with clockwise and
 counter-clockwise guest front faces, persistent near/far depth rejection, disabled depth writes,
-stencil replace/equal/reject, ordered draws across queued command buffers, the 64-draw
-command-buffer boundary, 256-draw oldest-buffer retirement, four upload-arena lifetimes, explicit
-waits, reusable upload-arena lifetime across command-buffer completion, and synchronization during
-shared/private regional readback, queued clear, resize, and context release. It protects the
-resource, fixed-function, and asynchronous-lifetime contracts used by translated producer draws.
-It does not replace title-level validation of texture-cache uploads, resolve coherence, or
-sustained execution.
+stencil replace/equal/reject, conservative shared-depth handoff between color contexts on one
+queue, rejection of incompatible-queue sharing, ordered draws across queued command buffers, the
+64-draw command-buffer boundary, 256-draw oldest-buffer retirement, four upload-arena lifetimes,
+explicit waits, reusable upload-arena lifetime across command-buffer completion, a pre-clear GPU
+presentation snapshot, and synchronization during shared/private regional readback, queued clear,
+resize, and context release. It protects the resource, fixed-function, and asynchronous-lifetime
+contracts used by translated producer draws. It does not replace title-level validation of
+texture-cache uploads, resolve coherence, guest-addressed shared-depth identity, or sustained
+execution.
 
 Run the Metal test with API validation enabled after changing submission or resource ownership:
 
@@ -207,6 +209,52 @@ require an external `powerpc-none-elf` binutils toolchain. Enable them explicitl
 ```sh
 cmake --preset macos-arm64-release -DREXGLUE_BUILD_PPC_TESTS=ON
 ```
+
+## Deterministic Dam benchmark
+
+Run the input-only menu-to-Dam route with profiling, fixed 1280x720 output, a 60 FPS cap, no
+physical input, and all high-volume diagnostics disabled:
+
+```sh
+./tools/benchmark-dam.sh
+```
+
+The script defaults to the cached local game data, discards eight complete 64-frame Dam windows,
+and measures the following 48. It records the executable, runtime, XEX hashes, Git state, hardware,
+macOS version, power source, and environment beside the raw log under
+`out/benchmarks/<UTC timestamp>/`. It then writes `windows.csv`, `summary.json`, and `summary.txt`.
+The parser fails a run with insufficient windows, a resolve fallback, a full-frame presenter
+upload, a Metal execution error, a nil drawable, or an unmatched or timed-out `WAIT_REG_MEM`.
+Generated results and game-data hashes stay under the ignored `out/` tree.
+
+Override paths or sampling only when needed:
+
+```sh
+GOLDENEYE_BENCH_GAME_DATA=/absolute/path/to/game-data \
+GOLDENEYE_BENCH_WARMUP_WINDOWS=8 \
+GOLDENEYE_BENCH_MEASURE_WINDOWS=48 \
+GOLDENEYE_BENCH_TIMEOUT_S=600 \
+./tools/benchmark-dam.sh
+```
+
+`tools/metal_profile_parser.py` can also parse an existing profiler log without launching the
+title:
+
+```sh
+python3 tools/metal_profile_parser.py /absolute/path/to/raw.log \
+  --output /tmp/goldeneye-benchmark --warmup 8 --measure 48
+```
+
+Interpret transition-heavy samples honestly. On the Apple M3 Ultra, the batched-publication run
+at `out/benchmarks/20260717T173814Z` used only two warmup windows; its selected early Dam windows
+therefore averaged 52.482 FPS (38.797–59.089), while later recorded windows reached
+59.923–60.067 FPS. The first direct-snapshot run at
+`out/benchmarks/20260717T174238Z` used only one warmup window; its selected transition windows
+averaged 34.916 FPS (29.987–46.840), but subsequent complete windows reached approximately 60 FPS.
+The finalized `20260717T180143Z` run used the default eight warmup and 48 measured windows. It
+averaged 59.909 FPS (57.357–60.148) with zero full-frame presenter uploads, resolve fallbacks,
+unmatched waits, timeouts, or nil drawables. These are M3 Ultra measurements, not a claim that
+every scene is locked to 60 FPS. The base M5 MacBook Air still needs the same benchmark rerun.
 
 ## Runtime and Metal diagnostics
 
@@ -269,7 +317,10 @@ display latency. When the flag is absent, the timers and presenter source hashin
 The Metal presenter draws `FPS` by default after each completed guest front-buffer update. It
 counts guest-delivered frames over a monotonic interval rather than CAMetalLayer paint events, so
 window expose or repaint traffic cannot inflate the value. Set `REX_METAL_SHOW_FPS=false` to
-disable the overlay.
+disable the overlay. On the exact direct path, a tiny BGRA overlay texture is blended over the
+GPU-resident mailbox image; the profiler's upload counters intentionally describe full-frame
+presenter uploads, so this overlay does not turn a zero-full-frame-upload window into a frame
+upload.
 
 Other host-pixel and fallback flags in the code are experiments. Results produced with them must be
 labelled as diagnostics and must not be reported as strict-path rendering success.
@@ -296,11 +347,21 @@ full-frame readback stays 1280x720. The default GPU tiled resolve writes the gue
 directly. Clear operations needed by the same sequence are queued in order on the context instead
 of forcing a separate CPU wait.
 
-Complete, top-origin, full-width resolves can populate an exact resolved-surface cache. A swap may
-reuse its host BGRA pixels only when the fetch base, pitch, dimensions, endian mode, and live guest
-tiled bytes still match. External guest writes and overlapping resolve writes invalidate the
-cache, and the final byte comparison catches writes that bypass normal tracking. Both the mirror
-and dirty-range commits use the true tiled-address upper bound rather than a linear
+GPU tiled writes remain resident until the next required guest-visible publication boundary.
+Overlapping resolve ranges are coalesced into one ordered copy from the resident Metal buffer to
+the guest alias. `EVENT_WRITE_SHD` and `EVENT_WRITE_EXT` completion payloads are batched and encoded
+after that copy in the same command buffer, so the guest cannot observe completion before the
+resolved bytes. Reuse of an overlapping completion address flushes the pending batch to preserve
+intermediate title handshake values. CP waits, swaps, primary-buffer completion, cache teardown,
+and shutdown are also explicit flush boundaries.
+
+Complete, top-origin, full-width resolves can populate an exact resolved-surface record. Before
+the resolve's title-requested clear, the same command buffer copies the rendered image to a private
+Metal snapshot. A swap may use it only when fetch base, pitch, dimensions, endian and swizzle,
+extent, and coherence metadata still match. It is copied on the GPU into a three-slot presenter
+mailbox, avoiding a full-frame CPU readback and `replaceRegion` upload. The checked CPU BGRA path
+remains the fallback for non-exact, diagnostic, or invalidated surfaces. Both the mirror and
+dirty-range commits use the true tiled-address upper bound rather than a linear
 `pitch * height * 4` estimate; the latter is too small for the bottom of a 1280x720 tiled surface.
 
 Coarse guest-memory invalidation may cover 256 KiB even when the resident texture bytes did not
@@ -326,21 +387,23 @@ binding.
 
 The GPU compute path writes the Xenos tiled destination directly and is enabled by default.
 Byte-exact coverage includes eight full and partial rectangle cases across all four 128-bit endian
-modes, and a live Dam proving run completed thousands of resolves with zero fallbacks. Set
+modes, and live Dam proving runs completed tens of thousands of resolves with zero fallbacks. Set
 `GOLDENEYE_METAL_GPU_TILED_RESOLVE=0` only when comparing the CPU fallback, and record the opt-out
-in performance results. Further work should make resolve submission more asynchronous and reduce
-the fence wait around its consumers.
+in performance results. Further work should reduce the fence wait around its consumers.
 
-Persistent Metal render contexts own private `Depth32Float_Stencil8` attachments. Normalized
+Persistent Metal render contexts own `Depth32Float_Stencil8` attachments. Normalized
 `RB_DEPTHCONTROL`, `RB_STENCILREFMASK`, and `RB_STENCILREFMASK_BF` state drives depth compare/write
 and independent front/back stencil compare, operations, masks, and references. Attachment
 load/store ordering follows the existing queued render context, and resize/reset/release drains
 pending work before changing its lifetime.
 
-This is intentionally a bounded fidelity slice. Depth attachments are still per host color-target
-context rather than shared by guest `RB_DEPTH_INFO.depth_base` / EDRAM identity. Guest `D24S8` and
-`D24FS8` both use Metal 32-bit float depth, and guest depth clear, copy, resolve, readback,
-texture-alias, MSAA, sample-mask, depth-bias, and non-solid-fill behavior remain unimplemented.
+Two color contexts using the same Metal queue can share one attachment through the conservative
+probe API, which drains and hands off the open owner in submission order. This is intentionally a
+foundation rather than title integration: the command processor does not yet select shared targets
+by a complete guest key containing `RB_DEPTH_INFO`, pitch, MSAA, dimensions, and format. Do not
+share by resolution alone. Guest `D24S8` and `D24FS8` both use Metal 32-bit float depth, and guest
+depth clear, copy, resolve, readback, texture-alias, MSAA, sample-mask, depth-bias, and
+non-solid-fill behavior remain unimplemented.
 
 The title-facing GPU-wait hook determines completion from one atomic primary-ring snapshot. A ring
 is drained only when it is configured, has a valid write pointer, and has no pending commands;
@@ -366,15 +429,12 @@ The POSIX host tick count is represented in nanoseconds. Its frequency is theref
 billion ticks per second rather than derived from `clock_getres`, which reports the timer's
 precision rather than the unit of the returned count. The former calculation scaled guest time and
 the FPS display by the host timer quantum on macOS. With the corrected clock and performance
-optimizations above, verified 1280x720 captures on an Apple M3 Ultra reach the dossier and a clean
-real Dam briefing at roughly 60 FPS. An earlier dynamic Dam proving window measured 29.68 FPS.
-Oldest-first upload command-buffer retirement and a 2048 global retained-draw ceiling then
-produced a correct 46.5 FPS screenshot while reducing draw time from roughly 10 ms to 7.2–7.5 ms
-per swap. A later correct Dam screenshot displayed 60.0 FPS; stable complete windows reported
-roughly 6.4–6.7 ms draw, 4.2–4.35 ms copy, 1.74 ms swap, and 2.9 ms `WAIT_REG_MEM` time per swap.
-Not every Dam view sustains 60 FPS, so the primary performance target is broader-scene stability
-through asynchronous resolve work and lower fence-wait cost, followed by live physical
-keyboard/mouse gameplay validation.
+optimizations above, verified 1280x720 captures on an Apple M3 Ultra reach the dossier and clean
+real Dam gameplay. The finalized 48-window direct-snapshot sample averages 59.909 FPS and roughly
+9.12 ms draw, 0.62 ms copy, 1.17 ms swap, and 3.36 ms `WAIT_REG_MEM` per swap. Its presenter
+windows have 64 sources and commits, zero full-frame uploads or upload bytes, and no drawable
+failures. This does not establish locked 60 FPS across every view, and it does not predict the
+lower-power base M5 MacBook Air result; that machine requires a fresh benchmark.
 
 ## Debugging guardrails
 

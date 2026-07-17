@@ -15,12 +15,14 @@ REXCVAR_DECLARE(bool, mnk_mode);
 REXCVAR_DECLARE(bool, mnk_mouse_enabled);
 REXCVAR_DECLARE(double, mnk_sensitivity);
 REXCVAR_DECLARE(std::string, keybind_start);
+REXCVAR_DECLARE(std::string, keybind_right_shoulder);
 REXCVAR_DECLARE(std::string, keybind_lstick_up);
 REXCVAR_DECLARE(std::string, keybind_rstick_up);
 
 using rex::X_RESULT;
 using rex::X_STATUS;
 using rex::input::X_INPUT_GAMEPAD_B;
+using rex::input::X_INPUT_GAMEPAD_RIGHT_SHOULDER;
 using rex::input::X_INPUT_GAMEPAD_START;
 using rex::input::X_INPUT_STATE;
 
@@ -117,6 +119,7 @@ TEST_CASE("MnK driver maps native keyboard and mouse events to controller state"
   ScopedValue<bool> enabled(REXCVAR_GET(mnk_mode), true);
   ScopedValue<double> sensitivity(REXCVAR_GET(mnk_sensitivity), 1.0);
   ScopedValue<std::string> start(REXCVAR_GET(keybind_start), "Return");
+  ScopedValue<std::string> right_shoulder(REXCVAR_GET(keybind_right_shoulder), "F");
 
   rex::input::mnk::MnkInputDriver driver(nullptr, 0);
   REQUIRE(driver.Setup() == X_STATUS_SUCCESS);
@@ -124,9 +127,11 @@ TEST_CASE("MnK driver maps native keyboard and mouse events to controller state"
   auto w = Key(rex::ui::VirtualKey::kW);
   auto shift = Key(rex::ui::VirtualKey::kShift);
   auto enter = Key(rex::ui::VirtualKey::kReturn);
+  auto graphics_toggle = Key(rex::ui::VirtualKey::kF);
   driver.OnKeyDown(w);
   driver.OnKeyDown(shift);
   driver.OnKeyDown(enter);
+  driver.OnKeyDown(graphics_toggle);
 
   rex::ui::MouseEvent move(nullptr, rex::ui::MouseEvent::Button::kNone, 0, 0, 0, 0, {-4, 3});
   rex::ui::MouseEvent left_down(nullptr, rex::ui::MouseEvent::Button::kLeft, 0, 0);
@@ -141,12 +146,16 @@ TEST_CASE("MnK driver maps native keyboard and mouse events to controller state"
   CHECK(state.gamepad.right_trigger == 0xFF);
   CHECK((state.gamepad.buttons & X_INPUT_GAMEPAD_B) != 0);
   CHECK((state.gamepad.buttons & X_INPUT_GAMEPAD_START) != 0);
+  CHECK((state.gamepad.buttons & X_INPUT_GAMEPAD_RIGHT_SHOULDER) != 0);
 
   driver.OnKeyUp(w);
   driver.OnKeyUp(shift);
   driver.OnKeyUp(enter);
+  driver.OnKeyUp(graphics_toggle);
   rex::ui::MouseEvent left_up(nullptr, rex::ui::MouseEvent::Button::kLeft, 0, 0);
   driver.OnMouseUp(left_up);
+  REQUIRE(driver.GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK((state.gamepad.buttons & X_INPUT_GAMEPAD_RIGHT_SHOULDER) == 0);
 }
 
 TEST_CASE("MnK driver supports keyboard right-stick binds and modal suppression",
