@@ -87,9 +87,9 @@ endif()
 # metadata, and the source notices.  Game data is deliberately never copied.
 # ---------------------------------------------------------------------------
 if(APPLE)
-    set(GOLDENEYE_VERSION "0.1.1" CACHE STRING
+    set(GOLDENEYE_VERSION "0.1.2" CACHE STRING
         "GoldenEye Metal CFBundleShortVersionString")
-    set(GOLDENEYE_BUILD_NUMBER "2" CACHE STRING
+    set(GOLDENEYE_BUILD_NUMBER "3" CACHE STRING
         "GoldenEye Metal numeric CFBundleVersion")
     set(GOLDENEYE_BUNDLE_IDENTIFIER "io.github.ysrdevs.goldeneye-metal" CACHE STRING
         "GoldenEye Metal reverse-DNS bundle identifier")
@@ -103,7 +103,7 @@ if(APPLE)
     if(NOT GOLDENEYE_VERSION MATCHES "^[0-9]+\\.[0-9]+(\\.[0-9]+)?$")
         message(FATAL_ERROR
             "GOLDENEYE_VERSION must contain two or three numeric components "
-            "(for example, 0.1.1)")
+            "(for example, 0.1.2)")
     endif()
     if(NOT GOLDENEYE_BUILD_NUMBER MATCHES "^[0-9]+(\\.[0-9]+)?(\\.[0-9]+)?$")
         message(FATAL_ERROR

@@ -31,8 +31,8 @@ staples the app, creates the distributable ZIP from that stapled app, then
 creates, signs, notarizes, staples, and Gatekeeper-assesses the DMG. It writes:
 
 ```text
-release/GoldenEye-Metal-0.1.1-macos-arm64.zip
-release/GoldenEye-Metal-0.1.1-macos-arm64.dmg
+release/GoldenEye-Metal-0.1.2-macos-arm64.zip
+release/GoldenEye-Metal-0.1.2-macos-arm64.dmg
 ```
 
 The scripts accept `VERSION`, `BUILD_NUMBER`, `BUNDLE_IDENTIFIER`, and

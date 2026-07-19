@@ -5,8 +5,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 
-VERSION="${VERSION:-${APP_VERSION:-0.1.1}}"
-BUILD_NUMBER="${BUILD_NUMBER:-2}"
+VERSION="${VERSION:-${APP_VERSION:-0.1.2}}"
+BUILD_NUMBER="${BUILD_NUMBER:-3}"
 BUNDLE_IDENTIFIER="${BUNDLE_IDENTIFIER:-io.github.ysrdevs.goldeneye-metal}"
 MACOS_DEPLOYMENT_TARGET="${MACOS_DEPLOYMENT_TARGET:-14.0}"
 
@@ -28,8 +28,8 @@ Usage:
   ./launcher/build-app.sh
 
 Optional environment variables:
-  VERSION                  App version (default: 0.1.1)
-  BUILD_NUMBER             Numeric bundle build number (default: 2)
+  VERSION                  App version (default: 0.1.2)
+  BUILD_NUMBER             Numeric bundle build number (default: 3)
   BUNDLE_IDENTIFIER        Reverse-DNS bundle ID
   MACOS_DEPLOYMENT_TARGET  Minimum macOS version (default: 14.0)
   BUILD_JOBS               Parallel build jobs (default: logical CPU count)

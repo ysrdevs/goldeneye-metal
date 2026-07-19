@@ -7,6 +7,7 @@
 #pragma once
 
 #include <rex/cvar.h>
+#include <rex/logging.h>
 #include <rex/rex_app.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
@@ -64,6 +65,16 @@ class GeApp : public rex::ReXApp {
     // choice would never persist. The throttle is the same story: its default
     // lives in its REXCVAR_DEFINE and it is tuned live from the pause menu, so
     // it is never written here (writing default==default is a no-op anyway).
+  }
+
+  void OnPostInitLogging() override {
+    // Lets tester logs prove that the crash-guard build was actually launched.
+    REXLOG_INFO(
+        "[GE-GUARD-823DFB70-v1] active; protects packed-data loads at "
+        "823DFBAC and 823DFBD8");
+    if (auto* logger = rex::GetLoggerRaw(rex::log::core())) {
+      logger->flush();
+    }
   }
 
   std::optional<rex::PathConfig> OnPreparePaths(

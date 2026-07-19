@@ -14,7 +14,7 @@ GoldenEye Metal does not contain or download game data.
 ## Install
 
 1. Download the current DMG from the
-   [GitHub release page](https://github.com/ysrdevs/goldeneye-metal/releases/tag/v0.1.1).
+   [GitHub release page](https://github.com/ysrdevs/goldeneye-metal/releases/tag/v0.1.2).
 2. Open the DMG.
 3. Drag **GoldenEye Metal.app** into Applications.
 4. Open the app from Applications.
@@ -94,7 +94,7 @@ across every controller family is still in progress.
 
 ## Current limitations
 
-Version 0.1.1 is an experimental development release. It reaches the menu, Dam briefing, and first
+Version 0.1.2 is an experimental development release. It reaches the menu, Dam briefing, and first
 mission gameplay. Correct captures have shown 46.5–60 FPS, but performance is not locked to 60 FPS
 in every view. Some depth, stencil, multisampling, and broader-scene graphics behavior still needs
 work.

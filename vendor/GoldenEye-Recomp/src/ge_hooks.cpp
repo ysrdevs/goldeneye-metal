@@ -2050,6 +2050,75 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
     ST16(base, GE_PAD0 + 10, static_cast<uint16_t>(ry));
 }
 
+namespace {
+constexpr uint32_t kGeProtectedLowPageEnd = 0x10000u;
+
+constexpr bool ge_packed_data_load_needs_recovery(uint32_t callback_result,
+                                                  uint32_t load_address) {
+  return callback_result == 0 || load_address < kGeProtectedLowPageEnd;
+}
+
+static_assert(ge_packed_data_load_needs_recovery(0, 2));
+static_assert(ge_packed_data_load_needs_recovery(1, 3));
+static_assert(ge_packed_data_load_needs_recovery(0xFFFFFFFFu, 1));
+static_assert(!ge_packed_data_load_needs_recovery(0x10000u, 0x10002u));
+
+bool ge_should_log_packed_data_recovery(uint64_t hit) {
+  // Keep the first reports detailed, then retain sparse evidence if a bad
+  // resource remains active for many frames without flooding the tester log.
+  return hit <= 16 || (hit & (hit - 1)) == 0;
+}
+
+bool ge_recover_packed_data_load(uint32_t load_site, uint32_t callback_result,
+                                 uint32_t stream_offset, uint32_t load_address,
+                                 uint32_t owner, uint32_t guest_sp,
+                                 std::atomic<uint64_t>& hits, PPCRegister& result) {
+  if (!ge_packed_data_load_needs_recovery(callback_result, load_address)) {
+    return false;
+  }
+
+  // Callers already interpret a zero return as an empty packed-data result.
+  // The configured hook then jumps to sub_823DFB70's normal epilogue so its
+  // guest stack frame and saved registers are restored exactly as usual.
+  result.u64 = 0;
+
+  const uint64_t hit = hits.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (ge_should_log_packed_data_recovery(hit)) {
+    const char* reason = callback_result == 0 ? "null-callback" : "protected-low-page";
+    REXKRNL_WARN(
+        "[GE-GUARD-823DFB70-v1] recovered site=0x{:08X} hit={} reason={} "
+        "owner=0x{:08X} callback=0x{:08X} stream_offset=0x{:08X} "
+        "load=0x{:08X} guest_sp=0x{:08X}",
+        load_site, hit, reason, owner, callback_result, stream_offset, load_address, guest_sp);
+    if (auto* logger = rex::GetLoggerRaw(rex::log::krnl())) {
+      logger->flush();
+    }
+  }
+  return true;
+}
+}  // namespace
+
+// First packed-data callback load: lbz r11,2(r3) at 0x823DFBAC.
+bool ge_guard_packed_data_header(PPCRegister& r3, PPCRegister& r31, PPCRegister& r1) {
+  static std::atomic<uint64_t> hits{0};
+  const uint32_t callback_result = r3.u32;
+  const uint32_t load_address = callback_result + 2u;
+  return ge_recover_packed_data_load(0x823DFBACu, callback_result, 0, load_address, r31.u32,
+                                     r1.u32, hits, r3);
+}
+
+// Second packed-data callback load: lbz r3,2(r3+r30) at 0x823DFBD8. The hook
+// runs at 0x823DFBD4, before the add, so no invalid effective address is formed.
+bool ge_guard_packed_data_value(PPCRegister& r3, PPCRegister& r30, PPCRegister& r31,
+                                PPCRegister& r1) {
+  static std::atomic<uint64_t> hits{0};
+  const uint32_t callback_result = r3.u32;
+  const uint32_t stream_offset = r30.u32;
+  const uint32_t load_address = callback_result + stream_offset + 2u;
+  return ge_recover_packed_data_load(0x823DFBD8u, callback_result, stream_offset, load_address,
+                                     r31.u32, r1.u32, hits, r3);
+}
+
 // Startup asset/property table path: sub_823AE250 stores into a lookup result at
 // 0x823AE290. Missing optional entries can return null; on macOS that becomes a
 // host SIGBUS at guest base+0x14. Skip only the store and let the caller continue.
