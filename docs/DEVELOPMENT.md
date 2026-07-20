@@ -86,15 +86,22 @@ pointer so mouse-look is not clamped by a screen edge, and focus loss or teardow
 system cursor. Modifier `FlagsChanged` events never query AppKit's key-down-only repeat state; a
 focused regression covers their previous-state delivery.
 
-For the packaged player experience, open `GoldenEye Metal.app`. If no valid game-data root is
-configured or cached, its native first-run window accepts a local backup ZIP, the Xbox LIVE/STFS
-package inside it, or an extracted folder. It verifies the supported package before mounting it,
-imports through a private staging directory, publishes the completed cache atomically under
+For the packaged player experience, open `GoldenEye Metal.app`. Its native launcher always waits
+for an explicit **Play GoldenEye** action. If no valid game-data root is configured or cached, it
+accepts a local backup ZIP, the Xbox LIVE/STFS package inside it, or an extracted folder. It
+verifies the supported package before mounting it, imports through a private staging directory,
+publishes the completed cache atomically under
 `~/Library/Application Support/GoldenEye Metal/Game Data`, and removes the temporary package. It
-does not download or upload game data. Hold Option while opening the app to show setup again and
-select a different local source. Active imports can be cancelled; the staging directory is removed
+does not download or upload game data. Selecting or importing a source returns to the Ready state
+instead of starting gameplay. Active imports can be cancelled; the staging directory is removed
 and an existing working cache is not replaced. Strictly named interrupted-import artifacts older
 than six hours are cleaned on a later launch.
+
+The launcher can export one save-anywhere diagnostic ZIP containing bounded `ge_*.log` files,
+content-validated GoldenEye macOS crash reports, app build identity, and basic system information.
+It excludes game data, saves, cache, raw configuration, and remembered paths, and redacts local
+paths and persistent crash identifiers. Explicit developer invocations with `--game_data_root` and
+headless runs bypass the launcher so benchmarks and automation remain noninteractive.
 
 For a build-tree interactive run, double-click `Launch GoldenEye.command` at the repository root.
 It finds an extracted game-data folder, checks the minimum `default.xex` plus `files/` layout,

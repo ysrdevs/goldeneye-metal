@@ -26,8 +26,10 @@ To start playing:
 
 1. [Download the DMG](https://github.com/ysrdevs/goldeneye-metal/releases/download/v0.1.2/GoldenEye-Metal-0.1.2-macos-arm64.dmg).
 2. Open it and drag **GoldenEye Metal.app** into Applications.
-3. Launch the app and select your compatible local game backup.
-4. Wait for the one-time import. Future launches start directly from the private local copy.
+3. Launch the app. On first use, select your compatible local game backup and wait for the
+   one-time import.
+4. Choose **Play GoldenEye**. Future launches open the same launcher with your private local copy
+   ready.
 
 The first-run launcher accepts:
 
@@ -36,8 +38,12 @@ The first-run launcher accepts:
 - an extracted folder containing `default.xex`, `files/`, `music.xwb`, and `sfx.xwb`.
 
 The launcher verifies the supported game revision before importing it. Your files stay on your
-Mac: the app does not include, download, or upload game data. Hold **Option** while opening the app
-to choose a different source later.
+Mac: the app does not include, download, or upload game data. You can choose a different source
+from the launcher later.
+
+After a crash, reopen the launcher and choose **Export Diagnostic Bundle…**. Save the ZIP anywhere
+and send that one file with your report. It includes the relevant logs and matching macOS crash
+reports, while excluding game data, saves, cache, and settings.
 
 The release is Developer ID signed, Apple-notarized, and stapled. See the
 [player guide](docs/PLAYER_GUIDE.md) for detailed controls, controller setup, import behavior, and
@@ -85,7 +91,7 @@ Working today:
 - the classification, gun-barrel, RARE, menu, briefing, and first Dam gameplay sequences;
 - native Metal presentation on Apple Silicon;
 - native keyboard/mouse input and modern SDL gamepad support;
-- a local first-run game-data importer and normal macOS app launcher;
+- a local game-data importer, explicit Play launcher, and one-click diagnostic export;
 - an on-screen FPS counter and clean macOS window/menu quitting.
 
 Correct Dam captures have shown **46.5–60 FPS**, but this is not a claim of locked 60 FPS. The main

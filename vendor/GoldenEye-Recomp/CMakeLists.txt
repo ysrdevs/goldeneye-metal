@@ -53,6 +53,12 @@ endif()
 set_target_properties(ge PROPERTIES OUTPUT_NAME "GoldenEye")
 
 rexglue_setup_target(ge)
+if(APPLE)
+    find_library(GOLDENEYE_UNIFORM_TYPE_IDENTIFIERS_FRAMEWORK
+        UniformTypeIdentifiers REQUIRED)
+    target_link_libraries(ge PRIVATE
+        "${GOLDENEYE_UNIFORM_TYPE_IDENTIFIERS_FRAMEWORK}")
+endif()
 if(NOT MSVC)
     target_compile_options(ge PRIVATE
         "-ffile-prefix-map=${REXSDK_DIR}=."

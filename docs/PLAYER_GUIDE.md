@@ -38,14 +38,27 @@ installed under:
 ```
 
 The temporary package is deleted after import. Later launches use the private cached copy, so the
-original ZIP or package does not need to remain mounted or selected.
+original ZIP or package does not need to remain mounted or selected. The app still opens at the
+launcher so you decide when to start the game.
 
 The app never uploads the selected backup. It records the expected file count and size, checks
 critical resources and executable identity on later launches, and asks to rebuild a damaged or
 incomplete cache from a verified source.
 
-Hold **Option** while opening the app to show the source chooser again. Cancelling a new import
-does not replace an existing working cache.
+Use **Choose Backup ZIP or Package…** or **Use Extracted Game Folder…** in the launcher to change
+the source later. Cancelling a new import does not replace an existing working cache.
+
+## Share crash logs
+
+After a crash:
+
+1. Reopen **GoldenEye Metal.app**.
+2. Choose **Export Diagnostic Bundle…**.
+3. Pick where to save the ZIP, then send that single ZIP with your bug report.
+
+The bundle collects the latest GoldenEye runtime logs, matching macOS crash reports, app build
+identity, and basic system information. It excludes game data, saves, cache, settings, and
+remembered source paths. Private local paths and macOS crash identifiers are redacted.
 
 ## Keyboard and mouse
 

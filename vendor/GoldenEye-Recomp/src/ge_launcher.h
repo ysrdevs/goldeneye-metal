@@ -14,9 +14,10 @@ namespace ge {
 // Applies platform-appropriate writable user/config/cache locations.
 void ConfigureLauncherPaths(rex::PathConfig& paths);
 
-// Returns paths synchronously when valid game data is already configured.
-// Otherwise displays the native first-run launcher and resumes on the UI
-// thread after a successful local import or folder selection.
+// Displays the native launcher and resumes on the UI thread only after the
+// user explicitly chooses Play. The launcher also owns first-run game-data
+// setup and privacy-preserving diagnostic export. Explicit noninteractive
+// command-line launches may return paths synchronously.
 std::optional<rex::PathConfig> PrepareLauncherPaths(const rex::PathConfig& defaults,
                                                     std::function<void(rex::PathConfig)> resume,
                                                     rex::ui::WindowedAppContext& app_context);

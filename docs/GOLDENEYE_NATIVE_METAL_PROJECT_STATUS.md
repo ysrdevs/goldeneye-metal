@@ -1,6 +1,6 @@
 # GoldenEye native Metal project status
 
-Last updated: 2026-07-17
+Last updated: 2026-07-20
 
 ## Goal
 
@@ -129,6 +129,16 @@ extent, physical range, host-size conversion, and allocation size before transla
 guest pointer. Invalid bindings use the dummy texture. A standalone test preserves the observed
 descriptor alongside valid exact-boundary and arithmetic-overflow cases.
 
+Two independent v0.1.2 tester reports later identified the same Dam cleanup crash at guest
+`0x823CFC94`: a virtual callback returned with the caller's ABI-nonvolatile `r28` cleared, turning
+the next owner load into an access at guest address `0x70`. Paired hooks now snapshot `r1` and
+`r26`–`r31` immediately before that callback and restore them immediately after it, preserving the
+original cleanup loops and critical-section release path. The per-host-thread snapshot stack is
+allocation-free, recursion-aware, bounded, and emits flushed, rate-limited repair diagnostics.
+Generated hook placement was verified around the real indirect call. A subsequent deterministic
+Dam run completed 18 profiling windows without a crash and selected six clean windows averaging
+59.696 FPS; this is a targeted regression run, not proof that every gameplay path is stable.
+
 Native macOS input now uses a first-responder Cocoa content view and forwards physical key down,
 key up, repeat, character, modifier, mouse button, wheel, and relative-motion events through the
 common `Window` input path. Hidden mouse capture is unbounded and restored on focus loss or
@@ -170,6 +180,15 @@ titles therefore finish native window and cursor cleanup, then exit at the proce
 that unsafe teardown begins. A cached-game reproduction that previously remained hung after eight
 seconds now removed the process before the first 10 ms poll after a real macOS Quit event. Setup and
 initialization paths without an active title retain normal in-process destruction.
+
+Normal app launches now always stop at an explicit Ready/Play launcher instead of starting the
+game as soon as cached data is found. The same window exports one save-anywhere diagnostic ZIP
+containing bounded runtime logs, content-validated GoldenEye macOS crash reports, app identity,
+and basic system information. Game data, saves, cache, raw configuration, and remembered paths
+are excluded. Copied text is size-limited and sanitizes home/game paths, credential-like settings,
+and persistent crash identifiers; files are read without following symlinks, archived in a
+private workspace, and atomically published to the selected destination. Explicit
+`--game_data_root` and headless developer launches remain noninteractive.
 
 Modern controller input now follows the native SDL gamepad path by default on macOS and is selected
 explicitly by the Finder launcher. SDL's bundled mappings cover DualShock 4, DualSense, Xbox One,

@@ -72,6 +72,9 @@ class GeApp : public rex::ReXApp {
     REXLOG_INFO(
         "[GE-GUARD-823DFB70-v1] active; protects packed-data loads at "
         "823DFBAC and 823DFBD8");
+    REXLOG_INFO(
+        "[GE-GUARD-823CFC00-v1] active; preserves cleanup callback ABI at "
+        "823CFC84");
     if (auto* logger = rex::GetLoggerRaw(rex::log::core())) {
       logger->flush();
     }

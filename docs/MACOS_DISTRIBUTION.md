@@ -42,15 +42,21 @@ release owner is responsible for confirming the right to distribute the
 compiled output produced from their local generated integration; this document
 is not legal advice.
 
-On first launch, the native setup window accepts a user-selected backup ZIP,
-its Xbox LIVE/STFS package, or an extracted game-data folder. The ZIP path is
-strictly local: the launcher extracts only the single package member, verifies
-the exact supported SHA-256 identity, imports into
+The native launcher always appears for normal app launches and waits for the
+user to choose **Play GoldenEye**. On first launch it accepts a user-selected
+backup ZIP, its Xbox LIVE/STFS package, or an extracted game-data folder. The
+ZIP path is strictly local: the launcher extracts only the single package
+member, verifies the exact supported SHA-256 identity, imports into
 `~/Library/Application Support/GoldenEye Metal/Game Data`, and removes the
-temporary package. A valid cache or remembered extracted folder skips setup on
-later launches. Holding Option while opening the app forces the setup window to
-appear again; a newly selected extracted folder is remembered ahead of the
-previous cache.
+temporary package. A valid cache or remembered extracted folder appears Ready
+on later launches. Explicit `--game_data_root` and headless developer
+invocations remain noninteractive.
+
+The same window exports one save-anywhere diagnostic ZIP containing bounded
+runtime logs, matching content-validated macOS crash reports, application build
+identity, and basic system information. It never copies game data, saves,
+cache, raw configuration, or remembered paths, and sanitizes private paths and
+persistent crash identifiers before archiving.
 
 The import window exposes Cancel while work is active. Package extraction is
 bounded by size and time, game-file extraction checks cancellation between

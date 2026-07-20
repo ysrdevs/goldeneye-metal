@@ -10,6 +10,7 @@
 // and the recompiled source function then returns.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -46,6 +47,7 @@
 #endif
 #endif
 #include <string>
+#include <string_view>
 
 namespace ge {
 // Relaunch this same executable as a fresh, detached process. Used by the ONLINE
@@ -2053,8 +2055,7 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
 namespace {
 constexpr uint32_t kGeProtectedLowPageEnd = 0x10000u;
 
-constexpr bool ge_packed_data_load_needs_recovery(uint32_t callback_result,
-                                                  uint32_t load_address) {
+constexpr bool ge_packed_data_load_needs_recovery(uint32_t callback_result, uint32_t load_address) {
   return callback_result == 0 || load_address < kGeProtectedLowPageEnd;
 }
 
@@ -2063,16 +2064,56 @@ static_assert(ge_packed_data_load_needs_recovery(1, 3));
 static_assert(ge_packed_data_load_needs_recovery(0xFFFFFFFFu, 1));
 static_assert(!ge_packed_data_load_needs_recovery(0x10000u, 0x10002u));
 
-bool ge_should_log_packed_data_recovery(uint64_t hit) {
+bool ge_should_log_sparse_recovery(uint64_t hit) {
   // Keep the first reports detailed, then retain sparse evidence if a bad
   // resource remains active for many frames without flooding the tester log.
   return hit <= 16 || (hit & (hit - 1)) == 0;
 }
 
+struct GeCleanupCallbackSnapshot {
+  uint64_t r1;
+  uint64_t r26;
+  uint64_t r27;
+  uint64_t r28;
+  uint64_t r29;
+  uint64_t r30;
+  uint64_t r31;
+  uint32_t object;
+  uint32_t callback;
+};
+
+constexpr size_t kGeCleanupCallbackMaximumDepth = 64;
+
+struct GeCleanupCallbackStack {
+  std::array<GeCleanupCallbackSnapshot, kGeCleanupCallbackMaximumDepth> entries{};
+  size_t depth = 0;
+  size_t overflow_depth = 0;
+};
+
+// A callback may recursively run the same cleanup path. Keep an allocation-free
+// stack per host thread so every ordinary nested return restores its own caller
+// without risking a heap exception while the guest holds two critical sections.
+thread_local GeCleanupCallbackStack g_ge_cleanup_callback_stack;
+std::atomic<uint64_t> g_ge_cleanup_callback_repairs{0};
+std::atomic<uint64_t> g_ge_cleanup_callback_stack_errors{0};
+
+void ge_log_cleanup_callback_stack_error(std::string_view reason, uint32_t guest_sp, size_t depth) {
+  const uint64_t hit =
+      g_ge_cleanup_callback_stack_errors.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (!ge_should_log_sparse_recovery(hit)) {
+    return;
+  }
+  REXKRNL_WARN("[GE-GUARD-823CFC00-v1] callback snapshot {} hit={} depth={} guest_sp=0x{:08X}",
+               reason, hit, depth, guest_sp);
+  if (auto* logger = rex::GetLoggerRaw(rex::log::krnl())) {
+    logger->flush();
+  }
+}
+
 bool ge_recover_packed_data_load(uint32_t load_site, uint32_t callback_result,
-                                 uint32_t stream_offset, uint32_t load_address,
-                                 uint32_t owner, uint32_t guest_sp,
-                                 std::atomic<uint64_t>& hits, PPCRegister& result) {
+                                 uint32_t stream_offset, uint32_t load_address, uint32_t owner,
+                                 uint32_t guest_sp, std::atomic<uint64_t>& hits,
+                                 PPCRegister& result) {
   if (!ge_packed_data_load_needs_recovery(callback_result, load_address)) {
     return false;
   }
@@ -2083,7 +2124,7 @@ bool ge_recover_packed_data_load(uint32_t load_site, uint32_t callback_result,
   result.u64 = 0;
 
   const uint64_t hit = hits.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (ge_should_log_packed_data_recovery(hit)) {
+  if (ge_should_log_sparse_recovery(hit)) {
     const char* reason = callback_result == 0 ? "null-callback" : "protected-low-page";
     REXKRNL_WARN(
         "[GE-GUARD-823DFB70-v1] recovered site=0x{:08X} hit={} reason={} "
@@ -2098,13 +2139,84 @@ bool ge_recover_packed_data_load(uint32_t load_site, uint32_t callback_result,
 }
 }  // namespace
 
+// sub_823CFC00 walks two intrusive cleanup lists while holding the owner's
+// critical sections. The virtual cleanup callback at 0x823CFC84 is required by
+// the PPC ABI to preserve r1 and r26-r31. At least one real callback path
+// returns with r28 cleared, which turns the next owner load at 0x823CFC94 into
+// a protected-low-page access at guest 0x70. Snapshot every live nonvolatile
+// register immediately before the callback and restore it immediately after;
+// this preserves the original loop and its ordinary lock-release epilogue.
+void ge_cleanup_callback_enter(PPCRegister& r1, PPCRegister& r26, PPCRegister& r27,
+                               PPCRegister& r28, PPCRegister& r29, PPCRegister& r30,
+                               PPCRegister& r31, PPCRegister& r3, PPCRegister& r11) {
+  if (g_ge_cleanup_callback_stack.overflow_depth != 0 ||
+      g_ge_cleanup_callback_stack.depth == kGeCleanupCallbackMaximumDepth) {
+    ++g_ge_cleanup_callback_stack.overflow_depth;
+    ge_log_cleanup_callback_stack_error("overflow", r1.u32, g_ge_cleanup_callback_stack.depth);
+    return;
+  }
+  g_ge_cleanup_callback_stack.entries[g_ge_cleanup_callback_stack.depth++] = {
+      r1.u64, r26.u64, r27.u64, r28.u64, r29.u64, r30.u64, r31.u64, r3.u32, r11.u32,
+  };
+}
+
+void ge_cleanup_callback_leave(PPCRegister& r1, PPCRegister& r26, PPCRegister& r27,
+                               PPCRegister& r28, PPCRegister& r29, PPCRegister& r30,
+                               PPCRegister& r31) {
+  if (g_ge_cleanup_callback_stack.overflow_depth != 0) {
+    --g_ge_cleanup_callback_stack.overflow_depth;
+    return;
+  }
+  if (g_ge_cleanup_callback_stack.depth == 0) {
+    ge_log_cleanup_callback_stack_error("underflow", r1.u32, 0);
+    return;
+  }
+
+  const GeCleanupCallbackSnapshot saved =
+      g_ge_cleanup_callback_stack.entries[--g_ge_cleanup_callback_stack.depth];
+  uint32_t changed = 0;
+  changed |= r1.u64 != saved.r1 ? 1u << 0 : 0;
+  changed |= r26.u64 != saved.r26 ? 1u << 1 : 0;
+  changed |= r27.u64 != saved.r27 ? 1u << 2 : 0;
+  changed |= r28.u64 != saved.r28 ? 1u << 3 : 0;
+  changed |= r29.u64 != saved.r29 ? 1u << 4 : 0;
+  changed |= r30.u64 != saved.r30 ? 1u << 5 : 0;
+  changed |= r31.u64 != saved.r31 ? 1u << 6 : 0;
+
+  const uint64_t returned_r28 = r28.u64;
+  r1.u64 = saved.r1;
+  r26.u64 = saved.r26;
+  r27.u64 = saved.r27;
+  r28.u64 = saved.r28;
+  r29.u64 = saved.r29;
+  r30.u64 = saved.r30;
+  r31.u64 = saved.r31;
+
+  if (changed == 0) {
+    return;
+  }
+  const uint64_t hit = g_ge_cleanup_callback_repairs.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (!ge_should_log_sparse_recovery(hit)) {
+    return;
+  }
+  REXKRNL_WARN(
+      "[GE-GUARD-823CFC00-v1] repaired callback ABI hit={} changed=0x{:02X} "
+      "owner=0x{:08X} object=0x{:08X} callback=0x{:08X} "
+      "returned_r28=0x{:08X} guest_sp=0x{:08X}",
+      hit, changed, static_cast<uint32_t>(saved.r28), saved.object, saved.callback,
+      static_cast<uint32_t>(returned_r28), static_cast<uint32_t>(saved.r1));
+  if (auto* logger = rex::GetLoggerRaw(rex::log::krnl())) {
+    logger->flush();
+  }
+}
+
 // First packed-data callback load: lbz r11,2(r3) at 0x823DFBAC.
 bool ge_guard_packed_data_header(PPCRegister& r3, PPCRegister& r31, PPCRegister& r1) {
   static std::atomic<uint64_t> hits{0};
   const uint32_t callback_result = r3.u32;
   const uint32_t load_address = callback_result + 2u;
-  return ge_recover_packed_data_load(0x823DFBACu, callback_result, 0, load_address, r31.u32,
-                                     r1.u32, hits, r3);
+  return ge_recover_packed_data_load(0x823DFBACu, callback_result, 0, load_address, r31.u32, r1.u32,
+                                     hits, r3);
 }
 
 // Second packed-data callback load: lbz r3,2(r3+r30) at 0x823DFBD8. The hook
