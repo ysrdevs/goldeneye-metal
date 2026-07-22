@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <string_view>
 
 #if REX_PLATFORM_WIN32
@@ -30,7 +31,7 @@
 REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
 REXCVAR_DEFINE_BOOL(mnk_mouse_enabled, true, "Input", "Enable mouse controller input and capture");
 REXCVAR_DEFINE_INT32(mnk_user_index, 0, "Input", "Controller slot (0-3) for MnK").range(0, 3);
-REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
+REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse motion sensitivity")
     .range(0.01, 10.0);
 
 REXCVAR_DEFINE_STRING(keybind_a, "Space", "Input/Keybinds/Controller", "A button");
@@ -123,10 +124,59 @@ void MnkInputDriver::OnInputActiveChanged(bool active) {
     mouse_dx_ = 0;
     mouse_dy_ = 0;
   }
-  // The passed bit is the app-specific modal state. Reconcile against the full
-  // callback too (focus and other host overlays) without latching those
-  // transient conditions into host_input_active_.
+  // Reconcile against the live callback too so focus and host overlays cannot
+  // race a queued capture transition.
   UpdateMouseCapture(is_active(), activity_generation);
+}
+
+void MnkInputDriver::SetMouseMotionMode(MouseMotionMode mode) {
+  std::lock_guard lock(state_mutex_);
+  if (mouse_motion_mode_ == mode) {
+    return;
+  }
+  mouse_motion_mode_ = mode;
+  // Never carry a partial stick pulse across a mode transition.
+  mouse_dx_ = 0;
+  mouse_dy_ = 0;
+}
+
+bool MnkInputDriver::ConsumeApplicationMouseMotion(uint32_t user_index,
+                                                   MouseMotionDelta* out_delta) {
+  if (out_delta) {
+    *out_delta = {};
+  }
+  if (user_index != UserIndex()) {
+    return false;
+  }
+
+  const uint64_t activity_generation = input_activity_generation_.load(std::memory_order_acquire);
+  const bool callback_active = is_active();
+  const bool enabled = IsEnabled();
+  const bool mouse_enabled = IsMouseEnabled();
+
+  std::lock_guard lock(state_mutex_);
+  if (mouse_motion_mode_ != MouseMotionMode::kApplication) {
+    return false;
+  }
+
+  const bool active = enabled && mouse_enabled && callback_active &&
+                      host_input_active_.load(std::memory_order_acquire) &&
+                      has_focus_.load(std::memory_order_acquire) &&
+                      activity_generation ==
+                          input_activity_generation_.load(std::memory_order_acquire);
+  if (!active) {
+    mouse_dx_ = 0;
+    mouse_dy_ = 0;
+    return false;
+  }
+
+  if (out_delta) {
+    out_delta->x = mouse_dx_;
+    out_delta->y = mouse_dy_;
+  }
+  mouse_dx_ = 0;
+  mouse_dy_ = 0;
+  return true;
 }
 
 uint32_t MnkInputDriver::UserIndex() const {
@@ -271,8 +321,10 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
 
   double sensitivity = REXCVAR_GET(mnk_sensitivity);
   constexpr double kBaseScale = 200.0;
-  int32_t rx = mouse_enabled ? static_cast<int32_t>(mouse_dx_ * sensitivity * kBaseScale) : 0;
-  int32_t ry = mouse_enabled ? static_cast<int32_t>(-mouse_dy_ * sensitivity * kBaseScale) : 0;
+  const bool mouse_to_stick =
+      mouse_enabled && mouse_motion_mode_ == MouseMotionMode::kRightStick;
+  int32_t rx = mouse_to_stick ? static_cast<int32_t>(mouse_dx_ * sensitivity * kBaseScale) : 0;
+  int32_t ry = mouse_to_stick ? static_cast<int32_t>(-mouse_dy_ * sensitivity * kBaseScale) : 0;
   if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_left)))
     rx = -INT16_MAX;
   if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_right)))
@@ -281,8 +333,10 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
     ry = INT16_MAX;
   if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_down)))
     ry = -INT16_MAX;
-  mouse_dx_ = 0;
-  mouse_dy_ = 0;
+  if (mouse_to_stick) {
+    mouse_dx_ = 0;
+    mouse_dy_ = 0;
+  }
 
   auto clamp16 = [](int32_t v) -> int16_t {
     return static_cast<int16_t>(std::clamp(v, (int32_t)INT16_MIN, (int32_t)INT16_MAX));
@@ -505,11 +559,23 @@ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
   int32_t x = e.x();
   int32_t y = e.y();
   if (e.has_movement_delta()) {
-    mouse_dx_ += e.movement_x();
-    mouse_dy_ += e.movement_y();
+    mouse_dx_ = static_cast<int32_t>(std::clamp(
+        static_cast<int64_t>(mouse_dx_) + e.movement_x(),
+        static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
+        static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
+    mouse_dy_ = static_cast<int32_t>(std::clamp(
+        static_cast<int64_t>(mouse_dy_) + e.movement_y(),
+        static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
+        static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
   } else {
-    mouse_dx_ += x - prev_mouse_x_;
-    mouse_dy_ += y - prev_mouse_y_;
+    mouse_dx_ = static_cast<int32_t>(std::clamp(
+        static_cast<int64_t>(mouse_dx_) + x - prev_mouse_x_,
+        static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
+        static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
+    mouse_dy_ = static_cast<int32_t>(std::clamp(
+        static_cast<int64_t>(mouse_dy_) + y - prev_mouse_y_,
+        static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
+        static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
   }
   prev_mouse_x_ = x;
   prev_mouse_y_ = y;

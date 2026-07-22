@@ -8,10 +8,12 @@
 
 #pragma once
 
+#include <rex/input/controller.h>
 #include <rex/ui/imgui_dialog.h>
 
 #include <imgui.h>
 
+#include <array>
 #include <functional>
 
 // Briefing-folder pause / settings menu.
@@ -31,6 +33,9 @@ class GeMenuDialog : public rex::ui::ImGuiDialog {
     // deferred, off the paint thread, so it never tears down the live surface).
     std::function<bool()> get_fullscreen;
     std::function<void(bool)> request_fullscreen;
+    // Notify the active presenter after the V-Sync cvar changes so the host
+    // presentation mode can update without restarting the game.
+    std::function<void(bool)> on_vsync_changed;
     // Persist current cvar values to the config file.
     std::function<void()> persist_config;
     // Save & relaunch. The ONLINE tab calls this after writing the username /
@@ -54,6 +59,8 @@ class GeMenuDialog : public rex::ui::ImGuiDialog {
   void DrawFolder(ImGuiIO& io);
   void DrawTabs(ImGuiIO& io);
   void DrawContent(ImGuiIO& io);
+  void UpdateControllerSnapshot();
+  void DrawControllerTest();
 
   Callbacks callbacks_;
   int selected_tab_ = 0;
@@ -72,6 +79,19 @@ class GeMenuDialog : public rex::ui::ImGuiDialog {
   // arrow/tab keys are captured for the bind, not used to switch tabs). Sentinel
   // 0xFFFFFFFF = nothing saved / not currently capturing.
   unsigned saved_nav_flags_ = 0xFFFFFFFFu;
+
+  // Physical-controller state is sampled independently of guest input, so the
+  // controller can navigate and test itself while this modal host menu keeps
+  // the game input suppressed.
+  rex::input::ControllerSnapshot controller_snapshot_;
+  bool controller_snapshot_valid_ = false;
+  bool testing_tools_unlocked_ = false;
+  static constexpr unsigned kTestingToggleCount = 14;
+  // One pending desired state per entry in the data-driven Cheats list.
+  // -1 means idle; 0/1 means a game-thread update is still being applied.
+  std::array<int, kTestingToggleCount> testing_pending_toggles_{};
+  int testing_pending_graphics_mode_ = -1;
+  bool performance_report_pending_ = false;
 
   // ONLINE tab edit state, loaded from the cvars the first time the tab shows
   // (so typing doesn't fight a per-frame reload). Applied on Save & Restart.

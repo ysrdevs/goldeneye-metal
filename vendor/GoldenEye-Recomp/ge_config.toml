@@ -128,10 +128,25 @@ name = "ge_inject_keyboard"
 registers = ["r11"]
 after_instruction = true
 # Dam crash recovery: sub_823DFB70 asks a resource object for its packed-data
-# buffer, then reads a byte from callback_result+2 (and later
-# callback_result+stream_offset+2). A transient null/low result otherwise hits
-# the runtime's intentionally protected guest low page. Jump to the function's
-# normal epilogue after the hook substitutes the existing empty-result value.
+# buffer through two vtable+16 calls. A destroyed/base-state resource can point
+# that slot at the title's pure-virtual handler. Intercept only that exact
+# target before either dispatch, substitute the accessor's existing empty
+# result, and use the function's normal stack/register epilogue.
+[[midasm_hook]]
+address = 0x823DFBA8
+name = "ge_skip_packed_data_purecall_header"
+registers = ["r11", "r3", "r31", "r1"]
+after_instruction = false
+jump_address_on_true = 0x823DFBDC
+[[midasm_hook]]
+address = 0x823DFBD0
+name = "ge_skip_packed_data_purecall_value"
+registers = ["r11", "r3", "r30", "r31", "r1"]
+after_instruction = false
+jump_address_on_true = 0x823DFBDC
+# A transient null/low callback result otherwise hits the runtime's
+# intentionally protected guest low page. These post-call guards use the same
+# empty result and normal epilogue.
 [[midasm_hook]]
 address = 0x823DFBAC
 name = "ge_guard_packed_data_header"

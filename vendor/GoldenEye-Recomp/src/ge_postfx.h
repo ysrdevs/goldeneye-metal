@@ -1,9 +1,8 @@
 // ge - ReXGlue Recompiled Project
 //
-// Post-processing filter overlay. A passive, always-on ImGui dialog that draws
-// a full-screen color filter over the guest image every frame, driven by the
-// postfx_* cvars. Lets the user restyle the look (tint / brightness / vignette
-// / scanlines) live, pick presets, save, or reset to default.
+// Post-processing spatial overlay. The Metal and D3D12 presentation paths
+// handle the per-pixel colour grade; this passive ImGui dialog draws vignette
+// and scanlines over the guest image. The shared postfx_* cvars update both live.
 //
 // This file is yours to edit. 'rexglue migrate' will NOT overwrite it.
 
@@ -13,8 +12,8 @@
 
 namespace ge {
 
-// Full-screen filter layer. Created once at startup and kept alive; it renders
-// under the pause menu (added later) but over the guest image. Non-interactive.
+// Full-screen spatial-effect layer. It renders under the pause menu (added
+// later) but over the guest image and is non-interactive.
 class PostFxOverlay : public rex::ui::ImGuiDialog {
  public:
   explicit PostFxOverlay(rex::ui::ImGuiDrawer* drawer);
@@ -25,10 +24,15 @@ class PostFxOverlay : public rex::ui::ImGuiDialog {
 };
 
 // Built-in presets (index 0 == "Off"/default). Setting a preset writes the
-// postfx_* cvars; the overlay picks the new values up next frame.
+// postfx_* cvars; the GPU grade and overlay pick them up on the next frame.
 int PostFxPresetCount();
 const char* PostFxPresetName(int index);
 void ApplyPostFxPreset(int index);
 void ResetPostFx();  // equivalent to ApplyPostFxPreset(0)
+
+// Whether the passive ImGui layer has visible work. Pure colour grading is
+// handled by the native presentation shader and must not keep UI-thread
+// presentation active on macOS.
+bool PostFxSpatialEffectsEnabled();
 
 }  // namespace ge

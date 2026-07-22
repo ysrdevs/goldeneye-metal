@@ -24,6 +24,35 @@
 
 REXCVAR_DEFINE_STRING(hid_mappings_file, "", "Input",
                       "Optional path to an additional SDL gamepad mappings file");
+REXCVAR_DEFINE_DOUBLE(controller_look_sensitivity, 1.0, "Input/Controller",
+                      "Physical controller right-stick look sensitivity")
+    .range(rex::input::kControllerLookSensitivityMin,
+           rex::input::kControllerLookSensitivityMax);
+REXCVAR_DEFINE_DOUBLE(controller_move_deadzone, 0.0, "Input/Controller",
+                      "Physical controller left-stick radial deadzone")
+    .range(rex::input::kControllerDeadzoneMin,
+           rex::input::kControllerDeadzoneMax);
+REXCVAR_DEFINE_DOUBLE(controller_aim_deadzone, 0.0, "Input/Controller",
+                      "Physical controller right-stick radial deadzone")
+    .range(rex::input::kControllerDeadzoneMin,
+           rex::input::kControllerDeadzoneMax);
+REXCVAR_DEFINE_BOOL(controller_invert_y, false, "Input/Controller",
+                    "Invert physical controller vertical look");
+REXCVAR_DEFINE_BOOL(controller_rumble_enabled, true, "Input/Controller",
+                    "Enable physical controller rumble");
+REXCVAR_DEFINE_DOUBLE(controller_rumble_intensity, 1.0, "Input/Controller",
+                      "Physical controller rumble intensity")
+    .range(rex::input::kControllerRumbleIntensityMin,
+           rex::input::kControllerRumbleIntensityMax);
+REXCVAR_DEFINE_STRING(controller_layout, "modern", "Input/Controller",
+                      "Physical controller layout preset")
+    .allowed({"modern", "classic", "southpaw"});
+REXCVAR_DEFINE_STRING(controller_button_map, "", "Input/Controller",
+                      "Physical-to-guest controller button overrides")
+    .validator([](std::string_view value) {
+      rex::input::controller::ButtonBindings bindings;
+      return rex::input::controller::ParseButtonBindings(value, &bindings);
+    });
 
 namespace rex::input::sdl {
 
@@ -303,20 +332,30 @@ X_RESULT SDLInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
-  // Make sure packet_number is only incremented by 1, even if there have been
-  // multiple updates between GetState calls. Also track `is_active` to
-  // increment the packet number if it changed.
-  if ((is_active != controller->is_active) || (is_active && controller->state_changed)) {
+  X_INPUT_GAMEPAD configured_gamepad = {};
+  if (is_active) {
+    configured_gamepad = ApplyControllerTuning(controller->state.gamepad);
+  }
+
+  // Count changes in the guest-visible state, including hot-reloaded layouts
+  // and remaps. Physical changes hidden by a deadzone or unbound control do not
+  // need to wake a guest that uses packet_number to skip unchanged samples.
+  const bool configured_changed =
+      !controller->configured_state_valid ||
+      std::memcmp(&configured_gamepad, &controller->last_configured_gamepad,
+                  sizeof(configured_gamepad)) != 0;
+  if ((is_active != controller->is_active) || configured_changed) {
     controller->state.packet_number++;
-    controller->is_active = is_active;
-    controller->state_changed = false;
   }
+  controller->last_configured_gamepad = configured_gamepad;
+  controller->configured_state_valid = true;
+  controller->is_active = is_active;
+  controller->state_changed = false;
+
   std::memcpy(out_state, &controller->state, sizeof(*out_state));
-  if (!is_active) {
-    // Simulate an "untouched" controller. When we become active again the
-    // pressed buttons aren't lost and will be visible again.
-    std::memset(&out_state->gamepad, 0, sizeof(out_state->gamepad));
-  }
+  // When input is inactive this is the zeroed sample built above. The raw
+  // physical state is retained and becomes visible again after reactivation.
+  out_state->gamepad = configured_gamepad;
   return X_ERROR_SUCCESS;
 }
 
@@ -338,13 +377,80 @@ X_RESULT SDLInputDriver::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibrat
   }
 
   const bool active = is_active();
-  const uint16_t left = active ? static_cast<uint16_t>(vibration->left_motor_speed) : 0;
-  const uint16_t right = active ? static_cast<uint16_t>(vibration->right_motor_speed) : 0;
+  const bool enabled = REXCVAR_GET(controller_rumble_enabled);
+  const double intensity = REXCVAR_GET(controller_rumble_intensity);
+  const uint16_t left = active && enabled
+                            ? rex::input::controller::ScaleRumble(
+                                  static_cast<uint16_t>(vibration->left_motor_speed), intensity)
+                            : 0;
+  const uint16_t right = active && enabled
+                             ? rex::input::controller::ScaleRumble(
+                                   static_cast<uint16_t>(vibration->right_motor_speed), intensity)
+                             : 0;
   // SDL clamps longer requests to this duration. XInput vibration updates
   // refresh it during normal play.
   const uint32_t duration = (left || right) ? std::numeric_limits<uint16_t>::max() : 0;
-  return SDL_RumbleGamepad(controller->sdl, left, right, duration) ? X_ERROR_SUCCESS
-                                                                   : X_ERROR_FUNCTION_FAILED;
+  // Disabling rumble is an intentional successful suppression, even for a pad
+  // that has no rumble hardware. Still issue a stop in case the setting was
+  // changed while a previous effect was active.
+  const X_RESULT result = SetRumbleLocked(*controller, left, right, duration, false);
+  return (!enabled || !active) ? X_ERROR_SUCCESS : result;
+}
+
+bool SDLInputDriver::GetControllerSnapshot(uint32_t user_index,
+                                           ControllerSnapshot* out_snapshot) {
+  if (!out_snapshot || user_index >= HID_SDL_USER_COUNT ||
+      !ready_.load(std::memory_order_acquire)) {
+    if (out_snapshot) {
+      *out_snapshot = {};
+      out_snapshot->user_index = user_index;
+    }
+    return false;
+  }
+
+  QueueControllerUpdate();
+  auto guard = DrainAndLock();
+  auto* controller = GetControllerState(user_index);
+  if (!controller) {
+    *out_snapshot = {};
+    out_snapshot->user_index = user_index;
+    return false;
+  }
+
+  out_snapshot->connected = true;
+  out_snapshot->input_active = is_active();
+  out_snapshot->rumble_supported = controller->rumble_supported;
+  out_snapshot->user_index = user_index;
+  const char* name = SDL_GetGamepadName(controller->sdl);
+  out_snapshot->name = name ? name : "Controller";
+  out_snapshot->raw_gamepad = controller->state.gamepad;
+  out_snapshot->gamepad = ApplyControllerTuning(controller->state.gamepad);
+  return true;
+}
+
+X_RESULT SDLInputDriver::PlayControllerTestRumble(uint32_t user_index) {
+  if (user_index >= HID_SDL_USER_COUNT ||
+      !ready_.load(std::memory_order_acquire)) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  QueueControllerUpdate();
+  auto guard = DrainAndLock();
+  auto* controller = GetControllerState(user_index);
+  if (!controller) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  if (!REXCVAR_GET(controller_rumble_enabled) ||
+      !controller->rumble_supported) {
+    return X_ERROR_FUNCTION_FAILED;
+  }
+  constexpr uint16_t kTestStrength = 0x9000;
+  constexpr uint32_t kTestDurationMs = 220;
+  const uint16_t strength = rex::input::controller::ScaleRumble(
+      kTestStrength, REXCVAR_GET(controller_rumble_intensity));
+  if (!strength) {
+    return X_ERROR_FUNCTION_FAILED;
+  }
+  return SetRumbleLocked(*controller, strength, strength, kTestDurationMs, true);
 }
 
 X_RESULT SDLInputDriver::GetKeystroke(uint32_t users, uint32_t flags,
@@ -429,10 +535,14 @@ X_RESULT SDLInputDriver::GetKeystroke(uint32_t users, uint32_t flags,
     // If input is not active (e.g. due to a dialog overlay), force buttons to
     // "unpressed". The algorithm will automatically send UP events when
     // `is_active()` goes low and DOWN events when it goes high again.
+    X_INPUT_GAMEPAD guest_gamepad = {};
+    if (is_active) {
+      guest_gamepad = ApplyControllerTuning(controller->state.gamepad);
+    }
     const uint64_t curr_butts =
-        is_active
-            ? (controller->state.gamepad.buttons | AnalogToKeyfield(controller->state.gamepad))
-            : uint64_t(0);
+        is_active ? (static_cast<uint16_t>(guest_gamepad.buttons) |
+                     AnalogToKeyfield(guest_gamepad))
+                  : uint64_t(0);
     KeystrokeState& last = keystroke_states_.at(user_index);
 
     // Handle repeating
@@ -734,6 +844,50 @@ void SDLInputDriver::RefreshControllerStateLocked(ControllerState& controller) {
   controller.state_changed = true;
 }
 
+X_INPUT_GAMEPAD SDLInputDriver::ApplyControllerTuning(
+    const X_INPUT_GAMEPAD& gamepad) const {
+  rex::input::controller::Layout layout =
+      rex::input::controller::Layout::kModern;
+  rex::input::controller::ParseLayout(
+      rex::cvar::GetFlagByName(rex::input::kControllerLayoutCvar), &layout);
+
+  rex::input::controller::ButtonBindings bindings;
+  rex::input::controller::ParseButtonBindings(
+      rex::cvar::GetFlagByName(rex::input::kControllerButtonMapCvar),
+      &bindings);
+
+  rex::input::ControllerTuning tuning;
+  tuning.look_sensitivity = REXCVAR_GET(controller_look_sensitivity);
+  tuning.move_deadzone = REXCVAR_GET(controller_move_deadzone);
+  tuning.aim_deadzone = REXCVAR_GET(controller_aim_deadzone);
+  tuning.invert_y = REXCVAR_GET(controller_invert_y);
+  return rex::input::controller::ApplyTuning(
+      rex::input::controller::ApplyMapping(gamepad, layout, bindings),
+      tuning);
+}
+
+X_RESULT SDLInputDriver::SetRumbleLocked(ControllerState& controller,
+                                         uint16_t left, uint16_t right,
+                                         uint32_t duration_ms,
+                                         bool host_test) {
+  if (!controller.rumble_supported && !left && !right) {
+    return X_ERROR_SUCCESS;
+  }
+  if (SDL_RumbleGamepad(controller.sdl, left, right, duration_ms)) {
+    return X_ERROR_SUCCESS;
+  }
+  if (!controller.rumble_failure_logged) {
+    controller.rumble_failure_logged = true;
+    const char* name = SDL_GetGamepadName(controller.sdl);
+    const char* error = SDL_GetError();
+    REXLOG_WARN("SDL: Controller '{}' rejected {} rumble: {}",
+                name ? name : "Controller",
+                host_test ? "test" : "game",
+                error && *error ? error : "no device detail");
+  }
+  return X_ERROR_FUNCTION_FAILED;
+}
+
 std::optional<size_t> SDLInputDriver::GetControllerIndexFromInstanceID(SDL_JoystickID instance_id) {
   // Loop through our controllers and try to match the given ID.
   for (size_t i = 0; i < controllers_.size(); i++) {
@@ -784,6 +938,14 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
   if (SDL_GetJoystickConnectionState(SDL_GetGamepadJoystick(state.sdl)) ==
       SDL_JOYSTICK_CONNECTION_WIRELESS) {
     cap_flags |= X_INPUT_CAPS_WIRELESS;
+  }
+
+  const SDL_PropertiesID properties = SDL_GetGamepadProperties(state.sdl);
+  state.rumble_supported =
+      properties && SDL_GetBooleanProperty(
+                        properties, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
+  if (state.rumble_supported) {
+    cap_flags |= X_INPUT_CAPS_FFB_SUPPORTED;
   }
 
   // Check if all navigational buttons are present

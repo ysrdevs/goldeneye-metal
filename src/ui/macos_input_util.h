@@ -1,6 +1,9 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <limits>
 
 namespace rex::ui::macos {
 
@@ -23,6 +26,29 @@ struct CapsLockTransition {
 constexpr CapsLockTransition ResolveCapsLockTransition(bool was_enabled, bool is_enabled) {
   const bool changed = was_enabled != is_enabled;
   return {is_enabled, changed, changed};
+}
+
+// NSEvent may report fractional relative motion, especially for trackpads.
+// Preserve the fraction across events instead of rounding every event to zero.
+inline int32_t AccumulateRelativeMouseDelta(double delta, double& residual) {
+  const double accumulated = delta + residual;
+  if (!std::isfinite(accumulated)) {
+    residual = 0.0;
+    return 0;
+  }
+
+  const double quantized = std::round(accumulated);
+  if (quantized >= static_cast<double>(std::numeric_limits<int32_t>::max())) {
+    residual = 0.0;
+    return std::numeric_limits<int32_t>::max();
+  }
+  if (quantized <= static_cast<double>(std::numeric_limits<int32_t>::min())) {
+    residual = 0.0;
+    return std::numeric_limits<int32_t>::min();
+  }
+
+  residual = accumulated - quantized;
+  return static_cast<int32_t>(quantized);
 }
 
 struct CursorWarpPoint {

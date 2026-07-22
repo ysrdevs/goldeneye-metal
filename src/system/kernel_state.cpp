@@ -365,35 +365,6 @@ void KernelState::FreeTLS(PPCContext* context, uint32_t slot) {
   kernel::xboxkrnl::xeKeKfReleaseSpinLock(context, tls_lock, old_irql);
 }
 
-bool KernelState::ToggleGuestPause() {
-  // Debug freeze-frame: host-suspend every guest thread (the CP worker / present
-  // are not guest threads, so the last frame stays on screen). Matched
-  // suspend/resume via the static flag keeps host suspend counts balanced.
-  static std::atomic<bool> s_paused{false};
-  bool pause = !s_paused.load(std::memory_order_relaxed);
-  s_paused.store(pause, std::memory_order_relaxed);
-  const std::vector<object_ref<XThread>> threads = object_table()->GetObjectsByType<XThread>();
-  uint32_t n = 0;
-  for (const object_ref<XThread>& thread : threads) {
-    if (!thread || !thread->is_guest_thread()) {
-      continue;
-    }
-    rex::thread::Thread* host = thread->thread();
-    if (!host) {
-      continue;
-    }
-    uint32_t host_suspend_count = 0;
-    if (pause) {
-      host->Suspend(&host_suspend_count);
-    } else {
-      host->Resume(&host_suspend_count);
-    }
-    ++n;
-  }
-  REXSYS_INFO("Guest emulation {} (F1) -- {} guest threads", pause ? "PAUSED" : "RESUMED", n);
-  return pause;
-}
-
 void KernelState::RegisterTitleTerminateNotification(uint32_t routine, uint32_t priority) {
   TerminateNotification notify;
   notify.guest_routine = routine;

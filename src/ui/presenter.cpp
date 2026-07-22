@@ -420,6 +420,30 @@ void Presenter::OnSurfaceResizeFromUIThread() {
   }
 }
 
+void Presenter::OnVsyncChangedFromUIThread() {
+  // No intrusive lifecycle changes may be made from inside a UI drawer. The
+  // caller defers this notification until the active paint has completed.
+  assert_false(is_executing_ui_drawers_);
+
+  if (!surface_) {
+    return;
+  }
+
+  // Surface connection state is exclusively owned by the guest-output thread
+  // in the immediate mode. Take it back before asking the backend to reapply
+  // presentation configuration. The paint-mode mutex makes this wait for any
+  // in-flight guest-thread present to finish first.
+  if (paint_mode_ == PaintMode::kGuestOutputThreadImmediately) {
+    SetPaintModeFromUIThread(PaintMode::kUIThreadOnRequest);
+  }
+
+  bool request_repaint;
+  UpdateSurfacePaintConnectionFromUIThread(&request_repaint, true);
+  if (request_repaint) {
+    RequestPaintOrConnectionRecoveryViaWindow(true);
+  }
+}
+
 void Presenter::PaintFromUIThread(bool force_paint) {
   // If there is no surface, this will be a no-op, nothing outdated, nothing to
   // paint. However, an explicit monitor check is needed because UI framerate

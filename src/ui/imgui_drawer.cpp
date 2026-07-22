@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <cfloat>
 #include <cstring>
 #include <filesystem>
@@ -73,6 +74,16 @@ void ImGuiDrawer::AddDialog(ImGuiDialog* dialog) {
     }
   }
   dialogs_.push_back(dialog);
+}
+
+void ImGuiDrawer::SetGamepadStateProvider(GamepadStateProvider provider) {
+  gamepad_state_provider_ = std::move(provider);
+  ImGuiIO& io = GetIO();
+  if (gamepad_state_provider_) {
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+  } else {
+    UpdateGamepadInput(io);
+  }
 }
 
 void ImGuiDrawer::RemoveDialog(ImGuiDialog* dialog) {
@@ -384,6 +395,8 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   io.DisplaySize.x = window_->GetActualPhysicalWidth() * physical_to_logical;
   io.DisplaySize.y = window_->GetActualPhysicalHeight() * physical_to_logical;
 
+  UpdateGamepadInput(io);
+
   ImGui::NewFrame();
 
   assert_true(!IsDrawingDialogs());
@@ -582,6 +595,51 @@ void ImGuiDrawer::ClearInput() {
   io.ClearInputKeys();
   touch_pointer_id_ = TouchEvent::kPointerIDNone;
   reset_mouse_position_after_next_frame_ = false;
+}
+
+void ImGuiDrawer::UpdateGamepadInput(ImGuiIO& io) {
+  ImGuiGamepadState state = {};
+  const bool connected =
+      gamepad_state_provider_ && gamepad_state_provider_(&state);
+  if (connected) {
+    io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+  } else {
+    io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
+  }
+
+  auto key = [&io, connected](ImGuiKey imgui_key, bool down) {
+    io.AddKeyEvent(imgui_key, connected && down);
+  };
+  key(ImGuiKey_GamepadFaceDown, state.face_down);
+  key(ImGuiKey_GamepadFaceRight, state.face_right);
+  key(ImGuiKey_GamepadFaceLeft, state.face_left);
+  key(ImGuiKey_GamepadFaceUp, state.face_up);
+  key(ImGuiKey_GamepadDpadLeft, state.dpad_left);
+  key(ImGuiKey_GamepadDpadRight, state.dpad_right);
+  key(ImGuiKey_GamepadDpadUp, state.dpad_up);
+  key(ImGuiKey_GamepadDpadDown, state.dpad_down);
+  key(ImGuiKey_GamepadL1, state.left_shoulder);
+  key(ImGuiKey_GamepadR1, state.right_shoulder);
+  key(ImGuiKey_GamepadL3, state.left_stick_button);
+  key(ImGuiKey_GamepadR3, state.right_stick_button);
+  key(ImGuiKey_GamepadStart, state.start);
+  key(ImGuiKey_GamepadBack, state.back);
+
+  // Match the standard Dear ImGui backend behavior: ignore the noisy center,
+  // then remap the remaining travel to the full analog navigation range.
+  auto analog = [&io, connected](ImGuiKey imgui_key, float value) {
+    constexpr float kDeadzone = 0.20f;
+    const float amount =
+        connected
+            ? std::clamp((value - kDeadzone) / (1.0f - kDeadzone), 0.0f,
+                         1.0f)
+            : 0.0f;
+    io.AddKeyAnalogEvent(imgui_key, amount > 0.0f, amount);
+  };
+  analog(ImGuiKey_GamepadLStickLeft, -state.left_stick_x);
+  analog(ImGuiKey_GamepadLStickRight, state.left_stick_x);
+  analog(ImGuiKey_GamepadLStickUp, state.left_stick_y);
+  analog(ImGuiKey_GamepadLStickDown, -state.left_stick_y);
 }
 
 void ImGuiDrawer::OnKey(KeyEvent& e, bool is_down) {

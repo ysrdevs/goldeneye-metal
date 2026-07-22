@@ -704,7 +704,7 @@ void ReXApp::NotifyInputActiveChanged() {
     return;
   }
   static_cast<rex::input::InputSystem*>(runtime_->input_system())
-      ->NotifyInputActiveChanged(IsInputActive());
+      ->NotifyInputActiveChanged(IsEffectiveInputActive());
 }
 
 bool ReXApp::IsEffectiveInputActive() const {
@@ -716,9 +716,17 @@ bool ReXApp::IsEffectiveInputActive() const {
   if (!IsInputActive()) {
     return false;
   }
-  if (!debug_overlay_ && !console_overlay_ && !settings_overlay_) {
+  // Console and settings are modal as soon as they open. Waiting for ImGui's
+  // next-frame WantCaptureMouse value leaves one input sample able to leak
+  // through at each transition.
+  if (console_overlay_ || settings_overlay_) {
+    return false;
+  }
+  if (!debug_overlay_) {
     return true;
   }
+  // The debug/FPS overlay is normally passive, but respect it if it exposes an
+  // interactive control that asks ImGui to capture the mouse.
   return imgui_drawer_ && !imgui_drawer_->GetIO().WantCaptureMouse;
 }
 

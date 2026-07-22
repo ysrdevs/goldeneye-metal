@@ -57,6 +57,7 @@ endif()
 # Metal UI backend
 if(REXGLUE_USE_METAL)
     set(REXUI_METAL_SOURCES
+        metal/metal_immediate_drawer.mm
         metal/metal_presenter.mm
         metal/metal_provider.mm
     )
@@ -177,6 +178,48 @@ endif()
 
 if(REXGLUE_USE_METAL)
     target_compile_definitions(rexui PUBLIC REX_HAS_METAL=1)
+    target_link_libraries(rexui PUBLIC
+        "-framework MetalFX"
+    )
+
+    # MetalPresenter compiles its final presentation shader at runtime. Build
+    # a small executable that compiles the exact same source so CI and release
+    # verification catch FXAA / color-grade shader errors before launch.
+    add_executable(metal_presenter_shader_test
+        metal/metal_presenter_shader_test.mm
+    )
+    target_include_directories(metal_presenter_shader_test PRIVATE
+        ${REXGLUE_ROOT}/src/ui/metal
+    )
+    target_link_libraries(metal_presenter_shader_test PRIVATE
+        "-framework Metal"
+        "-framework Foundation"
+    )
+    set_target_properties(metal_presenter_shader_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
+        CXX_STANDARD 23
+        CXX_STANDARD_REQUIRED ON
+    )
+    if(REXGLUE_BUILD_TESTS)
+        add_test(NAME metal_presenter_shader_test COMMAND metal_presenter_shader_test)
+    endif()
+
+    add_executable(metal_metalfx_scaler_test
+        metal/metal_metalfx_scaler_test.mm
+    )
+    target_link_libraries(metal_metalfx_scaler_test PRIVATE
+        "-framework Metal"
+        "-framework MetalFX"
+        "-framework Foundation"
+    )
+    set_target_properties(metal_metalfx_scaler_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
+        CXX_STANDARD 23
+        CXX_STANDARD_REQUIRED ON
+    )
+    if(REXGLUE_BUILD_TESTS)
+        add_test(NAME metal_metalfx_scaler_test COMMAND metal_metalfx_scaler_test)
+    endif()
 endif()
 
 # D3D12 backend dependencies

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,16 @@ struct ProbeSamplerSlot {
   uint8_t address_mode_r = 2;
   uint8_t max_anisotropy = 1;
 };
+
+// Sampler slots are rebuilt from live guest/cvar state for each draw. Keep
+// every field that changes Metal sampler behavior in the cache key so a live
+// filtering change selects a new state immediately.
+constexpr uint64_t GetProbeSamplerKey(const ProbeSamplerSlot& slot) {
+  return uint64_t(slot.min_linear) | (uint64_t(slot.mag_linear) << 8) |
+         (uint64_t(slot.mip_linear) << 16) | (uint64_t(slot.address_mode_s) << 24) |
+         (uint64_t(slot.address_mode_t) << 32) | (uint64_t(slot.address_mode_r) << 40) |
+         (uint64_t(slot.max_anisotropy) << 48);
+}
 
 struct ProbeIndexBuffer {
   const void* data = nullptr;
@@ -131,12 +142,53 @@ struct PipelineProbeUploadStats {
   uint64_t suballocation_bytes = 0;
 };
 
+// Per-pipeline timing and outcome information for the optional persistent
+// MTLBinaryArchive path. A hit means Metal created the pipeline while
+// MTLPipelineOptionFailOnBinaryArchiveMiss was active. A miss always falls
+// back to normal compilation, so a stale or corrupt cache never prevents a
+// pipeline from being created.
+struct RenderPipelineCacheTelemetry {
+  bool archive_enabled = false;
+  bool archive_hit = false;
+  bool archive_miss = false;
+  bool archive_updated = false;
+  bool archive_update_failed = false;
+  uint64_t archive_lookup_ns = 0;
+  uint64_t archive_add_ns = 0;
+  uint64_t pipeline_build_ns = 0;
+  std::string archive_error;
+};
+
+// End-to-end render-thread cost of satisfying an archive miss. The failed
+// fail-on-miss lookup is part of the hitch just as much as archive insertion
+// and the fallback pipeline build.
+constexpr uint64_t GetRenderPipelineCacheMissDurationNs(
+    const RenderPipelineCacheTelemetry& telemetry) {
+  return telemetry.archive_lookup_ns + telemetry.archive_add_ns +
+         telemetry.pipeline_build_ns;
+}
+
+// MTLBinaryArchive is device-specific. GetMetalDeviceCacheKey returns a stable
+// per-device key suitable for separating archive files. Existing archives are
+// opened when valid; invalid, oversized or driver-incompatible files fall back
+// to a new empty archive and are replaced on the next successful serialization.
+uint64_t GetMetalDeviceCacheKey(void* metal_device);
+void* CreateMetalPipelineBinaryArchive(void* metal_device,
+                                       const std::filesystem::path& archive_path,
+                                       bool* loaded_existing_out, std::string* warning_or_error_out);
+bool SerializeMetalPipelineBinaryArchive(void* binary_archive,
+                                         const std::filesystem::path& archive_path,
+                                         uint64_t* serialized_size_out, std::string* error_out);
+void ReleaseMetalPipelineBinaryArchive(void* binary_archive);
+
 void* CreateMslLibrary(void* metal_device, const std::string& source, std::string* error_out);
 void ReleaseMslLibrary(void* metal_library);
 bool ValidateMslSource(void* metal_device, const std::string& source, std::string* error_out);
 void* CreateRenderPipelineState(void* metal_device, void* vertex_library, void* fragment_library,
                                 std::string* error_out,
-                                const ProbeColorTargetState* color_target_state = nullptr);
+                                const ProbeColorTargetState* color_target_state = nullptr,
+                                void* binary_archive = nullptr,
+                                RenderPipelineCacheTelemetry* cache_telemetry_out = nullptr);
 void ReleaseRenderPipelineState(void* pipeline_state);
 void* CreatePipelineProbeContext(void* metal_device, std::string* error_out);
 void* CreatePipelineProbeContext(void* metal_device, void* metal_command_queue,

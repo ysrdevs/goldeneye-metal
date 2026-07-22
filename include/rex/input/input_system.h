@@ -38,6 +38,10 @@ class InputSystem : public system::IInputSystem {
   void DetachWindow();
   void SetActiveCallback(std::function<bool()> callback);
   void NotifyInputActiveChanged(bool active);
+  void SetMouseMotionMode(MouseMotionMode mode);
+  bool ConsumeApplicationMouseMotion(uint32_t user_index, MouseMotionDelta* out_delta);
+  bool GetControllerSnapshot(uint32_t user_index, ControllerSnapshot* out_snapshot);
+  X_RESULT PlayControllerTestRumble(uint32_t user_index);
 
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags, X_INPUT_CAPABILITIES* out_caps);
   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state);

@@ -29,15 +29,21 @@ include(generated/rexglue.cmake)
 set(GE_SOURCES
     src/main.cpp
     src/ge_game_data.cpp
+    src/ge_host_pause.cpp
     src/ge_hooks.cpp
     src/ge_menu.cpp
     src/ge_postfx.cpp
+    src/ge_save_manager.cpp
+    src/ge_testing_tools.cpp
     src/ge_username.cpp
     src/ge_ce_patches.cpp
 )
 
 if(APPLE)
-    list(APPEND GE_SOURCES src/ge_launcher_macos.mm)
+    list(APPEND GE_SOURCES
+        src/ge_launch_recovery.cpp
+        src/ge_launcher_macos.mm
+    )
 else()
     list(APPEND GE_SOURCES src/ge_launcher_stub.cpp)
 endif()
@@ -66,6 +72,58 @@ if(NOT MSVC)
     )
 endif()
 
+# Filesystem-only regression for the GoldenEye-specific save backup, restore,
+# reset, and quarantine/undo backend. It is never packaged.
+add_executable(goldeneye_save_manager_test EXCLUDE_FROM_ALL
+    tests/save_manager_test.cpp
+    src/ge_save_manager.cpp
+)
+target_include_directories(goldeneye_save_manager_test PRIVATE src)
+target_link_libraries(goldeneye_save_manager_test PRIVATE rex::runtime)
+target_compile_definitions(goldeneye_save_manager_test PRIVATE
+    GOLDENEYE_SAVE_MANAGER_TESTING=1)
+rexglue_apply_target_settings(goldeneye_save_manager_test)
+if(NOT MSVC)
+    target_compile_options(goldeneye_save_manager_test PRIVATE
+        "-ffile-prefix-map=${REXSDK_DIR}=."
+        "-fmacro-prefix-map=${REXSDK_DIR}=."
+    )
+endif()
+
+# State-machine regression for the asynchronous host-menu -> retail pause
+# bridge. It is source-only and never packaged.
+add_executable(goldeneye_host_pause_test EXCLUDE_FROM_ALL
+    tests/host_pause_test.cpp
+)
+target_include_directories(goldeneye_host_pause_test PRIVATE src)
+target_compile_definitions(goldeneye_host_pause_test PRIVATE
+    "GOLDENEYE_GENERATED_DIRECTORY=\"${CMAKE_CURRENT_SOURCE_DIR}/generated\"")
+rexglue_apply_target_settings(goldeneye_host_pause_test)
+if(NOT MSVC)
+    target_compile_options(goldeneye_host_pause_test PRIVATE
+        "-ffile-prefix-map=${REXSDK_DIR}=."
+        "-fmacro-prefix-map=${REXSDK_DIR}=."
+    )
+endif()
+
+# Deterministic regression for the host testing-tools mapping, eligibility
+# gate, and mission/pause-bound request queue. It is source-only and never
+# packaged.
+add_executable(goldeneye_testing_tools_test EXCLUDE_FROM_ALL
+    tests/testing_tools_test.cpp
+)
+target_include_directories(goldeneye_testing_tools_test PRIVATE src)
+target_compile_definitions(goldeneye_testing_tools_test PRIVATE
+    "GOLDENEYE_TESTING_TOOLS_SOURCE_FILE=\"${CMAKE_CURRENT_SOURCE_DIR}/src/ge_testing_tools.cpp\""
+    "GOLDENEYE_GENERATED_DIRECTORY=\"${CMAKE_CURRENT_SOURCE_DIR}/generated\"")
+rexglue_apply_target_settings(goldeneye_testing_tools_test)
+if(NOT MSVC)
+    target_compile_options(goldeneye_testing_tools_test PRIVATE
+        "-ffile-prefix-map=${REXSDK_DIR}=."
+        "-fmacro-prefix-map=${REXSDK_DIR}=."
+    )
+endif()
+
 # Local-only importer smoke tool. It is excluded from normal builds and never
 # packaged; developers may invoke it explicitly with their own package to test
 # the same validation/extraction backend used by the launcher.
@@ -78,6 +136,44 @@ target_link_libraries(goldeneye_game_data_import_smoke PRIVATE rex::runtime)
 rexglue_apply_target_settings(goldeneye_game_data_import_smoke)
 if(NOT MSVC)
     target_compile_options(goldeneye_game_data_import_smoke PRIVATE
+        "-ffile-prefix-map=${REXSDK_DIR}=."
+        "-fmacro-prefix-map=${REXSDK_DIR}=."
+    )
+endif()
+
+# Deterministic regression for the exact callback target used by the Dam
+# packed-data lifetime guard. It is never packaged, but the macOS release gate
+# runs it before accepting an app bundle.
+add_executable(goldeneye_crash_guard_test EXCLUDE_FROM_ALL
+    tests/crash_guard_test.cpp
+)
+target_include_directories(goldeneye_crash_guard_test PRIVATE src)
+if(NOT MSVC)
+    target_compile_options(goldeneye_crash_guard_test PRIVATE
+        "-ffile-prefix-map=${REXSDK_DIR}=."
+        "-fmacro-prefix-map=${REXSDK_DIR}=."
+    )
+endif()
+
+add_custom_target(goldeneye_crash_guard_codegen_verify
+    COMMAND "${CMAKE_COMMAND}"
+        "-DGENERATED_DIRECTORY=${CMAKE_CURRENT_SOURCE_DIR}/generated"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/verify_crash_guard_codegen.cmake"
+    DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/verify_crash_guard_codegen.cmake"
+    COMMENT "Verifying generated Dam purecall guards"
+    VERBATIM
+)
+
+# Filesystem-only regression for the durable run marker and one-launch Safe
+# Mode config snapshot. It is source-only and never packaged.
+if(APPLE)
+    add_executable(goldeneye_launch_recovery_test EXCLUDE_FROM_ALL
+        tests/launch_recovery_test.cpp
+        src/ge_launch_recovery.cpp
+    )
+    target_include_directories(goldeneye_launch_recovery_test PRIVATE src)
+    target_compile_options(goldeneye_launch_recovery_test PRIVATE
         "-ffile-prefix-map=${REXSDK_DIR}=."
         "-fmacro-prefix-map=${REXSDK_DIR}=."
     )
@@ -186,10 +282,30 @@ if(APPLE)
     )
 
     add_custom_target(goldeneye_macos_app_verify
+        COMMAND "$<TARGET_FILE:goldeneye_crash_guard_test>"
+        COMMAND "$<TARGET_FILE:goldeneye_host_pause_test>"
+        COMMAND "$<TARGET_FILE:goldeneye_testing_tools_test>"
+        COMMAND "$<TARGET_FILE:goldeneye_launch_recovery_test>"
+        COMMAND "$<TARGET_FILE:goldeneye_save_manager_test>"
+        COMMAND "$<TARGET_FILE:metal_presenter_shader_test>"
+        COMMAND "$<TARGET_FILE:metal_metalfx_scaler_test>"
+        COMMAND "${CMAKE_COMMAND}"
+            "-DGAME_EXECUTABLE=$<TARGET_FILE:ge>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/packaging/macos/verify_pause_hook.cmake"
         COMMAND
             "${CMAKE_CURRENT_SOURCE_DIR}/packaging/macos/verify_app.sh"
             "${GOLDENEYE_MACOS_APP_DIR}"
-        DEPENDS goldeneye_macos_app
+        DEPENDS
+            goldeneye_macos_app
+            goldeneye_crash_guard_test
+            goldeneye_crash_guard_codegen_verify
+            goldeneye_host_pause_test
+            goldeneye_testing_tools_test
+            goldeneye_launch_recovery_test
+            goldeneye_save_manager_test
+            metal_metalfx_scaler_test
+            metal_presenter_shader_test
+            "${CMAKE_CURRENT_SOURCE_DIR}/packaging/macos/verify_pause_hook.cmake"
         COMMENT "Verifying unsigned GoldenEye Metal.app layout and linkage"
         VERBATIM
     )

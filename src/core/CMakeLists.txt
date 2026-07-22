@@ -13,6 +13,7 @@ add_library(rexcore OBJECT
     filesystem_wildcard.cpp
     logging.cpp
     memory.cpp
+    perf/metal_performance.cpp
     mutex.cpp
     ring_buffer.cpp
     sha256.cpp

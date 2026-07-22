@@ -3,7 +3,9 @@
 #include <filesystem>
 #include <array>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -30,6 +32,8 @@ class MetalCommandProcessor final : public CommandProcessor {
   MetalCommandProcessor(GraphicsSystem* graphics_system, system::KernelState* kernel_state);
   ~MetalCommandProcessor() override;
 
+  void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
+                               bool blocking) override;
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
@@ -76,6 +80,15 @@ class MetalCommandProcessor final : public CommandProcessor {
   MetalShader::MetalTranslation* GetTranslatedShader(MetalShader& shader);
   bool EnsureShaderTranslated(MetalShader& shader, uint64_t modification);
   bool EnsureShaderTranslated(MetalShader& shader);
+  void* CreateCachedRenderPipelineState(
+      void* vertex_library, void* fragment_library, std::string* error_out,
+      const ProbeColorTargetState* color_target_state = nullptr);
+  void FinalizePipelineArchiveSerializationLocked();
+  void HandlePipelineArchiveSerializationResultLocked(
+      bool succeeded, uint64_t archive_size, uint64_t elapsed_ns,
+      std::string serialize_error);
+  void SerializePipelineArchiveIfNeeded(bool force);
+  void ShutdownPipelineArchive();
   void* EnsureRenderPipeline(MetalShader& vertex_shader, MetalShader& pixel_shader,
                              uint32_t rt_index = 0, uint32_t color_write_mask = 0xF);
   void UpdateMinimalSystemConstants(xenos::PrimitiveType prim_type,
@@ -226,6 +239,37 @@ class MetalCommandProcessor final : public CommandProcessor {
   std::unordered_map<uint64_t, void*> host_pixel_pipeline_states_;
   std::unordered_map<uint64_t, void*> solid_color_pipeline_states_;
   std::unordered_map<uint64_t, void*> memexport_pipeline_states_;
+  void* pipeline_binary_archive_ = nullptr;
+  std::filesystem::path pipeline_binary_archive_path_;
+  bool pipeline_binary_archive_dirty_ = false;
+  uint64_t pipeline_archive_hit_count_ = 0;
+  uint64_t pipeline_archive_miss_count_ = 0;
+  uint64_t pipeline_archive_busy_bypass_count_ = 0;
+  uint64_t pipeline_archive_update_failure_count_ = 0;
+  uint64_t pipeline_archive_serialization_count_ = 0;
+  uint64_t pipeline_archive_serialization_failure_count_ = 0;
+  uint64_t pipeline_archive_serialization_ns_ = 0;
+  uint64_t pipeline_archive_serialization_max_ns_ = 0;
+  uint32_t pipeline_archive_consecutive_serialization_failures_ = 0;
+  uint64_t pipeline_archive_lookup_ns_ = 0;
+  uint64_t pipeline_archive_add_ns_ = 0;
+  uint64_t pipeline_build_ns_ = 0;
+  uint64_t pipeline_archive_swap_count_ = 0;
+  uint64_t pipeline_archive_first_dirty_swap_ = 0;
+  uint64_t pipeline_archive_last_update_swap_ = 0;
+  uint64_t pipeline_archive_next_serialize_swap_ = 0;
+  std::mutex pipeline_archive_mutex_;
+  std::thread pipeline_archive_save_thread_;
+  bool pipeline_archive_save_in_flight_ = false;
+  bool pipeline_archive_save_result_ready_ = false;
+  bool pipeline_archive_save_result_succeeded_ = false;
+  uint64_t pipeline_archive_save_result_size_ = 0;
+  uint64_t pipeline_archive_save_result_elapsed_ns_ = 0;
+  std::string pipeline_archive_save_result_error_;
+  uint64_t msl_library_compile_count_ = 0;
+  uint64_t msl_library_compile_failure_count_ = 0;
+  uint64_t msl_library_compile_ns_ = 0;
+  uint64_t msl_library_compile_max_ns_ = 0;
   std::unordered_set<uint64_t> probed_pipeline_keys_;
   std::unordered_set<uint64_t> disabled_host_pixel_shader_hashes_;
   std::unordered_map<uint64_t, uint32_t> host_pixel_shader_draws_this_swap_;

@@ -8,6 +8,8 @@ add_executable(unit_tests
     kernel/object_table_test.cpp
     core/cvar_test.cpp
     core/fiber_test.cpp
+    core/logging_test.cpp
+    core/metal_performance_test.cpp
     core/sha256_test.cpp
     core/stream_test.cpp
     core/byte_order_test.cpp
@@ -37,6 +39,7 @@ endif()
 if(REXGLUE_USE_METAL)
     target_sources(unit_tests PRIVATE
         graphics/metal_completion_packet_test.cpp
+        graphics/metal_sampler_util_test.cpp
     )
     target_link_libraries(unit_tests PRIVATE
         glslang::SPIRV

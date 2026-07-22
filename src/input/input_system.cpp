@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <utility>
 
 #include <rex/dbg.h>
 #include <rex/input/flags.h>
@@ -77,6 +79,72 @@ void InputSystem::NotifyInputActiveChanged(bool active) {
   for (auto& driver : drivers_) {
     driver->OnInputActiveChanged(active);
   }
+}
+
+void InputSystem::SetMouseMotionMode(MouseMotionMode mode) {
+  for (auto& driver : drivers_) {
+    driver->SetMouseMotionMode(mode);
+  }
+}
+
+bool InputSystem::ConsumeApplicationMouseMotion(uint32_t user_index,
+                                                MouseMotionDelta* out_delta) {
+  MouseMotionDelta combined = {};
+  bool owned = false;
+  auto saturating_add = [](int32_t lhs, int32_t rhs) {
+    const int64_t sum = static_cast<int64_t>(lhs) + static_cast<int64_t>(rhs);
+    return static_cast<int32_t>(
+        std::clamp(sum, static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
+                   static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
+  };
+
+  for (auto& driver : drivers_) {
+    MouseMotionDelta delta = {};
+    if (!driver->ConsumeApplicationMouseMotion(user_index, &delta)) {
+      continue;
+    }
+    owned = true;
+    combined.x = saturating_add(combined.x, delta.x);
+    combined.y = saturating_add(combined.y, delta.y);
+  }
+  if (out_delta) {
+    *out_delta = combined;
+  }
+  return owned;
+}
+
+bool InputSystem::GetControllerSnapshot(uint32_t user_index,
+                                        ControllerSnapshot* out_snapshot) {
+  if (out_snapshot) {
+    *out_snapshot = {};
+    out_snapshot->user_index = user_index;
+  }
+  for (auto& driver : drivers_) {
+    ControllerSnapshot snapshot = {};
+    snapshot.user_index = user_index;
+    if (!driver->GetControllerSnapshot(user_index, &snapshot)) {
+      continue;
+    }
+    if (out_snapshot) {
+      *out_snapshot = std::move(snapshot);
+    }
+    return true;
+  }
+  return false;
+}
+
+X_RESULT InputSystem::PlayControllerTestRumble(uint32_t user_index) {
+  bool any_connected = false;
+  for (auto& driver : drivers_) {
+    X_RESULT result = driver->PlayControllerTestRumble(user_index);
+    if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
+      any_connected = true;
+    }
+    if (result == X_ERROR_SUCCESS) {
+      return result;
+    }
+  }
+  return any_connected ? X_ERROR_FUNCTION_FAILED : X_ERROR_DEVICE_NOT_CONNECTED;
 }
 
 X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,

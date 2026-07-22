@@ -1,11 +1,14 @@
+#include <rex/cvar.h>
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/ui/ui_event.h>
+#include <rex/ui/virtual_key.h>
 
 #include <SDL3/SDL.h>
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -19,6 +22,15 @@ using rex::input::X_INPUT_GAMEPAD_RIGHT_SHOULDER;
 using rex::input::X_INPUT_GAMEPAD_Y;
 using rex::input::X_INPUT_STATE;
 using rex::input::X_INPUT_VIBRATION;
+
+REXCVAR_DECLARE(double, controller_look_sensitivity);
+REXCVAR_DECLARE(double, controller_move_deadzone);
+REXCVAR_DECLARE(double, controller_aim_deadzone);
+REXCVAR_DECLARE(bool, controller_invert_y);
+REXCVAR_DECLARE(bool, controller_rumble_enabled);
+REXCVAR_DECLARE(double, controller_rumble_intensity);
+REXCVAR_DECLARE(std::string, controller_layout);
+REXCVAR_DECLARE(std::string, controller_button_map);
 
 namespace {
 
@@ -194,6 +206,18 @@ class SDLDriverFixture {
     return result;
   }
 
+  bool Snapshot(uint32_t user_index,
+                rex::input::ControllerSnapshot& snapshot) {
+    for (int attempt = 0; attempt < 8; ++attempt) {
+      SDL_PumpEvents();
+      context.ExecutePendingFunctionsFromUIThread();
+      if (driver.GetControllerSnapshot(user_index, &snapshot)) {
+        return true;
+      }
+    }
+    return driver.GetControllerSnapshot(user_index, &snapshot);
+  }
+
   TestAppContext context;
   TestWindow window;
   rex::input::sdl::SDLInputDriver driver;
@@ -334,4 +358,301 @@ TEST_CASE("SDL gamepad rumble follows XInput state and stops when inactive", "[i
   active = true;
   rumble.accept = false;
   REQUIRE(fixture.driver.SetState(0, &vibration) == X_ERROR_FUNCTION_FAILED);
+}
+
+TEST_CASE("SDL controller snapshot remains live while guest input is suppressed",
+          "[input][sdl][controller]") {
+  const double old_sensitivity = REXCVAR_GET(controller_look_sensitivity);
+  const double old_move_deadzone = REXCVAR_GET(controller_move_deadzone);
+  const double old_aim_deadzone = REXCVAR_GET(controller_aim_deadzone);
+  const bool old_invert = REXCVAR_GET(controller_invert_y);
+  struct RestoreCvars {
+    double sensitivity;
+    double move_deadzone;
+    double aim_deadzone;
+    bool invert;
+    ~RestoreCvars() {
+      REXCVAR_SET(controller_look_sensitivity, sensitivity);
+      REXCVAR_SET(controller_move_deadzone, move_deadzone);
+      REXCVAR_SET(controller_aim_deadzone, aim_deadzone);
+      REXCVAR_SET(controller_invert_y, invert);
+    }
+  } restore{old_sensitivity, old_move_deadzone, old_aim_deadzone, old_invert};
+
+  REXCVAR_SET(controller_look_sensitivity, 2.0);
+  REXCVAR_SET(controller_move_deadzone, 0.15);
+  REXCVAR_SET(controller_aim_deadzone, 0.0);
+  REXCVAR_SET(controller_invert_y, true);
+
+  SDLDriverFixture fixture;
+  bool active = false;
+  fixture.driver.set_is_active_callback([&active] { return active; });
+  VirtualGamepad gamepad;
+  gamepad.SetButton(SDL_GAMEPAD_BUTTON_SOUTH, true);
+  gamepad.SetAxis(SDL_GAMEPAD_AXIS_LEFTX, 3000);
+  gamepad.SetAxis(SDL_GAMEPAD_AXIS_RIGHTX, 12000);
+  gamepad.SetAxis(SDL_GAMEPAD_AXIS_RIGHTY, 8000);
+  gamepad.Commit();
+
+  rex::input::ControllerSnapshot snapshot;
+  REQUIRE(fixture.Snapshot(0, snapshot));
+  CHECK(snapshot.connected);
+  CHECK_FALSE(snapshot.input_active);
+  CHECK(snapshot.name == "GoldenEye virtual gamepad");
+  CHECK((snapshot.raw_gamepad.buttons & X_INPUT_GAMEPAD_A) != 0);
+  CHECK(snapshot.raw_gamepad.thumb_lx == 3000);
+  CHECK(snapshot.gamepad.thumb_lx == 0);
+  CHECK(snapshot.gamepad.thumb_rx == 24000);
+  CHECK(snapshot.gamepad.thumb_ry > 0);
+
+  X_INPUT_STATE guest_state = {};
+  REQUIRE(fixture.Poll(0, guest_state) == X_ERROR_SUCCESS);
+  CHECK(guest_state.gamepad.buttons == 0);
+  CHECK(guest_state.gamepad.thumb_rx == 0);
+}
+
+TEST_CASE("SDL host rumble test respects enable and intensity settings",
+          "[input][sdl][controller]") {
+  const bool old_enabled = REXCVAR_GET(controller_rumble_enabled);
+  const double old_intensity = REXCVAR_GET(controller_rumble_intensity);
+  struct RestoreRumbleCvars {
+    bool enabled;
+    double intensity;
+    ~RestoreRumbleCvars() {
+      REXCVAR_SET(controller_rumble_enabled, enabled);
+      REXCVAR_SET(controller_rumble_intensity, intensity);
+    }
+  } restore{old_enabled, old_intensity};
+
+  REXCVAR_SET(controller_rumble_enabled, true);
+  REXCVAR_SET(controller_rumble_intensity, 0.5);
+  SDLDriverFixture fixture;
+  RumbleRecord rumble;
+  VirtualGamepad gamepad(&rumble);
+  rex::input::ControllerSnapshot snapshot;
+  REQUIRE(fixture.Snapshot(0, snapshot));
+  REQUIRE(snapshot.rumble_supported);
+
+  REQUIRE(fixture.driver.PlayControllerTestRumble(0) == X_ERROR_SUCCESS);
+  CHECK(rumble.left == 0x4800);
+  CHECK(rumble.right == 0x4800);
+
+  REXCVAR_SET(controller_rumble_enabled, false);
+  REQUIRE(fixture.driver.PlayControllerTestRumble(0) ==
+          X_ERROR_FUNCTION_FAILED);
+}
+
+TEST_CASE("Controller tuning uses independent radial deadzones and safe inversion",
+          "[input][sdl][controller]") {
+  rex::input::X_INPUT_GAMEPAD source = {};
+  source.thumb_lx = 3000;
+  source.thumb_ly = 0;
+  source.thumb_rx = 12000;
+  source.thumb_ry = static_cast<int16_t>(-32768);
+
+  rex::input::ControllerTuning tuning;
+  tuning.move_deadzone = 0.15;
+  tuning.aim_deadzone = 0.0;
+  tuning.look_sensitivity = 2.0;
+  tuning.invert_y = true;
+  const auto tuned = rex::input::controller::ApplyTuning(source, tuning);
+
+  CHECK(tuned.thumb_lx == 0);
+  CHECK(tuned.thumb_ly == 0);
+  CHECK(tuned.thumb_rx == 24000);
+  // Inverting -32768 must saturate to +32767, not overflow back to -32768.
+  CHECK(tuned.thumb_ry == 32767);
+}
+
+TEST_CASE("Controller radial deadzone remaps its remaining range", "[input][sdl][controller]") {
+  int16_t x = 0;
+  int16_t y = 0;
+  rex::input::controller::ApplyRadialDeadzone(16384, 0, 0.25, &x, &y);
+  CHECK(x == 10923);
+  CHECK(y == 0);
+
+  rex::input::controller::ApplyRadialDeadzone(32767, 32767, 0.25, &x, &y);
+  CHECK(x == 23170);
+  CHECK(y == 23170);
+}
+
+TEST_CASE("Controller rumble intensity scales both motors", "[input][sdl][controller]") {
+  CHECK(rex::input::controller::ScaleRumble(0xFFFF, 0.0) == 0);
+  CHECK(rex::input::controller::ScaleRumble(0xFFFF, 0.5) == 0x8000);
+  CHECK(rex::input::controller::ScaleRumble(0xFFFF, 1.0) == 0xFFFF);
+  CHECK(rex::input::controller::ScaleRumble(
+            0xFFFF, std::numeric_limits<double>::quiet_NaN()) == 0xFFFF);
+}
+
+TEST_CASE("Controller layout presets route axes and southpaw stick clicks",
+          "[input][sdl][controller][mapping]") {
+  using rex::input::controller::ApplyMapping;
+  using rex::input::controller::ButtonBindings;
+  using rex::input::controller::Layout;
+
+  rex::input::X_INPUT_GAMEPAD source = {};
+  source.thumb_lx = 1111;
+  source.thumb_ly = 2222;
+  source.thumb_rx = 3333;
+  source.thumb_ry = 4444;
+  source.buttons = rex::input::X_INPUT_GAMEPAD_LEFT_THUMB;
+  const ButtonBindings bindings;
+
+  const auto modern = ApplyMapping(source, Layout::kModern, bindings);
+  CHECK(modern.thumb_lx == 1111);
+  CHECK(modern.thumb_ly == 2222);
+  CHECK(modern.thumb_rx == 3333);
+  CHECK(modern.thumb_ry == 4444);
+
+  const auto classic = ApplyMapping(source, Layout::kClassic, bindings);
+  CHECK(classic.thumb_lx == 3333);
+  CHECK(classic.thumb_ly == 2222);
+  CHECK(classic.thumb_rx == 1111);
+  CHECK(classic.thumb_ry == 4444);
+
+  const auto southpaw = ApplyMapping(source, Layout::kSouthpaw, bindings);
+  CHECK(southpaw.thumb_lx == 3333);
+  CHECK(southpaw.thumb_ly == 4444);
+  CHECK(southpaw.thumb_rx == 1111);
+  CHECK(southpaw.thumb_ry == 2222);
+  CHECK((southpaw.buttons & rex::input::X_INPUT_GAMEPAD_LEFT_THUMB) == 0);
+  CHECK((southpaw.buttons & rex::input::X_INPUT_GAMEPAD_RIGHT_THUMB) != 0);
+}
+
+TEST_CASE("Controller button map parsing is strict and canonical",
+          "[input][sdl][controller][mapping]") {
+  rex::input::controller::ButtonBindings bindings;
+  REQUIRE(rex::input::controller::ParseButtonBindings(
+      " a=b, rt=lb, x=none ", &bindings));
+  CHECK(rex::input::controller::SerializeButtonBindings(bindings) ==
+        "a=b,x=none,rt=lb");
+
+  rex::input::controller::ButtonBindings round_trip;
+  REQUIRE(rex::input::controller::ParseButtonBindings(
+      rex::input::controller::SerializeButtonBindings(bindings), &round_trip));
+  CHECK(round_trip.sources == bindings.sources);
+
+  CHECK_FALSE(rex::input::controller::ParseButtonBindings(
+      "a=b,a=x", &round_trip));
+  CHECK_FALSE(rex::input::controller::ParseButtonBindings(
+      "guide=a", &round_trip));
+  CHECK_FALSE(rex::input::controller::ParseButtonBindings(
+      "a=guide", &round_trip));
+  CHECK_FALSE(rex::input::controller::ParseButtonBindings(
+      "a=b,", &round_trip));
+}
+
+TEST_CASE("Controller remapping supports buttons triggers and unbound inputs",
+          "[input][sdl][controller][mapping]") {
+  rex::input::controller::ButtonBindings bindings;
+  REQUIRE(rex::input::controller::ParseButtonBindings(
+      "a=b,b=a,x=lt,y=none,lt=rb", &bindings));
+
+  rex::input::X_INPUT_GAMEPAD source = {};
+  source.buttons = rex::input::X_INPUT_GAMEPAD_B |
+                   rex::input::X_INPUT_GAMEPAD_RIGHT_SHOULDER |
+                   rex::input::X_INPUT_GAMEPAD_GUIDE;
+  source.left_trigger = 31;
+  const auto mapped = rex::input::controller::ApplyMapping(
+      source, rex::input::controller::Layout::kModern, bindings);
+
+  CHECK((mapped.buttons & rex::input::X_INPUT_GAMEPAD_A) != 0);
+  CHECK((mapped.buttons & rex::input::X_INPUT_GAMEPAD_B) == 0);
+  CHECK((mapped.buttons & rex::input::X_INPUT_GAMEPAD_X) != 0);
+  CHECK((mapped.buttons & rex::input::X_INPUT_GAMEPAD_Y) == 0);
+  CHECK((mapped.buttons & rex::input::X_INPUT_GAMEPAD_GUIDE) != 0);
+  CHECK(mapped.left_trigger == 255);
+}
+
+TEST_CASE("Controller UI assignment swaps conflicting physical sources",
+          "[input][sdl][controller][mapping]") {
+  using rex::input::controller::AssignSourceWithSwap;
+  using rex::input::controller::ButtonBindings;
+  using rex::input::controller::Control;
+  using rex::input::controller::Layout;
+  using rex::input::controller::ResolveSource;
+
+  ButtonBindings bindings;
+  REQUIRE(AssignSourceWithSwap(Layout::kModern, &bindings, Control::kA,
+                               Control::kB));
+  CHECK(ResolveSource(Layout::kModern, bindings, Control::kA) == Control::kB);
+  CHECK(ResolveSource(Layout::kModern, bindings, Control::kB) == Control::kA);
+  CHECK(rex::input::controller::SerializeButtonBindings(bindings) ==
+        "a=b,b=a");
+
+  rex::input::X_INPUT_GAMEPAD source = {};
+  source.buttons = rex::input::X_INPUT_GAMEPAD_B;
+  const auto mapped = rex::input::controller::ApplyMapping(
+      source, Layout::kModern, bindings);
+  CHECK((mapped.buttons & rex::input::X_INPUT_GAMEPAD_A) != 0);
+  CHECK((mapped.buttons & rex::input::X_INPUT_GAMEPAD_B) == 0);
+}
+
+TEST_CASE("Controller tuning follows logical axes after layout mapping",
+          "[input][sdl][controller][mapping]") {
+  rex::input::X_INPUT_GAMEPAD source = {};
+  source.thumb_lx = 12000;
+  source.thumb_rx = 3000;
+  const rex::input::controller::ButtonBindings bindings;
+  const auto classic = rex::input::controller::ApplyMapping(
+      source, rex::input::controller::Layout::kClassic, bindings);
+
+  rex::input::ControllerTuning tuning;
+  tuning.move_deadzone = 0.15;
+  tuning.aim_deadzone = 0.0;
+  tuning.look_sensitivity = 2.0;
+  const auto tuned = rex::input::controller::ApplyTuning(classic, tuning);
+  CHECK(tuned.thumb_lx == 0);
+  CHECK(tuned.thumb_rx == 24000);
+}
+
+TEST_CASE("SDL hot-reloads mapped state consistently for state snapshot and keystroke",
+          "[input][sdl][controller][mapping]") {
+  const std::string old_layout = REXCVAR_GET(controller_layout);
+  const std::string old_button_map = REXCVAR_GET(controller_button_map);
+  struct RestoreMappingCvars {
+    std::string layout;
+    std::string button_map;
+    ~RestoreMappingCvars() {
+      REXCVAR_SET(controller_layout, layout);
+      REXCVAR_SET(controller_button_map, button_map);
+    }
+  } restore{old_layout, old_button_map};
+
+  REXCVAR_SET(controller_layout, std::string("modern"));
+  REXCVAR_SET(controller_button_map, std::string());
+
+  SDLDriverFixture fixture;
+  VirtualGamepad gamepad;
+  gamepad.SetButton(SDL_GAMEPAD_BUTTON_EAST, true);
+  gamepad.SetAxis(SDL_GAMEPAD_AXIS_LEFTX, 12000);
+  gamepad.SetAxis(SDL_GAMEPAD_AXIS_RIGHTX, 3000);
+  gamepad.Commit();
+
+  X_INPUT_STATE state = {};
+  REQUIRE(fixture.Poll(0, state) == X_ERROR_SUCCESS);
+  const uint32_t modern_packet = static_cast<uint32_t>(state.packet_number);
+  CHECK((state.gamepad.buttons & rex::input::X_INPUT_GAMEPAD_B) != 0);
+  CHECK(state.gamepad.thumb_lx == 12000);
+
+  REXCVAR_SET(controller_layout, std::string("classic"));
+  REXCVAR_SET(controller_button_map, std::string("a=b,b=a"));
+  REQUIRE(fixture.Poll(0, state) == X_ERROR_SUCCESS);
+  CHECK(static_cast<uint32_t>(state.packet_number) == modern_packet + 1);
+  CHECK((state.gamepad.buttons & rex::input::X_INPUT_GAMEPAD_A) != 0);
+  CHECK((state.gamepad.buttons & rex::input::X_INPUT_GAMEPAD_B) == 0);
+  CHECK(state.gamepad.thumb_lx == 3000);
+  CHECK(state.gamepad.thumb_rx == 12000);
+
+  rex::input::ControllerSnapshot snapshot;
+  REQUIRE(fixture.Snapshot(0, snapshot));
+  CHECK((snapshot.raw_gamepad.buttons & rex::input::X_INPUT_GAMEPAD_B) != 0);
+  CHECK((snapshot.raw_gamepad.buttons & rex::input::X_INPUT_GAMEPAD_A) == 0);
+  CHECK((snapshot.gamepad.buttons & rex::input::X_INPUT_GAMEPAD_A) != 0);
+  CHECK(snapshot.gamepad.thumb_lx == 3000);
+
+  rex::input::X_INPUT_KEYSTROKE keystroke = {};
+  REQUIRE(fixture.driver.GetKeystroke(0, 0, &keystroke) == X_ERROR_SUCCESS);
+  CHECK(keystroke.virtual_key == static_cast<uint16_t>(
+                                      rex::ui::VirtualKey::kXInputPadA));
 }

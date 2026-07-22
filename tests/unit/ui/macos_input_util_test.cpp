@@ -1,10 +1,12 @@
 #include "ui/macos_input_util.h"
 
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 namespace {
 
 using rex::ui::macos::CalculateCursorWarpPoint;
+using rex::ui::macos::AccumulateRelativeMouseDelta;
 using rex::ui::macos::GetPreviousKeyState;
 using rex::ui::macos::ResolveCapsLockTransition;
 
@@ -53,6 +55,21 @@ TEST_CASE("macOS cursor warp converts AppKit coordinates to Core Graphics displa
 
   CHECK_FALSE(
       CalculateCursorWarpPoint(0.0, 0.0, 0.0, 0.0, 0.0, 900.0, 0.0, 0.0, 1440.0, 900.0).valid);
+}
+
+TEST_CASE("macOS relative mouse motion preserves fractional trackpad deltas",
+          "[ui][macos][input][mouse]") {
+  double residual = 0.0;
+  CHECK(AccumulateRelativeMouseDelta(0.4, residual) == 0);
+  CHECK(AccumulateRelativeMouseDelta(0.4, residual) == 1);
+  CHECK(AccumulateRelativeMouseDelta(0.4, residual) == 0);
+  CHECK(residual == Catch::Approx(0.2));
+
+  residual = 0.0;
+  CHECK(AccumulateRelativeMouseDelta(-0.4, residual) == 0);
+  CHECK(AccumulateRelativeMouseDelta(-0.4, residual) == -1);
+  CHECK(AccumulateRelativeMouseDelta(-0.4, residual) == 0);
+  CHECK(residual == Catch::Approx(-0.2));
 }
 
 }  // namespace

@@ -2,10 +2,9 @@
 //
 // Post-processing filter overlay implementation. See ge_postfx.h.
 //
-// The filter is built from standard alpha-blended full-screen primitives (the
-// only blend mode ImGui exposes), so it covers tint / brightness / vignette /
-// scanlines. Per-pixel curve ops (contrast / saturation / gamma) would need a
-// dedicated shader pass and are intentionally out of scope here.
+// Per-pixel colour grading is applied by the native final-presentation shader.
+// This passive ImGui layer adds the spatial effects that are better expressed
+// as host-output geometry: vignette and scanlines.
 
 #include "ge_postfx.h"
 
@@ -25,7 +24,8 @@ REXCVAR_DEFINE_DOUBLE(postfx_tint_b, 1.0, "PostFX", "Tint colour blue (0..1)").r
 REXCVAR_DEFINE_DOUBLE(postfx_tint, 0.0, "PostFX", "Tint strength (0..1)").range(0.0, 1.0);
 REXCVAR_DEFINE_DOUBLE(postfx_vignette, 0.0, "PostFX", "Vignette strength (0..1)").range(0.0, 1.0);
 REXCVAR_DEFINE_DOUBLE(postfx_scanlines, 0.0, "PostFX", "Scanline strength (0..1)").range(0.0, 1.0);
-// Shader colour-grade params (applied by the GPU grade pass in the D3D12 swap).
+// Shader colour-grade parameters, consumed live by the native GPU presentation
+// path (Metal on macOS and the D3D12 swap path on Windows).
 REXCVAR_DEFINE_DOUBLE(postfx_contrast, 1.0, "PostFX", "Contrast (1=none)").range(0.0, 2.0);
 REXCVAR_DEFINE_DOUBLE(postfx_saturation, 1.0, "PostFX", "Saturation (1=none)").range(0.0, 2.0);
 REXCVAR_DEFINE_DOUBLE(postfx_vibrance, 0.0, "PostFX", "Vibrance (-1..1)").range(-1.0, 1.0);
@@ -93,11 +93,16 @@ void ApplyPostFxPreset(int index) {
 
 void ResetPostFx() { ApplyPostFxPreset(0); }
 
+bool PostFxSpatialEffectsEnabled() {
+  return REXCVAR_GET(postfx_enabled) &&
+         (REXCVAR_GET(postfx_vignette) > 0.001 || REXCVAR_GET(postfx_scanlines) > 0.001);
+}
+
 PostFxOverlay::PostFxOverlay(rex::ui::ImGuiDrawer* drawer) : rex::ui::ImGuiDialog(drawer) {}
 PostFxOverlay::~PostFxOverlay() = default;
 
 void PostFxOverlay::OnDraw(ImGuiIO& io) {
-  if (!REXCVAR_GET(postfx_enabled)) return;
+  if (!PostFxSpatialEffectsEnabled()) return;
 
   const float W = io.DisplaySize.x, H = io.DisplaySize.y;
   if (W <= 0.0f || H <= 0.0f) return;
@@ -126,9 +131,8 @@ void PostFxOverlay::OnDraw(ImGuiIO& io) {
   };
 
   // NOTE: brightness / contrast / saturation / vibrance / temperature / gamma /
-  // tint are all done per-pixel by the GPU grade shader (ge_grade.cs.hlsl) in
-  // the D3D12 swap. This overlay only adds the spatial effects ImGui can do:
-  // vignette and scanlines.
+  // tint are all done per-pixel by the native GPU presentation shader. This
+  // overlay only adds the spatial effects: vignette and scanlines.
 
   // Vignette: four edge gradients (transparent inner -> dark edge) stack at the
   // corners to approximate a radial darkening.

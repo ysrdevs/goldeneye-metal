@@ -202,10 +202,6 @@ class KernelState {
   // Access must be guarded by the global critical region.
   util::ObjectTable* object_table() { return &object_table_; }
 
-  // Debug pause (F1): host-suspends all guest threads to freeze the game on the
-  // current frame, or resumes them. Returns the new paused state.
-  bool ToggleGuestPause();
-
   uint32_t process_type() const;
   void set_process_type(uint32_t value);
   uint32_t process_info_block_address() const {

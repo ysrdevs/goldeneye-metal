@@ -12,6 +12,8 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <cstdlib>
+
 #include <rex/dbg.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -21,6 +23,8 @@
 #include <rex/system/xexception.h>
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
+
+#include <fmt/format.h>
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -143,15 +147,19 @@ void RtlRaiseException_entry(ppc_ptr_t<X_EXCEPTION_RECORD> record) {
   rex::debug::Break();
 }
 
-void KeBugCheckEx_entry(u32 code, u32 param1, u32 param2, u32 param3, u32 param4) {
-  REXKRNL_DEBUG("*** STOP: 0x{:08X} (0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X})", code, param1, param2,
-                param3, param4);
-  fflush(stdout);
+[[noreturn]] void KeBugCheckEx_entry(u32 code, u32 param1, u32 param2, u32 param3, u32 param4) {
+  const std::string message = fmt::format(
+      "[GUEST BUGCHECK] code=0x{:08X} params=(0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X})", code,
+      param1, param2, param3, param4);
+  rex::LogSynchronously(rex::log::krnl(), spdlog::level::critical, message);
   rex::debug::Break();
-  assert_always();
+  // Break() intentionally gives an attached debugger a chance to stop here,
+  // but the first POSIX SIGTRAP may be consumed by its compatibility handler.
+  // A guest bugcheck must never return to recompiled title code.
+  std::abort();
 }
 
-void KeBugCheck_entry(u32 code) {
+[[noreturn]] void KeBugCheck_entry(u32 code) {
   KeBugCheckEx_entry(code, 0, 0, 0, 0);
 }
 

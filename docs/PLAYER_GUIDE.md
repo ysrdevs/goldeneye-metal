@@ -1,122 +1,88 @@
 # GoldenEye Metal player guide
 
-This guide covers the public macOS application. For source builds and developer diagnostics, see
-[DEVELOPMENT.md](DEVELOPMENT.md).
+## What you need
 
-## Requirements
+- An Apple Silicon Mac running macOS 14 or newer
+- A compatible game backup that you are legally allowed to use
 
-- Apple Silicon Mac
-- macOS 14 or newer
-- A compatible game backup that you are legally authorized to use
+GoldenEye Metal does not include or download game data.
 
-GoldenEye Metal does not contain or download game data.
+## Install and play
 
-## Install
+1. Download the DMG from [GitHub Releases](https://github.com/ysrdevs/goldeneye-metal/releases).
+2. Open it and drag **GoldenEye Metal.app** into Applications.
+3. Open the app and choose your backup ZIP, Xbox LIVE package, or extracted game folder.
+4. After the launcher verifies and imports the files, choose **Play GoldenEye**.
 
-1. Download the current DMG from the
-   [GitHub release page](https://github.com/ysrdevs/goldeneye-metal/releases/tag/v0.1.3).
-2. Open the DMG.
-3. Drag **GoldenEye Metal.app** into Applications.
-4. Open the app from Applications.
-
-The release is Developer ID signed, Apple-notarized, and stapled.
-
-## First launch and game-data import
-
-The launcher accepts any one of these local inputs:
-
-- the compatible original game-backup ZIP;
-- the Xbox LIVE/STFS package stored inside that backup; or
-- an extracted game-data folder containing `default.xex`, `files/`, `music.xwb`, and `sfx.xwb`.
-
-The app verifies the exact supported game revision before parsing or importing it. ZIPs are
-handled locally, and only the package inside the selected ZIP is read. Validated game data is
-installed under:
-
-```text
-~/Library/Application Support/GoldenEye Metal/Game Data
-```
-
-The temporary package is deleted after import. Later launches use the private cached copy, so the
-original ZIP or package does not need to remain mounted or selected. The app still opens at the
-launcher so you decide when to start the game.
-
-The app never uploads the selected backup. It records the expected file count and size, checks
-critical resources and executable identity on later launches, and asks to rebuild a damaged or
-incomplete cache from a verified source.
-
-Use **Choose Backup ZIP or Package…** or **Use Extracted Game Folder…** in the launcher to change
-the source later. Cancelling a new import does not replace an existing working cache.
-
-## Share crash logs
-
-After a crash:
-
-1. Reopen **GoldenEye Metal.app**.
-2. Choose **Export Diagnostic Bundle…**.
-3. Pick where to save the ZIP, then send that single ZIP with your bug report.
-
-The bundle collects the latest GoldenEye runtime logs, matching macOS crash reports, app build
-identity, and basic system information. It excludes game data, saves, cache, settings, and
-remembered source paths. Private local paths and macOS crash identifiers are redacted.
+Imported files stay on your Mac. The app does not upload your backup, and you only need to import
+it once. To replace it later, use **Choose Backup ZIP or Package…** or **Use Extracted Game
+Folder…** in the launcher.
 
 ## Keyboard and mouse
 
-Native keyboard/mouse input is enabled automatically by the macOS app.
-
-| Action | Default input |
+| Action | Default |
 | --- | --- |
 | Move | WASD |
-| Look | Mouse movement |
-| Fire | Left click |
-| Aim | Right click |
-| A / confirm | Space |
-| B / back | Shift |
+| Look | Mouse |
+| Fire / aim | Left click / right click |
+| Confirm / back | Space / Shift |
 | Start | Return |
 | D-pad | Arrow keys |
-| Host settings / release cursor | Escape |
+| Switch original/remastered graphics | F |
+| Open host settings | Escape |
+| Quit | Command-Q |
 
-Mouse capture is relative and hidden during play. Opening the host settings menu with Escape
-releases the cursor. The Controls page changes keyboard bindings and mouse sensitivity.
-
-Command-Q, Command-W, the application menu's Quit command, the Dock's Quit command, and the window
-close button all close the game without requiring Force Quit.
+Host settings lets you change bindings, mouse sensitivity, menu cursor speed, and vertical-look
+inversion. Opening it during an offline mission pauses the game and releases the mouse cursor.
 
 ## Controllers
 
-The native SDL gamepad path supports the standard macOS mappings for:
+Supported macOS controllers include DualShock 4, DualSense, Xbox One, and Xbox Series X|S pads.
+Connect over USB or Bluetooth before or during play. Up to four controller slots are available,
+and keyboard/mouse can remain active.
 
-- PlayStation 4 DualShock 4
-- PlayStation 5 DualSense
-- Xbox One controllers
-- Xbox Series X|S controllers
+In **Host Settings → Controls**, choose Modern, Classic, or Southpaw, remap buttons, adjust
+sensitivity and deadzones, configure rumble, or test the connected controller. A selects, B goes
+back, the D-pad or left stick navigates, and LB/RB changes settings tabs. Right Bumper switches the
+game between original and remastered graphics.
 
-Pair a wireless controller in macOS Bluetooth settings or connect it over USB, then start the
-game. Controllers can also be connected or removed while the game is running. The first connected
-pad becomes player 1; up to four guest controller slots are available. Keyboard and mouse can
-remain active alongside a controller.
+## Graphics and performance
 
-Face buttons follow their physical positions: Cross/A is guest A, Circle/B is guest B, Square/X
-is guest X, and Triangle/Y is guest Y. Options/Menu is Start. Share, Create, or View is Back. The
-D-pad, sticks, stick clicks, bumpers, and triggers use their normal mappings. Rumble is forwarded
-when the controller and its macOS connection expose it.
+The Video page provides Performance, Balanced, and Quality presets plus fullscreen, V-Sync,
+filtering, anti-aliasing, colour, and output-scaling options. GoldenEye still renders internally at
+1280×720; Sharp and MetalFX improve how that image is presented on your display.
 
-Automated coverage includes normalized input, hot-plugging, slot promotion, pause suppression,
-rumble, and simultaneous keyboard/controller input. Physical USB and Bluetooth acceptance testing
-across every controller family is still in progress.
+The performance overlay can be Off, FPS-only, or Detailed. A 60-second performance report can be
+recorded and automatically included with your next diagnostic export.
+
+## Cheats
+
+Open **Host Settings → Testing** and unlock the page to use the 14 supported runtime cheats,
+including God Mode, All Weapons, Infinite Ammo, Invisible, Big Heads, Tiny Bond, Paintball, No
+Radar, Turbo, Slow Motion, Invulnerable Characters, Stick Insects, Fresco, and Vaseline-o-vision.
+
+Cheats are available only in an active offline one-player mission while settings has paused the
+game. Use a separate save if you want clean progression. The game's original Debug Menu remains
+available separately.
+
+## Saves and crash recovery
+
+Choose **Manage Saves…** in the launcher to back up, restore, or reset saves. Keep an extra backup
+somewhere safe.
+
+After a crash or force-quit, reopen the launcher and choose **Start in Safe Mode** or **Play
+Normally**. To report a problem, choose **Export Diagnostic Bundle…** and send the resulting ZIP.
+It contains useful logs and crash information, not game data or saves.
 
 ## Current limitations
 
-Version 0.1.3 is an experimental development release. It reaches the menu, Dam briefing, and first
-mission gameplay. Correct captures have shown 46.5–60 FPS, but performance is not locked to 60 FPS
-in every view. Some depth, stencil, multisampling, and broader-scene graphics behavior still needs
-work.
+This is an experimental release. The menu, briefing, and Dam gameplay work, but performance is not
+locked to 60 FPS everywhere and some graphics issues remain.
 
-See the [native Metal technical status](GOLDENEYE_NATIVE_METAL_PROJECT_STATUS.md) for current
-evidence, limitations, and development priorities.
+For development details, see [DEVELOPMENT.md](DEVELOPMENT.md) and the
+[native Metal project status](GOLDENEYE_NATIVE_METAL_PROJECT_STATUS.md).
 
 ## Game-data policy
 
-The application contains no original executable, audio banks, or extracted game assets. It does
-not provide links to game-content downloads. Each user is responsible for supplying a compatible
-backup they are legally authorized to use.
+The app contains no original executable, audio, or extracted game assets. Players must provide a
+compatible backup they are legally authorized to use.

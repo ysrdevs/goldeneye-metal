@@ -3,6 +3,7 @@
 #import <Metal/Metal.h>
 
 #include <rex/logging.h>
+#include <rex/ui/metal/immediate_drawer.h>
 #include <rex/ui/metal/presenter.h>
 
 #include <utility>
@@ -39,7 +40,7 @@ std::unique_ptr<Presenter> MetalProvider::CreatePresenter(
 }
 
 std::unique_ptr<ImmediateDrawer> MetalProvider::CreateImmediateDrawer() {
-  return nullptr;
+  return MetalImmediateDrawer::Create(metal_device_);
 }
 
 }  // namespace rex::ui::metal

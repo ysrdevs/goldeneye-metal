@@ -21,6 +21,8 @@ REXCVAR_DECLARE(std::string, keybind_rstick_up);
 
 using rex::X_RESULT;
 using rex::X_STATUS;
+using rex::input::MouseMotionDelta;
+using rex::input::MouseMotionMode;
 using rex::input::X_INPUT_GAMEPAD_B;
 using rex::input::X_INPUT_GAMEPAD_RIGHT_SHOULDER;
 using rex::input::X_INPUT_GAMEPAD_START;
@@ -156,6 +158,116 @@ TEST_CASE("MnK driver maps native keyboard and mouse events to controller state"
   driver.OnMouseUp(left_up);
   REQUIRE(driver.GetState(0, &state) == X_ERROR_SUCCESS);
   CHECK((state.gamepad.buttons & X_INPUT_GAMEPAD_RIGHT_SHOULDER) == 0);
+}
+
+TEST_CASE("MnK application mouse mode preserves buttons and keyboard without stick pulses",
+          "[input][mnk][mouse]") {
+  ScopedValue<bool> enabled(REXCVAR_GET(mnk_mode), true);
+  ScopedValue<bool> mouse_enabled(REXCVAR_GET(mnk_mouse_enabled), true);
+  ScopedValue<std::string> look_up(REXCVAR_GET(keybind_rstick_up), "I");
+
+  rex::input::mnk::MnkInputDriver driver(nullptr, 0);
+  REQUIRE(driver.Setup() == X_STATUS_SUCCESS);
+  driver.SetMouseMotionMode(MouseMotionMode::kApplication);
+
+  rex::ui::MouseEvent move(nullptr, rex::ui::MouseEvent::Button::kNone, 0, 0, 0, 0, {12, -7});
+  rex::ui::MouseEvent left_down(nullptr, rex::ui::MouseEvent::Button::kLeft, 0, 0);
+  driver.OnMouseMove(move);
+  driver.OnMouseDown(left_down);
+
+  X_INPUT_STATE state = {};
+  REQUIRE(driver.GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(state.gamepad.thumb_rx == 0);
+  CHECK(state.gamepad.thumb_ry == 0);
+  CHECK(state.gamepad.right_trigger == 0xFF);  // Mouse buttons remain mapped normally.
+
+  // A normal guest controller poll must not steal title-owned motion.
+  MouseMotionDelta delta = {};
+  REQUIRE(driver.ConsumeApplicationMouseMotion(0, &delta));
+  CHECK(delta.x == 12);
+  CHECK(delta.y == -7);
+  REQUIRE(driver.ConsumeApplicationMouseMotion(0, &delta));
+  CHECK(delta.x == 0);
+  CHECK(delta.y == 0);
+
+  auto look = Key(rex::ui::VirtualKey::kI);
+  driver.OnKeyDown(look);
+  driver.OnMouseMove(move);
+  REQUIRE(driver.GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(state.gamepad.thumb_rx == 0);
+  CHECK(state.gamepad.thumb_ry == INT16_MAX);  // Explicit keyboard right-stick bind survives.
+  REQUIRE(driver.ConsumeApplicationMouseMotion(0, &delta));
+  CHECK(delta.x == 12);
+  CHECK(delta.y == -7);
+
+  driver.OnKeyUp(look);
+  rex::ui::MouseEvent left_up(nullptr, rex::ui::MouseEvent::Button::kLeft, 0, 0);
+  driver.OnMouseUp(left_up);
+  REQUIRE(driver.GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(state.gamepad.thumb_rx == 0);
+  CHECK(state.gamepad.thumb_ry == 0);
+  CHECK(state.gamepad.right_trigger == 0);
+
+  // A mode transition clears pending application motion instead of replaying
+  // it as an analog-stick pulse.
+  driver.OnMouseMove(move);
+  driver.SetMouseMotionMode(MouseMotionMode::kRightStick);
+  REQUIRE(driver.GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(state.gamepad.thumb_rx == 0);
+  CHECK(state.gamepad.thumb_ry == 0);
+
+  // Nor can right-stick-era motion replay into application mode.
+  driver.OnMouseMove(move);
+  driver.SetMouseMotionMode(MouseMotionMode::kApplication);
+  REQUIRE(driver.ConsumeApplicationMouseMotion(0, &delta));
+  CHECK(delta.x == 0);
+  CHECK(delta.y == 0);
+}
+
+TEST_CASE("MnK application mouse motion is discarded across overlays and focus changes",
+          "[input][mnk][mouse]") {
+  ScopedValue<bool> enabled(REXCVAR_GET(mnk_mode), true);
+  ScopedValue<bool> mouse_enabled(REXCVAR_GET(mnk_mouse_enabled), true);
+
+  rex::input::mnk::MnkInputDriver driver(nullptr, 0);
+  REQUIRE(driver.Setup() == X_STATUS_SUCCESS);
+  driver.SetMouseMotionMode(MouseMotionMode::kApplication);
+
+  bool active = true;
+  driver.set_is_active_callback([&active] { return active; });
+  rex::ui::MouseEvent first(nullptr, rex::ui::MouseEvent::Button::kNone, 0, 0, 0, 0, {9, 4});
+  driver.OnMouseMove(first);
+
+  MouseMotionDelta delta = {};
+  active = false;
+  CHECK_FALSE(driver.ConsumeApplicationMouseMotion(0, &delta));
+  CHECK(delta.x == 0);
+  CHECK(delta.y == 0);
+
+  // Motion generated while an overlay is active is ignored, and nothing
+  // replays when it closes.
+  driver.OnMouseMove(first);
+  active = true;
+  REQUIRE(driver.ConsumeApplicationMouseMotion(0, &delta));
+  CHECK(delta.x == 0);
+  CHECK(delta.y == 0);
+
+  rex::ui::MouseEvent second(nullptr, rex::ui::MouseEvent::Button::kNone, 0, 0, 0, 0, {3, -6});
+  driver.OnMouseMove(second);
+  rex::ui::UISetupEvent focus_event;
+  driver.OnLostFocus(focus_event);
+  CHECK_FALSE(driver.ConsumeApplicationMouseMotion(0, &delta));
+  CHECK(delta.x == 0);
+  CHECK(delta.y == 0);
+
+  driver.OnGotFocus(focus_event);
+  REQUIRE(driver.ConsumeApplicationMouseMotion(0, &delta));
+  CHECK(delta.x == 0);
+  CHECK(delta.y == 0);
+  driver.OnMouseMove(second);
+  REQUIRE(driver.ConsumeApplicationMouseMotion(0, &delta));
+  CHECK(delta.x == 3);
+  CHECK(delta.y == -6);
 }
 
 TEST_CASE("MnK driver supports keyboard right-stick binds and modal suppression",

@@ -36,13 +36,42 @@ namespace ui {
 class ImGuiDialog;
 class Window;
 
+// Backend-neutral gamepad sample consumed by Dear ImGui navigation. The
+// provider may remain active while game input itself is suppressed by a modal
+// host dialog.
+struct ImGuiGamepadState {
+  bool face_down = false;
+  bool face_right = false;
+  bool face_left = false;
+  bool face_up = false;
+  bool dpad_left = false;
+  bool dpad_right = false;
+  bool dpad_up = false;
+  bool dpad_down = false;
+  bool left_shoulder = false;
+  bool right_shoulder = false;
+  bool left_stick_button = false;
+  bool right_stick_button = false;
+  bool start = false;
+  bool back = false;
+  // Normalized to -1..1, with positive Y pointing up.
+  float left_stick_x = 0.0f;
+  float left_stick_y = 0.0f;
+};
+
 class ImGuiDrawer : public WindowInputListener, public UIDrawer {
  public:
   using FontSetupCallback = std::function<void(ImFontAtlas*)>;
+  using GamepadStateProvider =
+      std::function<bool(ImGuiGamepadState* out_state)>;
   ImGuiDrawer(Window* window, size_t z_order, FontSetupCallback font_setup = nullptr);
   ~ImGuiDrawer();
 
   ImGuiIO& GetIO();
+
+  // Enables standard Dear ImGui gamepad navigation using a live application
+  // provider. Passing an empty provider releases every gamepad key.
+  void SetGamepadStateProvider(GamepadStateProvider provider);
 
   void AddDialog(ImGuiDialog* dialog);
   void RemoveDialog(ImGuiDialog* dialog);
@@ -77,6 +106,7 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   void RenderDrawLists(ImDrawData* data, UIDrawContext& ui_draw_context);
 
   void ClearInput();
+  void UpdateGamepadInput(ImGuiIO& io);
   void OnKey(KeyEvent& e, bool is_down);
   void UpdateMousePosition(float x, float y);
   void SwitchToPhysicalMouseAndUpdateMousePosition(const MouseEvent& e);
@@ -89,6 +119,7 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   Window* window_;
   size_t z_order_;
   FontSetupCallback font_setup_;
+  GamepadStateProvider gamepad_state_provider_;
 
   ImGuiContext* internal_state_ = nullptr;
 

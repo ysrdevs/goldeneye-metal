@@ -315,6 +315,10 @@ class Presenter {
   void SetWindowSurfaceFromUIThread(Window* new_window, Surface* new_surface);
   void OnSurfaceMonitorUpdateFromUIThread(bool old_monitor_potentially_disconnected);
   void OnSurfaceResizeFromUIThread();
+  // Reapplies presentation synchronization after the V-Sync cvar changes.
+  // This must be called from the UI thread, outside a UI drawer's Draw call,
+  // because reconnecting may update platform-owned surface state.
+  void OnVsyncChangedFromUIThread();
 
   // For calling from the platform paint event handler. Refreshes the surface
   // connection if needed, and also paints if possible and if needed (if there

@@ -54,6 +54,7 @@ REXCVAR_DEFINE_BOOL(vsync, false, "GPU", "Enable vertical sync");
 REXCVAR_DEFINE_INT32(ge_gpu_throttle_us, 120, "GPU",
                      "GoldenEye: microseconds to pause the CP worker after each ring drain so the "
                      "emulated GPU cannot outrun the render thread (0 = off)")
+    .range(0, 500)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",

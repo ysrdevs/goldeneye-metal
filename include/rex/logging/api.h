@@ -15,6 +15,7 @@
 
 #include <filesystem>
 #include <span>
+#include <string_view>
 
 #include <rex/cvar.h>
 
@@ -132,6 +133,16 @@ std::shared_ptr<spdlog::logger> GetLogger(LogCategoryId category);
  * @return  Shared pointer to the Core category logger.
  */
 std::shared_ptr<spdlog::logger> GetLogger();
+
+/**
+ * Write a terminal-path record directly to a category's sinks and flush them
+ * before returning. This bypasses the async logger queue and category filter so
+ * fatal evidence is durable before a process trap or abort.
+ *
+ * This is not signal-handler-safe and must not be used on normal hot paths.
+ */
+void LogSynchronously(LogCategoryId category, spdlog::level::level_enum level,
+                      std::string_view message) noexcept;
 
 /**
  * Set the log level for a specific category at runtime.

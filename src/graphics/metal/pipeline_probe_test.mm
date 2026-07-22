@@ -16,7 +16,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 #include <rex/graphics/metal/msl_compiler.h>
@@ -25,6 +28,7 @@ namespace {
 
 using rex::graphics::metal::ClearPipelineProbeContext;
 using rex::graphics::metal::CreateHostRenderTargetContext;
+using rex::graphics::metal::CreateMetalPipelineBinaryArchive;
 using rex::graphics::metal::CreateMslLibrary;
 using rex::graphics::metal::CreatePipelineProbeContext;
 using rex::graphics::metal::CreatePipelineProbeSnapshotTexture;
@@ -44,14 +48,17 @@ using rex::graphics::metal::QueuePipelineProbeContextClearRect;
 using rex::graphics::metal::QueuePipelineProbeSnapshotCopy;
 using rex::graphics::metal::ReadPipelineProbeContext;
 using rex::graphics::metal::ReadPipelineProbeContextRect;
+using rex::graphics::metal::ReleaseMetalPipelineBinaryArchive;
 using rex::graphics::metal::ReleaseMslLibrary;
 using rex::graphics::metal::ReleasePipelineProbeContext;
 using rex::graphics::metal::ReleasePipelineProbeSnapshotTexture;
 using rex::graphics::metal::ReleaseRenderPipelineState;
 using rex::graphics::metal::RenderPipelineProbeToContext;
+using rex::graphics::metal::RenderPipelineCacheTelemetry;
 using rex::graphics::metal::ResetPipelineProbeContext;
 using rex::graphics::metal::ResolvePipelineProbeContextToXenosTiled;
 using rex::graphics::metal::SharePipelineProbeDepthStencilTarget;
+using rex::graphics::metal::SerializeMetalPipelineBinaryArchive;
 using rex::graphics::metal::WaitPipelineProbeContext;
 
 constexpr uint32_t kWidth = 40;
@@ -158,6 +165,98 @@ uint32_t GetExpectedTiledRgba8Offset(uint32_t x, uint32_t y, uint32_t pitch) {
          (((((y & 8u) >> 2u) + (x >> 3u)) & 3u) << 6u) + (offset & 63u);
 }
 
+bool TestPipelineArchiveRoundTrip(id<MTLDevice> device, void* vertex_library,
+                                  void* fragment_library, std::string& error_out) {
+  std::filesystem::path cache_directory =
+      std::filesystem::temp_directory_path() /
+      ("rex-metal-archive-test-" + std::to_string(uint64_t(getpid())));
+  std::filesystem::path archive_path = cache_directory / "roundtrip.metalarc";
+  std::error_code filesystem_error;
+  std::filesystem::remove_all(cache_directory, filesystem_error);
+
+  bool loaded_existing = false;
+  std::string archive_message;
+  void* write_archive = CreateMetalPipelineBinaryArchive(
+      device, archive_path, &loaded_existing, &archive_message);
+  if (!write_archive || loaded_existing) {
+    error_out = write_archive ? "new archive unexpectedly reported an existing file"
+                              : "could not create archive: " + archive_message;
+    ReleaseMetalPipelineBinaryArchive(write_archive);
+    return false;
+  }
+
+  RenderPipelineCacheTelemetry miss_telemetry;
+  void* miss_pipeline = CreateRenderPipelineState(device, vertex_library, fragment_library,
+                                                   &error_out, nullptr, write_archive,
+                                                   &miss_telemetry);
+  if (!miss_pipeline || !miss_telemetry.archive_miss || !miss_telemetry.archive_updated) {
+    if (error_out.empty()) {
+      error_out = "empty archive did not take the compile-and-add miss path";
+    }
+    ReleaseRenderPipelineState(miss_pipeline);
+    ReleaseMetalPipelineBinaryArchive(write_archive);
+    std::filesystem::remove_all(cache_directory, filesystem_error);
+    return false;
+  }
+
+  uint64_t serialized_size = 0;
+  bool serialized = SerializeMetalPipelineBinaryArchive(
+      write_archive, archive_path, &serialized_size, &error_out);
+  ReleaseRenderPipelineState(miss_pipeline);
+  ReleaseMetalPipelineBinaryArchive(write_archive);
+  if (!serialized || !serialized_size) {
+    std::filesystem::remove_all(cache_directory, filesystem_error);
+    return false;
+  }
+
+  void* read_archive = CreateMetalPipelineBinaryArchive(
+      device, archive_path, &loaded_existing, &archive_message);
+  if (!read_archive || !loaded_existing) {
+    error_out = read_archive ? "serialized archive was not loaded"
+                             : "could not reopen archive: " + archive_message;
+    ReleaseMetalPipelineBinaryArchive(read_archive);
+    std::filesystem::remove_all(cache_directory, filesystem_error);
+    return false;
+  }
+
+  RenderPipelineCacheTelemetry hit_telemetry;
+  void* hit_pipeline = CreateRenderPipelineState(device, vertex_library, fragment_library,
+                                                  &error_out, nullptr, read_archive,
+                                                  &hit_telemetry);
+  bool hit_succeeded = hit_pipeline && hit_telemetry.archive_hit &&
+                       !hit_telemetry.archive_miss && !hit_telemetry.archive_updated;
+  if (!hit_succeeded && error_out.empty()) {
+    error_out = "reopened archive did not satisfy the fail-on-miss pipeline lookup";
+  }
+  ReleaseRenderPipelineState(hit_pipeline);
+  ReleaseMetalPipelineBinaryArchive(read_archive);
+
+  if (hit_succeeded) {
+    // A truncated/corrupt cache must be ignored without disabling normal Metal
+    // pipeline creation. The next save will atomically replace this file.
+    const std::array<uint8_t, 8> corrupt_archive = {0x4D, 0x54, 0x4C, 0x00,
+                                                    0xBA, 0xD0, 0xCA, 0xFE};
+    std::ofstream corrupt_output(archive_path,
+                                 std::ios::binary | std::ios::out | std::ios::trunc);
+    corrupt_output.write(reinterpret_cast<const char*>(corrupt_archive.data()),
+                         std::streamsize(corrupt_archive.size()));
+    corrupt_output.close();
+    loaded_existing = true;
+    archive_message.clear();
+    void* recovered_archive = CreateMetalPipelineBinaryArchive(
+        device, archive_path, &loaded_existing, &archive_message);
+    const bool corruption_recovered =
+        recovered_archive && !loaded_existing && !archive_message.empty();
+    ReleaseMetalPipelineBinaryArchive(recovered_archive);
+    if (!corruption_recovered) {
+      error_out = "corrupt archive did not fall back to a fresh archive";
+      hit_succeeded = false;
+    }
+  }
+  std::filesystem::remove_all(cache_directory, filesystem_error);
+  return hit_succeeded;
+}
+
 bool ApplyExpectedTiledRect(std::vector<uint8_t>& expected, size_t buffer_offset,
                             uint32_t destination_pitch, uint32_t destination_x,
                             uint32_t destination_y, const uint8_t* source_bgra,
@@ -199,6 +298,16 @@ int RunPipelineProbeTest() {
       ReleaseMslLibrary(vertex_library);
       return 1;
     }
+    if (!TestPipelineArchiveRoundTrip(device, vertex_library, fragment_library, error)) {
+      std::fprintf(stderr, "[metal_pipeline_probe_test] FAIL: pipeline archive: %s\n",
+                   error.c_str());
+      ReleaseMslLibrary(vertex_library);
+      ReleaseMslLibrary(fragment_library);
+      return 1;
+    }
+    std::fprintf(stdout,
+                 "[metal_pipeline_probe_test] pipeline archive round trip and corruption "
+                 "recovery: PASS\n");
     void* pipeline_state =
         CreateRenderPipelineState(device, vertex_library, fragment_library, &error);
     ProbeColorTargetState alpha_blend_target_state;
@@ -279,9 +388,14 @@ int RunPipelineProbeTest() {
     texture.bytes_per_image = kTextureRgba.size();
 
     ProbeSamplerSlot sampler;
-    sampler.min_linear = 0;
-    sampler.mag_linear = 0;
-    sampler.mip_linear = 0;
+    // Exercise the strongest sampler state exposed by the live filtering
+    // override. The sentinel texture is uniform, so this validates Metal
+    // sampler creation and cache delivery without making the color assertion
+    // dependent on interpolation details.
+    sampler.min_linear = 1;
+    sampler.mag_linear = 1;
+    sampler.mip_linear = 1;
+    sampler.max_anisotropy = 16;
 
     constexpr std::array<uint32_t, 4> kUnusedSystemConstants = {};
     bool rendered = RenderPipelineProbeToContext(

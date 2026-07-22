@@ -1,5 +1,6 @@
 #include <rex/graphics/metal/command_processor.h>
 
+#include <fmt/format.h>
 #include <xxhash.h>
 
 #include <algorithm>
@@ -23,13 +24,16 @@
 
 #include <rex/graphics/flags.h>
 #include <rex/graphics/metal/msl_compiler.h>
+#include <rex/graphics/metal/sampler_util.h>
 #include <rex/graphics/metal/texture_decode_validation.h>
 #include <rex/graphics/pipeline/shader/interpreter.h>
 #include <rex/graphics/pipeline/texture/conversion.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/util/draw.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
+#include <rex/perf/metal_performance.h>
 #include <rex/system/xmemory.h>
 #include <rex/ui/metal/provider.h>
 #include <rex/ui/metal/presenter.h>
@@ -51,6 +55,13 @@ constexpr uint32_t kWatchedSwapLength = 1280u * 720u * 4u;
 // ceiling for pathological streams without forcing several full queue drains
 // during a normal ~1,600-draw GoldenEye frame; IssueSwap remains a frame fence.
 constexpr uint32_t kMaxAsyncProbeSubmissionsBetweenGlobalWaits = 2048;
+
+// MTLBinaryArchive serialization invokes Apple's GPU archiver and may take
+// tens of milliseconds. Wait for two seconds of 60 Hz swap-equivalent quiet
+// time, while still forcing a checkpoint after ten seconds of continuous
+// pipeline discovery so a long session eventually reaches disk.
+constexpr uint64_t kPipelineArchiveQuietSwaps = 120;
+constexpr uint64_t kPipelineArchiveMaximumDirtySwaps = 600;
 
 // Split the Xenos 32bpp tiled-address calculation into row-invariant and
 // column portions. Resolve writes otherwise realign the pitch and rebuild the
@@ -420,24 +431,6 @@ uint8_t ToProbeSamplerAddressMode(xenos::ClampMode clamp_mode) {
   }
 }
 
-uint8_t ToProbeSamplerAnisotropy(xenos::AnisoFilter aniso_filter) {
-  switch (aniso_filter) {
-    case xenos::AnisoFilter::kMax_2_1:
-      return 2;
-    case xenos::AnisoFilter::kMax_4_1:
-      return 4;
-    case xenos::AnisoFilter::kMax_8_1:
-      return 8;
-    case xenos::AnisoFilter::kMax_16_1:
-      return 16;
-    case xenos::AnisoFilter::kMax_1_1:
-    case xenos::AnisoFilter::kDisabled:
-    case xenos::AnisoFilter::kUseFetchConst:
-    default:
-      return 1;
-  }
-}
-
 ProbeSamplerSlot MakeProbeSamplerSlot(const RegisterFile& register_file,
                                       const SpirvShader::SamplerBinding& binding) {
   xenos::xe_gpu_texture_fetch_t fetch = register_file.GetTextureFetch(binding.fetch_constant);
@@ -460,19 +453,27 @@ ProbeSamplerSlot MakeProbeSamplerSlot(const RegisterFile& register_file,
   xenos::TextureFilter mip_filter = binding.mip_filter == xenos::TextureFilter::kUseFetchConst
                                         ? fetch.mip_filter
                                         : binding.mip_filter;
-  slot.mag_linear = mag_filter == xenos::TextureFilter::kLinear;
-  slot.min_linear = min_filter == xenos::TextureFilter::kLinear;
-  slot.mip_linear = mip_filter == xenos::TextureFilter::kLinear;
-
   xenos::AnisoFilter aniso_filter = binding.aniso_filter == xenos::AnisoFilter::kUseFetchConst
                                         ? fetch.aniso_filter
                                         : binding.aniso_filter;
-  slot.max_anisotropy = ToProbeSamplerAnisotropy(aniso_filter);
-  if (slot.max_anisotropy > 1) {
-    slot.mag_linear = 1;
-    slot.min_linear = 1;
-    slot.mip_linear = 1;
-  }
+
+  // Match the D3D12 and Vulkan override rules. Restricting the override to
+  // mipmapped, linearly filterable sampling avoids changing point-sampled UI
+  // and lookup textures, while still allowing the setting to take effect
+  // immediately because sampler slots are resolved for every draw.
+  uint32_t mip_min_level = 0;
+  uint32_t mip_max_level = 0;
+  texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                                 &mip_min_level, &mip_max_level);
+  const bool has_mips = mip_max_level > mip_min_level;
+  const int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
+  const ProbeSamplerFiltering filtering =
+      ResolveProbeSamplerFiltering(mag_filter, min_filter, mip_filter, aniso_filter, has_mips,
+                                   anisotropic_override);
+  slot.mag_linear = filtering.mag_linear;
+  slot.min_linear = filtering.min_linear;
+  slot.mip_linear = filtering.mip_linear;
+  slot.max_anisotropy = filtering.max_anisotropy;
   return slot;
 }
 
@@ -1386,7 +1387,364 @@ MetalCommandProcessor::MetalCommandProcessor(GraphicsSystem* graphics_system,
                                              system::KernelState* kernel_state)
     : CommandProcessor(graphics_system, kernel_state) {}
 
-MetalCommandProcessor::~MetalCommandProcessor() = default;
+MetalCommandProcessor::~MetalCommandProcessor() { ShutdownPipelineArchive(); }
+
+void MetalCommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
+                                                    uint32_t title_id, bool blocking) {
+  CommandProcessor::InitializeShaderStorage(cache_root, title_id, blocking);
+  ShutdownPipelineArchive();
+
+  if (!metal_device_ || cache_root.empty() || !title_id) {
+    REXLOG_WARN("Metal persistent pipeline cache disabled: missing device, cache root or title ID");
+    return;
+  }
+
+  const uint64_t device_key = GetMetalDeviceCacheKey(metal_device_);
+  const std::filesystem::path archive_directory =
+      cache_root / "shaders" / "metal" / fmt::format("{:08X}", title_id);
+  std::error_code filesystem_error;
+  std::filesystem::create_directories(archive_directory, filesystem_error);
+  if (filesystem_error) {
+    REXLOG_WARN("Metal persistent pipeline cache disabled: cannot create {}: {}",
+                rex::path_to_utf8(archive_directory), filesystem_error.message());
+    return;
+  }
+
+  // v1 covers the current translated-MSL entry-point contract and render
+  // descriptor layout. Device identity is part of the name because Metal
+  // binary archives cannot be shared across different GPUs.
+  pipeline_binary_archive_path_ =
+      archive_directory / fmt::format("pipeline-v1-{:016X}.metalarc", device_key);
+  bool loaded_existing = false;
+  std::string archive_message;
+  pipeline_binary_archive_ = CreateMetalPipelineBinaryArchive(
+      metal_device_, pipeline_binary_archive_path_, &loaded_existing, &archive_message);
+  if (!pipeline_binary_archive_) {
+    REXLOG_WARN("Metal persistent pipeline cache disabled for {}: {}",
+                rex::path_to_utf8(pipeline_binary_archive_path_), archive_message);
+    pipeline_binary_archive_path_.clear();
+    return;
+  }
+  if (!archive_message.empty()) {
+    REXLOG_WARN("Metal pipeline archive fallback for {}: {}",
+                rex::path_to_utf8(pipeline_binary_archive_path_), archive_message);
+  }
+  REXLOG_INFO("Metal persistent pipeline cache {}: {} (device {:016X})",
+              loaded_existing ? "loaded" : "created",
+              rex::path_to_utf8(pipeline_binary_archive_path_), device_key);
+}
+
+void* MetalCommandProcessor::CreateCachedRenderPipelineState(
+    void* vertex_library, void* fragment_library, std::string* error_out,
+    const ProbeColorTargetState* color_target_state) {
+  // Archive serialization runs off the render thread. Never make a new game
+  // pipeline wait for it: if the worker owns the archive, compile through
+  // Metal's ordinary path and leave that one entry for a later run. Normal
+  // draws use already-created pipeline states and don't touch this lock.
+  std::unique_lock archive_lock(pipeline_archive_mutex_, std::try_to_lock);
+  if (archive_lock.owns_lock()) {
+    FinalizePipelineArchiveSerializationLocked();
+  } else {
+    ++pipeline_archive_busy_bypass_count_;
+    if (pipeline_archive_busy_bypass_count_ <= 8 ||
+        (pipeline_archive_busy_bypass_count_ & 0x3F) == 0) {
+      REXLOG_INFO(
+          "Metal pipeline archive busy; compiling without persistence #{}",
+          pipeline_archive_busy_bypass_count_);
+    }
+  }
+
+  RenderPipelineCacheTelemetry telemetry;
+  void* pipeline_state = rex::graphics::metal::CreateRenderPipelineState(
+      metal_device_, vertex_library, fragment_library, error_out, color_target_state,
+      archive_lock.owns_lock() ? pipeline_binary_archive_ : nullptr, &telemetry);
+
+  pipeline_build_ns_ += telemetry.pipeline_build_ns;
+  if (telemetry.archive_enabled) {
+    rex::perf::RecordMetalPersistentCacheLookup(telemetry.archive_hit);
+    pipeline_archive_lookup_ns_ += telemetry.archive_lookup_ns;
+    pipeline_archive_add_ns_ += telemetry.archive_add_ns;
+    if (telemetry.archive_hit) {
+      ++pipeline_archive_hit_count_;
+    }
+    if (telemetry.archive_miss) {
+      ++pipeline_archive_miss_count_;
+      rex::perf::RecordMetalPipelineCompile(
+          GetRenderPipelineCacheMissDurationNs(telemetry), pipeline_state != nullptr);
+    }
+    if (telemetry.archive_updated) {
+      if (!pipeline_binary_archive_dirty_) {
+        pipeline_archive_first_dirty_swap_ = pipeline_archive_swap_count_;
+      }
+      pipeline_binary_archive_dirty_ = true;
+      pipeline_archive_last_update_swap_ = pipeline_archive_swap_count_;
+    }
+    if (telemetry.archive_update_failed) {
+      ++pipeline_archive_update_failure_count_;
+      if (pipeline_archive_update_failure_count_ <= 8 ||
+          (pipeline_archive_update_failure_count_ & 0x3F) == 0) {
+        REXLOG_WARN("Metal pipeline archive update failed #{}: {}",
+                    pipeline_archive_update_failure_count_, telemetry.archive_error);
+      }
+    }
+
+    const uint64_t lookup_count = pipeline_archive_hit_count_ + pipeline_archive_miss_count_;
+    if (lookup_count <= 16 || (lookup_count & 0x3F) == 0) {
+      REXLOG_INFO(
+          "Metal pipeline archive lookup #{}: {} (lookup {} us, archive add {} us, build {} us)",
+          lookup_count, telemetry.archive_hit ? "hit" : "miss",
+          telemetry.archive_lookup_ns / 1000, telemetry.archive_add_ns / 1000,
+          telemetry.pipeline_build_ns / 1000);
+    }
+  } else {
+    rex::perf::RecordMetalPipelineCompile(telemetry.pipeline_build_ns, pipeline_state != nullptr);
+  }
+  return pipeline_state;
+}
+
+void MetalCommandProcessor::FinalizePipelineArchiveSerializationLocked() {
+  if (!pipeline_archive_save_result_ready_) {
+    return;
+  }
+  if (pipeline_archive_save_thread_.joinable()) {
+    pipeline_archive_save_thread_.join();
+  }
+  const bool succeeded = pipeline_archive_save_result_succeeded_;
+  const uint64_t archive_size = pipeline_archive_save_result_size_;
+  const uint64_t elapsed_ns = pipeline_archive_save_result_elapsed_ns_;
+  std::string serialize_error = std::move(pipeline_archive_save_result_error_);
+  pipeline_archive_save_result_ready_ = false;
+  pipeline_archive_save_result_succeeded_ = false;
+  pipeline_archive_save_result_size_ = 0;
+  pipeline_archive_save_result_elapsed_ns_ = 0;
+  pipeline_archive_save_result_error_.clear();
+  HandlePipelineArchiveSerializationResultLocked(
+      succeeded, archive_size, elapsed_ns, std::move(serialize_error));
+}
+
+void MetalCommandProcessor::HandlePipelineArchiveSerializationResultLocked(
+    bool succeeded, uint64_t archive_size, uint64_t elapsed_ns,
+    std::string serialize_error) {
+  pipeline_archive_serialization_ns_ += elapsed_ns;
+  pipeline_archive_serialization_max_ns_ =
+      std::max(pipeline_archive_serialization_max_ns_, elapsed_ns);
+  if (succeeded) {
+    pipeline_archive_consecutive_serialization_failures_ = 0;
+    pipeline_archive_next_serialize_swap_ = pipeline_archive_swap_count_;
+    ++pipeline_archive_serialization_count_;
+    REXLOG_INFO("Metal pipeline archive saved #{}: {} bytes in {} us",
+                pipeline_archive_serialization_count_, archive_size,
+                elapsed_ns / 1000);
+    return;
+  }
+
+  ++pipeline_archive_serialization_failure_count_;
+  ++pipeline_archive_consecutive_serialization_failures_;
+  const uint32_t backoff_shift =
+      std::min(pipeline_archive_consecutive_serialization_failures_, uint32_t(10));
+  pipeline_archive_next_serialize_swap_ =
+      pipeline_archive_swap_count_ + (UINT64_C(1) << backoff_shift);
+
+  // Metal may accept a function through addRenderPipelineFunctionsWithDescriptor
+  // and reject it only when serializing the archive. After such a failure the
+  // in-memory archive may report "Nothing to serialize" forever. Preserve the
+  // last atomically written file, discard only the unsaved additions, and
+  // continue from a freshly opened archive so one unsupported shader cannot
+  // poison caching for every later pipeline in the process.
+  bool restored_existing = false;
+  std::string recovery_message;
+  void* recovered_archive = CreateMetalPipelineBinaryArchive(
+      metal_device_, pipeline_binary_archive_path_, &restored_existing,
+      &recovery_message);
+  if (recovered_archive) {
+    ReleaseMetalPipelineBinaryArchive(pipeline_binary_archive_);
+    pipeline_binary_archive_ = recovered_archive;
+    pipeline_binary_archive_dirty_ = false;
+    pipeline_archive_first_dirty_swap_ = 0;
+    pipeline_archive_last_update_swap_ = 0;
+    REXLOG_WARN(
+        "Metal pipeline archive save failed #{}; {} and discarded only unsaved "
+        "entries after {} us (next save no earlier than swap {}): {}{}{}",
+        pipeline_archive_serialization_failure_count_,
+        restored_existing ? "restored the last complete archive"
+                          : "restarted with an empty archive",
+        elapsed_ns / 1000, pipeline_archive_next_serialize_swap_, serialize_error,
+        recovery_message.empty() ? "" : "; recovery: ", recovery_message);
+    return;
+  }
+
+  // If even an empty archive can't be created, disable persistence for this
+  // process. Normal Metal pipeline compilation remains fully functional.
+  ReleaseMetalPipelineBinaryArchive(pipeline_binary_archive_);
+  pipeline_binary_archive_ = nullptr;
+  pipeline_binary_archive_dirty_ = false;
+  pipeline_archive_first_dirty_swap_ = 0;
+  pipeline_archive_last_update_swap_ = 0;
+  pipeline_binary_archive_path_.clear();
+  REXLOG_WARN(
+      "Metal pipeline archive save failed #{} and recovery failed; persistent "
+      "caching is disabled for this run: {}; recovery: {}",
+      pipeline_archive_serialization_failure_count_, serialize_error,
+      recovery_message.empty() ? "unknown Metal archive recovery error"
+                               : recovery_message);
+}
+
+void MetalCommandProcessor::SerializePipelineArchiveIfNeeded(bool force) {
+  // A forced shutdown checkpoint may need to wait for a previously queued
+  // worker. Never hold the archive mutex while joining because the worker owns
+  // it for the duration of Metal's serializer.
+  if (force && pipeline_archive_save_thread_.joinable()) {
+    pipeline_archive_save_thread_.join();
+  }
+
+  std::unique_lock archive_lock(pipeline_archive_mutex_, std::defer_lock);
+  if (force) {
+    archive_lock.lock();
+  } else if (!archive_lock.try_lock()) {
+    // Serialization is already running. Presentation must not wait for it.
+    return;
+  }
+  FinalizePipelineArchiveSerializationLocked();
+
+  if (pipeline_archive_save_in_flight_ || !pipeline_binary_archive_ ||
+      !pipeline_binary_archive_dirty_ || pipeline_binary_archive_path_.empty()) {
+    return;
+  }
+  if (!force) {
+    if (pipeline_archive_swap_count_ < pipeline_archive_next_serialize_swap_) {
+      return;
+    }
+    const bool quiet_period_elapsed =
+        pipeline_archive_swap_count_ >=
+        pipeline_archive_last_update_swap_ + kPipelineArchiveQuietSwaps;
+    const bool maximum_dirty_period_elapsed =
+        pipeline_archive_swap_count_ >=
+        pipeline_archive_first_dirty_swap_ + kPipelineArchiveMaximumDirtySwaps;
+    if (!quiet_period_elapsed && !maximum_dirty_period_elapsed) {
+      return;
+    }
+  }
+
+  // The current generation is now owned by this save attempt. Any pipeline
+  // added after the worker completes will mark the archive dirty again and be
+  // picked up by a later debounced save.
+  const uint64_t dirty_quiet_swaps =
+      pipeline_archive_swap_count_ >= pipeline_archive_last_update_swap_
+          ? pipeline_archive_swap_count_ - pipeline_archive_last_update_swap_
+          : 0;
+  pipeline_binary_archive_dirty_ = false;
+  pipeline_archive_first_dirty_swap_ = 0;
+  pipeline_archive_last_update_swap_ = 0;
+
+  if (force) {
+    uint64_t archive_size = 0;
+    std::string serialize_error;
+    const uint64_t serialize_start_ns = profiling::NowNs();
+    const bool succeeded = SerializeMetalPipelineBinaryArchive(
+        pipeline_binary_archive_, pipeline_binary_archive_path_, &archive_size,
+        &serialize_error);
+    HandlePipelineArchiveSerializationResultLocked(
+        succeeded, archive_size, profiling::ElapsedNs(serialize_start_ns),
+        std::move(serialize_error));
+    return;
+  }
+
+  void* archive = pipeline_binary_archive_;
+  const std::filesystem::path archive_path = pipeline_binary_archive_path_;
+  pipeline_archive_save_in_flight_ = true;
+  REXLOG_INFO(
+      "Metal pipeline archive background save queued after {} quiet swaps",
+      dirty_quiet_swaps);
+  try {
+    pipeline_archive_save_thread_ = std::thread([this, archive, archive_path]() {
+      // Excluding archive mutation is the only work this mutex protects. The
+      // render thread uses try_lock at swap and therefore never waits here.
+      std::unique_lock archive_lock(pipeline_archive_mutex_);
+      uint64_t archive_size = 0;
+      std::string serialize_error;
+      const uint64_t serialize_start_ns = profiling::NowNs();
+      const bool succeeded = SerializeMetalPipelineBinaryArchive(
+          archive, archive_path, &archive_size, &serialize_error);
+      pipeline_archive_save_result_succeeded_ = succeeded;
+      pipeline_archive_save_result_size_ = archive_size;
+      pipeline_archive_save_result_elapsed_ns_ =
+          profiling::ElapsedNs(serialize_start_ns);
+      pipeline_archive_save_result_error_ = std::move(serialize_error);
+      pipeline_archive_save_result_ready_ = true;
+      pipeline_archive_save_in_flight_ = false;
+    });
+  } catch (const std::exception& exception) {
+    pipeline_archive_save_in_flight_ = false;
+    pipeline_binary_archive_dirty_ = true;
+    pipeline_archive_first_dirty_swap_ = pipeline_archive_swap_count_;
+    pipeline_archive_last_update_swap_ = pipeline_archive_swap_count_;
+    pipeline_archive_next_serialize_swap_ =
+        pipeline_archive_swap_count_ + kPipelineArchiveQuietSwaps;
+    REXLOG_WARN("Could not start background Metal pipeline archive save: {}",
+                exception.what());
+  }
+}
+
+void MetalCommandProcessor::ShutdownPipelineArchive() {
+  if (!pipeline_binary_archive_) {
+    pipeline_binary_archive_path_.clear();
+    return;
+  }
+
+  SerializePipelineArchiveIfNeeded(true);
+  const uint64_t lookup_count = pipeline_archive_hit_count_ + pipeline_archive_miss_count_;
+  const uint64_t serialization_attempt_count =
+      pipeline_archive_serialization_count_ +
+      pipeline_archive_serialization_failure_count_;
+  REXLOG_INFO(
+      "Metal persistent pipeline cache shutdown: {} hits, {} misses, {} busy bypasses, "
+      "{} update failures, "
+      "{} saves ({} failed, avg {} us, max {} us), avg lookup {} us, avg pipeline "
+      "build {} us; MSL libraries {} compiled ({} failed), avg {} us, max {} us",
+      pipeline_archive_hit_count_, pipeline_archive_miss_count_,
+      pipeline_archive_busy_bypass_count_, pipeline_archive_update_failure_count_,
+      pipeline_archive_serialization_count_,
+      pipeline_archive_serialization_failure_count_,
+      serialization_attempt_count
+          ? pipeline_archive_serialization_ns_ / serialization_attempt_count / 1000
+          : 0,
+      pipeline_archive_serialization_max_ns_ / 1000,
+      lookup_count ? pipeline_archive_lookup_ns_ / lookup_count / 1000 : 0,
+      lookup_count ? pipeline_build_ns_ / lookup_count / 1000 : 0,
+      msl_library_compile_count_, msl_library_compile_failure_count_,
+      msl_library_compile_count_ ? msl_library_compile_ns_ / msl_library_compile_count_ / 1000 : 0,
+      msl_library_compile_max_ns_ / 1000);
+  ReleaseMetalPipelineBinaryArchive(pipeline_binary_archive_);
+  pipeline_binary_archive_ = nullptr;
+  pipeline_binary_archive_path_.clear();
+  pipeline_binary_archive_dirty_ = false;
+  pipeline_archive_hit_count_ = 0;
+  pipeline_archive_miss_count_ = 0;
+  pipeline_archive_busy_bypass_count_ = 0;
+  pipeline_archive_update_failure_count_ = 0;
+  pipeline_archive_serialization_count_ = 0;
+  pipeline_archive_serialization_failure_count_ = 0;
+  pipeline_archive_serialization_ns_ = 0;
+  pipeline_archive_serialization_max_ns_ = 0;
+  pipeline_archive_consecutive_serialization_failures_ = 0;
+  pipeline_archive_lookup_ns_ = 0;
+  pipeline_archive_add_ns_ = 0;
+  pipeline_build_ns_ = 0;
+  pipeline_archive_swap_count_ = 0;
+  pipeline_archive_first_dirty_swap_ = 0;
+  pipeline_archive_last_update_swap_ = 0;
+  pipeline_archive_next_serialize_swap_ = 0;
+  pipeline_archive_save_in_flight_ = false;
+  pipeline_archive_save_result_ready_ = false;
+  pipeline_archive_save_result_succeeded_ = false;
+  pipeline_archive_save_result_size_ = 0;
+  pipeline_archive_save_result_elapsed_ns_ = 0;
+  pipeline_archive_save_result_error_.clear();
+  msl_library_compile_count_ = 0;
+  msl_library_compile_failure_count_ = 0;
+  msl_library_compile_ns_ = 0;
+  msl_library_compile_max_ns_ = 0;
+}
 
 void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
@@ -2000,6 +2358,11 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   if (primitive_processor_) {
     static_cast<MetalPrimitiveProcessor*>(primitive_processor_.get())->EndFrame();
   }
+  ++pipeline_archive_swap_count_;
+  // macOS shutdown intentionally may end at the process boundary, bypassing
+  // C++ destructors. Debounced background checkpoints retain a warm archive
+  // without making presentation wait for Metal's comparatively slow serializer.
+  SerializePipelineArchiveIfNeeded(false);
   LogIncompleteOnce("swap");
   if (profile_enabled_) {
     if (!profile_window_start_ns_) {
@@ -2298,6 +2661,7 @@ void MetalCommandProcessor::ShutdownContext() {
     shared_memory_->SetGpuResourceMutationCallback({});
   }
   exact_resolved_surface_ = {};
+  ShutdownPipelineArchive();
   REXLOG_INFO("Metal shader cache shutdown: {} shaders cached, {} translated, {} failed",
               shaders_.size(), translated_shader_count_, failed_shader_translation_count_);
   for (auto& pipeline_entry : render_pipeline_states_) {
@@ -7395,7 +7759,20 @@ bool MetalCommandProcessor::EnsureShaderTranslated(MetalShader& shader, uint64_t
   DumpTargetedMslSource(*translation);
   if (metal_device_) {
     std::string metal_compile_error;
-    if (!translation->CompileMslLibrary(metal_device_, &metal_compile_error)) {
+    const uint64_t compile_start_ns = profiling::NowNs();
+    const bool compile_succeeded =
+        translation->CompileMslLibrary(metal_device_, &metal_compile_error);
+    const uint64_t compile_duration_ns = profiling::ElapsedNs(compile_start_ns);
+    ++msl_library_compile_count_;
+    msl_library_compile_ns_ += compile_duration_ns;
+    msl_library_compile_max_ns_ = std::max(msl_library_compile_max_ns_, compile_duration_ns);
+    msl_library_compile_failure_count_ += compile_succeeded ? 0 : 1;
+    rex::perf::RecordMetalShaderCompile(compile_duration_ns, compile_succeeded);
+    if (msl_library_compile_count_ <= 16 || (msl_library_compile_count_ & 0x3F) == 0) {
+      REXLOG_INFO("Metal MSL library compile #{}: {} us ({})", msl_library_compile_count_,
+                  compile_duration_ns / 1000, compile_succeeded ? "succeeded" : "failed");
+    }
+    if (!compile_succeeded) {
       ++failed_shader_translation_count_;
       DumpFailedMslSource(*translation);
       std::fprintf(stderr,
@@ -7560,9 +7937,9 @@ void* MetalCommandProcessor::EnsureRenderPipeline(MetalShader& vertex_shader,
   ProbeColorTargetState color_target_state;
   color_target_state.write_mask = uint8_t(color_write_mask & 0xF);
   color_target_state.blend_control = blend_control;
-  void* pipeline_state = CreateRenderPipelineState(
-      metal_device_, vertex_translation->metal_library(), pixel_translation->metal_library(),
-      &pipeline_error, &color_target_state);
+  void* pipeline_state = CreateCachedRenderPipelineState(
+      vertex_translation->metal_library(), pixel_translation->metal_library(), &pipeline_error,
+      &color_target_state);
   render_pipeline_states_.emplace(pipeline_key, pipeline_state);
 
   static std::atomic<uint32_t> pipeline_logs{0};
@@ -7630,9 +8007,8 @@ void* MetalCommandProcessor::EnsureFullscreenPixelPipeline(MetalShader& pixel_sh
   }
 
   std::string pipeline_error;
-  void* pipeline_state =
-      CreateRenderPipelineState(metal_device_, fullscreen_vertex_library_,
-                                pixel_translation->metal_library(), &pipeline_error);
+  void* pipeline_state = CreateCachedRenderPipelineState(
+      fullscreen_vertex_library_, pixel_translation->metal_library(), &pipeline_error);
   fullscreen_pixel_pipeline_states_.emplace(pipeline_key, pipeline_state);
   static std::atomic<uint32_t> fullscreen_pipeline_logs{0};
   uint32_t fullscreen_pipeline_index =
@@ -7694,9 +8070,8 @@ void* MetalCommandProcessor::EnsureHostPixelPipeline(MetalShader& pixel_shader) 
   }
 
   std::string pipeline_error;
-  void* pipeline_state =
-      CreateRenderPipelineState(metal_device_, host_pixel_vertex_library_,
-                                pixel_translation->metal_library(), &pipeline_error);
+  void* pipeline_state = CreateCachedRenderPipelineState(
+      host_pixel_vertex_library_, pixel_translation->metal_library(), &pipeline_error);
   host_pixel_pipeline_states_.emplace(pipeline_key, pipeline_state);
   static std::atomic<uint32_t> host_pixel_pipeline_logs{0};
   uint32_t host_pixel_pipeline_index =
@@ -7762,9 +8137,8 @@ void* MetalCommandProcessor::EnsureHostFallbackPixelPipeline() {
   }
 
   std::string pipeline_error;
-  host_fallback_pixel_pipeline_state_ =
-      CreateRenderPipelineState(metal_device_, host_pixel_vertex_library_,
-                                host_fallback_pixel_fragment_library_, &pipeline_error);
+  host_fallback_pixel_pipeline_state_ = CreateCachedRenderPipelineState(
+      host_pixel_vertex_library_, host_fallback_pixel_fragment_library_, &pipeline_error);
   static std::atomic<uint32_t> host_fallback_pipeline_logs{0};
   uint32_t host_fallback_pipeline_index =
       host_fallback_pipeline_logs.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -7826,9 +8200,8 @@ void* MetalCommandProcessor::EnsureHostVertexColorPixelPipeline() {
   }
 
   std::string pipeline_error;
-  host_vertex_color_pixel_pipeline_state_ =
-      CreateRenderPipelineState(metal_device_, host_pixel_vertex_library_,
-                                host_vertex_color_pixel_fragment_library_, &pipeline_error);
+  host_vertex_color_pixel_pipeline_state_ = CreateCachedRenderPipelineState(
+      host_pixel_vertex_library_, host_vertex_color_pixel_fragment_library_, &pipeline_error);
   static std::atomic<uint32_t> host_vertex_color_pipeline_logs{0};
   uint32_t host_vertex_color_pipeline_index =
       host_vertex_color_pipeline_logs.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -8613,8 +8986,8 @@ void* MetalCommandProcessor::EnsureSolidColorPipeline(MetalShader& vertex_shader
   }
 
   std::string pipeline_error;
-  void* pipeline_state = CreateRenderPipelineState(
-      metal_device_, vertex_translation->metal_library(), solid_fragment_library_, &pipeline_error);
+  void* pipeline_state = CreateCachedRenderPipelineState(
+      vertex_translation->metal_library(), solid_fragment_library_, &pipeline_error);
   solid_color_pipeline_states_.emplace(pipeline_key, pipeline_state);
   static std::atomic<uint32_t> solid_pipeline_logs{0};
   uint32_t solid_pipeline_index = solid_pipeline_logs.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -8672,8 +9045,8 @@ void* MetalCommandProcessor::EnsureMemExportPipeline(MetalShader& vertex_shader)
   }
 
   std::string pipeline_error;
-  void* pipeline_state = CreateRenderPipelineState(
-      metal_device_, vertex_translation->metal_library(), dummy_fragment_library_, &pipeline_error);
+  void* pipeline_state = CreateCachedRenderPipelineState(
+      vertex_translation->metal_library(), dummy_fragment_library_, &pipeline_error);
   memexport_pipeline_states_.emplace(pipeline_key, pipeline_state);
   static std::atomic<uint32_t> memexport_pipeline_logs{0};
   uint32_t memexport_pipeline_index =
@@ -9550,8 +9923,8 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
             metal_device_, MakeFullscreenProbeVertexMsl(), &fullscreen_vertex_error);
         if (fullscreen_vertex_library) {
           std::string fullscreen_pipeline_error;
-          void* fullscreen_pipeline_state = CreateRenderPipelineState(
-              metal_device_, fullscreen_vertex_library, pixel_shader_translation->metal_library(),
+          void* fullscreen_pipeline_state = CreateCachedRenderPipelineState(
+              fullscreen_vertex_library, pixel_shader_translation->metal_library(),
               &fullscreen_pipeline_error);
           if (fullscreen_pipeline_state) {
             std::vector<uint8_t> fullscreen_probe_bgra;
@@ -9680,8 +10053,8 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
         CreateMslLibrary(metal_device_, MakeFullscreenProbeVertexMsl(), &fullscreen_vertex_error);
     if (fullscreen_vertex_library) {
       std::string fullscreen_pipeline_error;
-      void* fullscreen_pipeline_state = CreateRenderPipelineState(
-          metal_device_, fullscreen_vertex_library, pixel_shader_translation->metal_library(),
+      void* fullscreen_pipeline_state = CreateCachedRenderPipelineState(
+          fullscreen_vertex_library, pixel_shader_translation->metal_library(),
           &fullscreen_pipeline_error);
       if (fullscreen_pipeline_state) {
         SpirvShaderTranslator::SystemConstants fullscreen_system_constants = system_constants_;

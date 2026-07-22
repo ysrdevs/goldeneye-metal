@@ -2,6 +2,8 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 #include <fcntl.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
@@ -10,6 +12,8 @@
 #include "ge_launcher.h"
 
 #include "ge_game_data.h"
+#include "ge_launch_recovery.h"
+#include "ge_save_manager.h"
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -50,6 +54,11 @@ constexpr uint64_t kMaximumDiagnosticArchiveBytes =
 constexpr size_t kMaximumRuntimeLogs = 64;
 constexpr size_t kMaximumCrashReports = 64;
 
+ge::launch_recovery::StartupResult g_startup_recovery;
+bool g_save_reconciliation_ok = true;
+bool g_save_reconciliation_repaired = false;
+std::string g_save_reconciliation_warning;
+
 NSString* ToNSString(const std::filesystem::path& path) {
   return [NSString stringWithUTF8String:path.string().c_str()];
 }
@@ -89,6 +98,120 @@ bool IsExplicitNoninteractiveLaunch() {
   const char* bypass = std::getenv("GOLDENEYE_LAUNCHER_BYPASS_UI");
   return (bypass && std::string_view(bypass) == "1") || HasProcessArgument(@"--game_data_root") ||
          HasProcessArgument(@"--headless");
+}
+
+void ApplySafeModeOverrides() {
+  // These are deliberately in-memory overrides applied after the saved config
+  // has loaded. BeginSafeMode snapshots that config before this function runs,
+  // and PrepareStartup restores it before config loading in the next process.
+  // Safe Mode therefore lasts exactly one game run even if another settings
+  // change happens to flush all current cvars while it is active.
+  constexpr std::array<std::pair<std::string_view, std::string_view>, 10> overrides = {{
+      {"gpu", "metal"},
+      {"fullscreen", "false"},
+      {"vsync", "true"},
+      {"max_fps", "60"},
+      {"metal_output_scaler", "bilinear"},
+      {"anisotropic_override", "2"},
+      {"swap_post_effect", "none"},
+      {"postfx_enabled", "false"},
+      {"metal_show_fps", "false"},
+      {"metal_show_detailed_performance", "false"},
+  }};
+  for (const auto& [name, value] : overrides) {
+    rex::cvar::SetFlagByName(name, value);
+  }
+  // The supported player-facing stability control. Its maximum trades a small
+  // amount of latency for the most conservative GPU command pacing.
+  rex::cvar::SetFlagByName("ge_gpu_throttle_us", "500");
+  REXLOG_WARN(
+      "GoldenEye Safe Mode active for this run: windowed, V-Sync, bilinear output, "
+      "reduced filtering, no AA/Post-FX/overlay, maximum stability throttle");
+}
+
+NSWindow* FindGameplayWindow(NSWindow* launcher_window) {
+  Class gameplay_view_class = NSClassFromString(@"RexMacContentView");
+  if (!gameplay_view_class) {
+    return nil;
+  }
+  for (NSWindow* candidate in [NSApp windows]) {
+    if (candidate != launcher_window &&
+        [[candidate contentView] isKindOfClass:gameplay_view_class]) {
+      return candidate;
+    }
+  }
+  return nil;
+}
+
+id g_game_window_close_observer = nil;
+
+void ArmCleanRunMarkerRemoval(NSWindow* game_window,
+                              const std::filesystem::path& user_data_root,
+                              const std::filesystem::path& config_path, bool safe_mode) {
+  if (!game_window || g_game_window_close_observer) {
+    return;
+  }
+  // Observe this exact RexMac gameplay window. The launcher, diagnostic panels
+  // and host settings windows cannot match the object filter and therefore
+  // cannot incorrectly turn a forced game termination into a clean exit.
+  id observer = [[NSNotificationCenter defaultCenter]
+      addObserverForName:NSWindowWillCloseNotification
+                  object:game_window
+                   queue:nil
+              usingBlock:^(NSNotification* notification) {
+                (void)notification;
+                if (safe_mode &&
+                    !ge::launch_recovery::CancelSafeMode(user_data_root, config_path)) {
+                  REXLOG_ERROR(
+                      "GoldenEye Safe Mode ended cleanly, but the original settings could not "
+                      "be restored yet; restoration will retry before the next config load");
+                }
+                if (ge::launch_recovery::EndRun(user_data_root)) {
+                  REXLOG_INFO(
+                      "GoldenEye game window accepted a clean close; recovery marker cleared");
+                } else {
+                  REXLOG_ERROR(
+                      "GoldenEye game window closed cleanly, but its recovery marker could not "
+                      "be cleared");
+                }
+                if (auto* logger = rex::GetLoggerRaw(rex::log::core())) {
+                  logger->flush();
+                }
+              }];
+  g_game_window_close_observer = [observer retain];
+}
+
+UTType* GoldenEyeSaveBackupType() {
+  UTType* type = [UTType typeWithFilenameExtension:@"gesave" conformingToType:UTTypeData];
+  return type ?: UTTypeData;
+}
+
+NSString* FormatSaveSnapshot(const ge::save::Snapshot& snapshot) {
+  NSString* save_state = snapshot.has_save_game ? @"Save game: Found" : @"Save game: Not found";
+  NSString* profile_state =
+      snapshot.has_profile_settings ? @"Profile settings: Found" : @"Profile settings: Not found";
+  NSString* size = [NSByteCountFormatter stringFromByteCount:static_cast<long long>(snapshot.byte_count)
+                                                   countStyle:NSByteCountFormatterCountStyleFile];
+  return [NSString stringWithFormat:@"%@\n%@  •  %zu file%@  •  %@", save_state, profile_state,
+                                    snapshot.file_count, snapshot.file_count == 1 ? @"" : @"s",
+                                    size];
+}
+
+NSString* FormatBackupInfo(const ge::save::BackupInfo& info) {
+  NSMutableArray<NSString*>* contents = [NSMutableArray array];
+  if (info.has_save_game) {
+    [contents addObject:@"save game"];
+  }
+  if (info.has_profile_settings) {
+    [contents addObject:@"profile settings"];
+  }
+  NSString* description = [contents count] ? [contents componentsJoinedByString:@" and "]
+                                            : @"no managed data";
+  NSString* size = [NSByteCountFormatter stringFromByteCount:static_cast<long long>(info.byte_count)
+                                                   countStyle:NSByteCountFormatterCountStyleFile];
+  return [NSString stringWithFormat:@"This verified backup contains %@ (%zu file%@, %@).",
+                                    description, info.file_count, info.file_count == 1 ? @"" : @"s",
+                                    size];
 }
 
 bool HasMagic(const std::filesystem::path& path, const std::array<uint8_t, 4>& expected) {
@@ -560,6 +683,7 @@ std::string SanitizeDiagnosticText(
   }
   RedactJSONIdentifier(&text, "crashReporterKey");
   RedactJSONIdentifier(&text, "bootSessionUUID");
+  RedactJSONIdentifier(&text, "sleepWakeUUID");
   RedactJSONIdentifier(&text, "deviceIdentifierForVendor");
   RedactJSONIdentifier(&text, "incident");
   RedactJSONIdentifier(&text, "incident_id");
@@ -777,6 +901,35 @@ std::vector<std::filesystem::path> FindRuntimeLogs(const std::filesystem::path& 
   return result;
 }
 
+std::optional<std::string> FindLatestMetalPerformanceReport(
+    const std::vector<std::filesystem::path>& newest_first_logs) {
+  constexpr std::string_view marker = "Metal performance report:";
+  for (const auto& log : newest_first_logs) {
+    auto contents = ReadBoundedTextFile(log, kMaximumDiagnosticFileBytes);
+    if (!contents) {
+      continue;
+    }
+    const size_t marker_position = contents->rfind(marker);
+    if (marker_position == std::string::npos) {
+      continue;
+    }
+    size_t line_start = contents->rfind('\n', marker_position);
+    line_start = line_start == std::string::npos ? 0 : line_start + 1;
+    size_t line_end = contents->find('\n', marker_position);
+    line_end = line_end == std::string::npos ? contents->size() : line_end;
+    std::string line = contents->substr(line_start, line_end - line_start);
+    // spdlog prefixes the message with time/category fields. Keep the stable,
+    // human-readable payload only so diagnostics are easy to compare.
+    const size_t payload = line.find(marker);
+    if (payload != std::string::npos) {
+      line.erase(0, payload);
+    }
+    line.push_back('\n');
+    return line;
+  }
+  return std::nullopt;
+}
+
 bool IsGoldenEyeCrashReport(const std::filesystem::path& path) {
   std::string name = LowerASCII(path.filename().string());
   bool matching_name = name.starts_with("goldeneye-") || name.starts_with("goldeneye metal-") ||
@@ -903,22 +1056,41 @@ bool IsHexToken(std::string_view value) {
   });
 }
 
-std::optional<std::string> ParseMachOUUID(std::string_view output) {
-  std::istringstream lines{std::string(output)};
-  std::string line;
-  while (std::getline(lines, line)) {
-    std::istringstream fields(line);
-    std::string label;
-    std::string uuid;
-    if (!(fields >> label >> uuid) || label != "UUID:" || uuid.size() != 36 || uuid[8] != '-' ||
-        uuid[13] != '-' || uuid[18] != '-' || uuid[23] != '-') {
-      continue;
+std::optional<std::string> CurrentExecutableUUID() {
+  const mach_header* header = _dyld_get_image_header(0);
+  if (!header || header->magic != MH_MAGIC_64) {
+    return std::nullopt;
+  }
+
+  const auto* header64 = reinterpret_cast<const mach_header_64*>(header);
+  const auto* command_bytes = reinterpret_cast<const uint8_t*>(header64 + 1);
+  size_t remaining = header64->sizeofcmds;
+  for (uint32_t index = 0; index < header64->ncmds; ++index) {
+    if (remaining < sizeof(load_command)) {
+      return std::nullopt;
     }
-    std::string compact = uuid;
-    std::erase(compact, '-');
-    if (IsHexToken(compact)) {
-      return uuid;
+    const auto* command = reinterpret_cast<const load_command*>(command_bytes);
+    if (command->cmdsize < sizeof(load_command) || command->cmdsize > remaining) {
+      return std::nullopt;
     }
+    if (command->cmd == LC_UUID && command->cmdsize >= sizeof(uuid_command)) {
+      const auto* uuid = reinterpret_cast<const uuid_command*>(command)->uuid;
+      char formatted[37] = {};
+      std::snprintf(
+          formatted, sizeof(formatted),
+          "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+          static_cast<unsigned>(uuid[0]), static_cast<unsigned>(uuid[1]),
+          static_cast<unsigned>(uuid[2]), static_cast<unsigned>(uuid[3]),
+          static_cast<unsigned>(uuid[4]), static_cast<unsigned>(uuid[5]),
+          static_cast<unsigned>(uuid[6]), static_cast<unsigned>(uuid[7]),
+          static_cast<unsigned>(uuid[8]), static_cast<unsigned>(uuid[9]),
+          static_cast<unsigned>(uuid[10]), static_cast<unsigned>(uuid[11]),
+          static_cast<unsigned>(uuid[12]), static_cast<unsigned>(uuid[13]),
+          static_cast<unsigned>(uuid[14]), static_cast<unsigned>(uuid[15]));
+      return std::string(formatted);
+    }
+    command_bytes += command->cmdsize;
+    remaining -= command->cmdsize;
   }
   return std::nullopt;
 }
@@ -964,8 +1136,7 @@ std::string BuildApplicationReport() {
       [[[[NSBundle mainBundle] executableURL] path] fileSystemRepresentation]);
   std::error_code ec;
   uint64_t executable_size = std::filesystem::file_size(executable, ec);
-  auto uuid = ParseMachOUUID(
-      SmallTaskOutput(@"/usr/bin/dwarfdump", @[ @"--uuid", ToNSString(executable) ]));
+  auto uuid = CurrentExecutableUUID();
   auto sha =
       ParseSHA256(SmallTaskOutput(@"/usr/bin/shasum", @[ @"-a", @"256", ToNSString(executable) ]));
 
@@ -986,6 +1157,29 @@ std::string BuildApplicationReport() {
   if (!ec) {
     report << "Executable size: " << executable_size << " bytes\n";
   }
+  return report.str();
+}
+
+std::string BuildRecoveryReport() {
+  std::ostringstream report;
+  report << "GoldenEye Metal launcher recovery report\n"
+         << "Previous game run interrupted: "
+         << (g_startup_recovery.interrupted_run ? "yes" : "no") << "\n"
+         << "Safe Mode config restored before loading: "
+         << (g_startup_recovery.restored_safe_mode_config ? "yes" : "no") << "\n"
+         << "Save transaction state safe: " << (g_save_reconciliation_ok ? "yes" : "no")
+         << "\n"
+         << "Interrupted save transaction repaired: "
+         << (g_save_reconciliation_repaired ? "yes" : "no") << "\n";
+  if (!g_startup_recovery.warning.empty()) {
+    report << "Recovery warning: " << g_startup_recovery.warning << "\n";
+  }
+  if (!g_save_reconciliation_warning.empty()) {
+    report << "Save recovery warning: " << g_save_reconciliation_warning << "\n";
+  }
+  report << "\nA run is considered clean only after the gameplay window accepts its close.\n"
+         << "This report contains recovery status only; it never copies game data, save "
+            "contents or settings values.\n";
   return report.str();
 }
 
@@ -1188,7 +1382,8 @@ bool ExportDiagnosticBundle(const rex::PathConfig& paths, const std::filesystem:
   uint64_t copied_diagnostic_bytes = 0;
   std::vector<std::string> log_manifest;
   std::vector<std::string> crash_manifest;
-  CopyDiagnosticFiles(FindRuntimeLogs(paths.user_data_root), bundle_root / "Runtime Logs",
+  const auto runtime_logs = FindRuntimeLogs(paths.user_data_root);
+  CopyDiagnosticFiles(runtime_logs, bundle_root / "Runtime Logs",
                       path_redactions, kMaximumRuntimeLogs, &copied_diagnostic_bytes, &log_stats,
                       &log_manifest);
   CopyDiagnosticFiles(FindCrashReports(home), bundle_root / "macOS Crash Reports", path_redactions,
@@ -1198,6 +1393,15 @@ bool ExportDiagnosticBundle(const rex::PathConfig& paths, const std::filesystem:
   std::string write_error;
   if (!WritePrivateTextFile(bundle_root / "System.txt", BuildSystemReport(), &write_error) ||
       !WritePrivateTextFile(bundle_root / "Application.txt", BuildApplicationReport(),
+                            &write_error) ||
+      !WritePrivateTextFile(bundle_root / "Recovery.txt", BuildRecoveryReport(), &write_error)) {
+    cleanup();
+    *error = write_error;
+    return false;
+  }
+  const auto performance_report = FindLatestMetalPerformanceReport(runtime_logs);
+  if (performance_report &&
+      !WritePrivateTextFile(bundle_root / "Metal Performance.txt", *performance_report,
                             &write_error)) {
     cleanup();
     *error = write_error;
@@ -1211,7 +1415,12 @@ bool ExportDiagnosticBundle(const rex::PathConfig& paths, const std::filesystem:
       << "Included:\n"
       << "- " << log_stats.copied << " runtime log(s)\n"
       << "- " << crash_stats.copied << " matching macOS crash report(s)\n"
-      << "- app build identity and non-identifying system information\n\n"
+      << "- app build identity, launcher recovery state and non-identifying system information\n";
+  if (performance_report) {
+    readme << "- the latest completed 60-second Metal performance report\n";
+  }
+  readme
+      << "\n"
       << "Privacy:\n"
       << "- No game data, saves, Xbox package, cache, remembered paths, or settings file is "
          "included.\n"
@@ -1262,21 +1471,43 @@ bool ExportDiagnosticBundle(const rex::PathConfig& paths, const std::filesystem:
   NSTextField* status_;
   NSProgressIndicator* progress_;
   NSButton* play_;
+  NSButton* safe_mode_;
   NSButton* choose_backup_;
   NSButton* choose_folder_;
+  NSButton* manage_saves_;
   NSButton* export_diagnostics_;
   NSButton* quit_;
+  NSWindow* save_window_;
+  NSTextField* save_summary_;
+  NSTextField* save_status_;
+  NSProgressIndicator* save_progress_;
+  NSButton* save_backup_;
+  NSButton* save_restore_;
+  NSButton* save_reset_;
+  NSButton* save_undo_;
+  NSButton* save_done_;
   rex::PathConfig paths_;
   std::function<void(rex::PathConfig)> resume_;
   rex::ui::WindowedAppContext* app_context_;
   std::atomic_bool busy_;
   std::atomic_bool cancel_requested_;
   std::atomic_bool exporting_;
+  std::atomic_bool save_work_active_;
+  BOOL recovery_needed_;
+  BOOL restored_safe_mode_config_;
+  BOOL save_reconciliation_ok_;
+  BOOL save_reconciliation_repaired_;
+  BOOL save_snapshot_valid_;
+  BOOL save_undo_is_redo_;
+  ge::save::Snapshot save_snapshot_;
+  std::filesystem::path save_undo_quarantine_;
+  std::string startup_warning_;
 }
 
 - (instancetype)initWithPaths:(const rex::PathConfig&)paths
                        resume:(std::function<void(rex::PathConfig)>)resume
-                   appContext:(rex::ui::WindowedAppContext*)appContext;
+                   appContext:(rex::ui::WindowedAppContext*)appContext
+                      recovery:(const ge::launch_recovery::StartupResult&)recovery;
 - (void)show;
 @end
 
@@ -1288,7 +1519,8 @@ GoldenEyeLauncherController* g_launcher = nil;
 
 - (instancetype)initWithPaths:(const rex::PathConfig&)paths
                        resume:(std::function<void(rex::PathConfig)>)resume
-                   appContext:(rex::ui::WindowedAppContext*)appContext {
+                   appContext:(rex::ui::WindowedAppContext*)appContext
+                      recovery:(const ge::launch_recovery::StartupResult&)recovery {
   self = [super init];
   if (self) {
     paths_ = paths;
@@ -1297,11 +1529,22 @@ GoldenEyeLauncherController* g_launcher = nil;
     busy_.store(false);
     cancel_requested_.store(false);
     exporting_.store(false);
+    save_work_active_.store(false);
+    recovery_needed_ = recovery.interrupted_run ? YES : NO;
+    restored_safe_mode_config_ = recovery.restored_safe_mode_config ? YES : NO;
+    save_reconciliation_ok_ = g_save_reconciliation_ok ? YES : NO;
+    save_reconciliation_repaired_ = g_save_reconciliation_repaired ? YES : NO;
+    save_snapshot_valid_ = NO;
+    save_undo_is_redo_ = NO;
+    startup_warning_ = recovery.warning;
   }
   return self;
 }
 
 - (void)dealloc {
+  [save_window_ setDelegate:nil];
+  [save_window_ close];
+  [save_window_ release];
   [window_ setDelegate:nil];
   [window_ release];
   [super dealloc];
@@ -1383,6 +1626,22 @@ GoldenEyeLauncherController* g_launcher = nil;
   [play_ setAction:@selector(play:)];
   [content addSubview:play_];
 
+  safe_mode_ = [[[NSButton alloc] initWithFrame:NSMakeRect(48, 288, 285, 48)] autorelease];
+  [safe_mode_ setTitle:@"Start in Safe Mode"];
+  [safe_mode_ setButtonType:NSButtonTypeMomentaryPushIn];
+  [safe_mode_ setBezelStyle:NSBezelStyleRounded];
+  [safe_mode_ setTarget:self];
+  [safe_mode_ setAction:@selector(safeMode:)];
+  [safe_mode_ setHidden:!recovery_needed_];
+  [content addSubview:safe_mode_];
+
+  if (recovery_needed_) {
+    [play_ setFrame:NSMakeRect(347, 288, 285, 48)];
+    [play_ setTitle:@"Play Normally"];
+  } else if (!startup_warning_.empty()) {
+    [play_ setTitle:@"Play Normally"];
+  }
+
   choose_backup_ = [[[NSButton alloc] initWithFrame:NSMakeRect(48, 232, 285, 42)] autorelease];
   [choose_backup_ setTitle:@"Choose Backup ZIP or Package…"];
   [choose_backup_ setButtonType:NSButtonTypeMomentaryPushIn];
@@ -1399,7 +1658,15 @@ GoldenEyeLauncherController* g_launcher = nil;
   [choose_folder_ setAction:@selector(chooseFolder:)];
   [content addSubview:choose_folder_];
 
-  export_diagnostics_ = [[[NSButton alloc] initWithFrame:NSMakeRect(48, 174, 584, 42)] autorelease];
+  manage_saves_ = [[[NSButton alloc] initWithFrame:NSMakeRect(48, 174, 285, 42)] autorelease];
+  [manage_saves_ setTitle:@"Manage Saves…"];
+  [manage_saves_ setButtonType:NSButtonTypeMomentaryPushIn];
+  [manage_saves_ setBezelStyle:NSBezelStyleRounded];
+  [manage_saves_ setTarget:self];
+  [manage_saves_ setAction:@selector(manageSaves:)];
+  [content addSubview:manage_saves_];
+
+  export_diagnostics_ = [[[NSButton alloc] initWithFrame:NSMakeRect(347, 174, 285, 42)] autorelease];
   [export_diagnostics_ setTitle:@"Export Diagnostic Bundle…"];
   [export_diagnostics_ setButtonType:NSButtonTypeMomentaryPushIn];
   [export_diagnostics_ setBezelStyle:NSBezelStyleRounded];
@@ -1437,15 +1704,49 @@ GoldenEyeLauncherController* g_launcher = nil;
   [quit_ setAction:@selector(quit:)];
   [content addSubview:quit_];
 
-  BOOL ready = !paths_.game_data_root.empty();
+  BOOL game_data_ready = !paths_.game_data_root.empty();
+  BOOL ready = game_data_ready && save_reconciliation_ok_;
   [play_ setEnabled:ready];
-  [play_ setKeyEquivalent:ready ? @"\r" : @""];
-  [choose_backup_ setKeyEquivalent:ready ? @"" : @"\r"];
-  if (ready) {
+  [manage_saves_ setEnabled:save_reconciliation_ok_];
+  [safe_mode_ setEnabled:ready && recovery_needed_ && startup_warning_.empty()];
+  [safe_mode_ setKeyEquivalent:(ready && recovery_needed_ && startup_warning_.empty()) ? @"\r"
+                                                                                       : @""];
+  [play_ setKeyEquivalent:(ready && (!recovery_needed_ || !startup_warning_.empty())) ? @"\r"
+                                                                                       : @""];
+  [choose_backup_ setKeyEquivalent:game_data_ready ? @"" : @"\r"];
+  if (!save_reconciliation_ok_) {
+    [explanation_ setTextColor:[NSColor systemRedColor]];
+    [explanation_
+        setStringValue:@"An interrupted save change could not be recovered safely. Play is "
+                        "disabled so the game cannot open a partial save. Export diagnostics, "
+                        "then quit and reopen GoldenEye Metal to retry recovery."];
+    [status_ setStringValue:@"Save recovery is required before play can start."];
+  } else if (!startup_warning_.empty()) {
+    [explanation_ setTextColor:[NSColor systemOrangeColor]];
+    std::string warning = startup_warning_;
+    warning += " Play Normally or export diagnostics; Safe Mode is unavailable until this state "
+               "can be repaired.";
+    [explanation_ setStringValue:ToNSString(std::string_view(warning))];
+    [status_ setStringValue:ready ? @"Play Normally remains available."
+                                  : @"Choose your game data to continue."];
+  } else if (recovery_needed_) {
+    [explanation_ setTextColor:[NSColor systemOrangeColor]];
+    [explanation_
+        setStringValue:@"The previous game session did not close cleanly. Your files are safe. "
+                       @"Use Safe Mode once, play normally, or export diagnostics for help."];
+    [status_ setStringValue:ready ? @"Recovery options ready."
+                                  : @"Choose your game data to use recovery options."];
+  } else if (game_data_ready) {
     [explanation_
         setStringValue:@"Your game data is ready. Choose Play when you want to start, or export "
                        @"one easy-to-send diagnostic ZIP if you need help."];
-    [status_ setStringValue:@"Ready to play."];
+    if (save_reconciliation_repaired_) {
+      [status_ setStringValue:@"An interrupted save change was recovered. Ready to play."];
+    } else {
+      [status_ setStringValue:restored_safe_mode_config_
+                                  ? @"Safe Mode finished; your original settings were restored."
+                                  : @"Ready to play."];
+    }
   } else {
     [status_ setStringValue:@"Choose your game data to continue."];
   }
@@ -1454,15 +1755,66 @@ GoldenEyeLauncherController* g_launcher = nil;
   [NSApp activateIgnoringOtherApps:YES];
 }
 
+- (void)updateSaveManagerControls {
+  BOOL visible = save_window_ && [save_window_ isVisible];
+  BOOL available = visible && !busy_.load();
+  BOOL operations_available = available && save_reconciliation_ok_;
+  BOOL has_managed_data = save_snapshot_valid_ && static_cast<bool>(save_snapshot_);
+  [save_backup_ setEnabled:operations_available && has_managed_data];
+  [save_restore_ setEnabled:operations_available];
+  [save_reset_ setEnabled:operations_available && has_managed_data];
+  [save_undo_ setHidden:save_undo_quarantine_.empty()];
+  [save_undo_ setTitle:save_undo_is_redo_ ? @"Redo Last Change" : @"Undo Last Change"];
+  [save_undo_ setEnabled:operations_available && !save_undo_quarantine_.empty()];
+  [save_done_ setEnabled:available];
+  if (save_work_active_.load()) {
+    [save_progress_ startAnimation:nil];
+  } else {
+    [save_progress_ stopAnimation:nil];
+  }
+}
+
+- (void)failClosedForSaveRecovery:(const std::string&)warning {
+  save_reconciliation_ok_ = NO;
+  save_reconciliation_repaired_ = NO;
+  g_save_reconciliation_ok = false;
+  g_save_reconciliation_repaired = false;
+  g_save_reconciliation_warning =
+      warning.empty() ? "An interrupted save transaction could not be reconciled." : warning;
+  [play_ setEnabled:NO];
+  [play_ setKeyEquivalent:@""];
+  [safe_mode_ setEnabled:NO];
+  [safe_mode_ setKeyEquivalent:@""];
+  [manage_saves_ setEnabled:NO];
+  [explanation_ setTextColor:[NSColor systemRedColor]];
+  [explanation_
+      setStringValue:@"Save recovery could not finish safely, so Play is disabled for this "
+                      "session. Close Save Management, export diagnostics, then quit and reopen "
+                      "GoldenEye Metal to retry recovery."];
+  [status_ setStringValue:@"Save recovery failed safely — gameplay has not started."];
+  [save_summary_ setTextColor:[NSColor systemRedColor]];
+  [save_summary_ setStringValue:@"Save state is protected pending recovery."];
+  [save_status_ setTextColor:[NSColor systemRedColor]];
+  [save_status_ setStringValue:@"Close this window and export diagnostics."];
+  [self updateSaveManagerControls];
+}
+
 - (void)setBusy:(BOOL)busy message:(NSString*)message {
   busy_.store(busy);
   BOOL exporting = exporting_.load();
-  [play_ setEnabled:!busy && !paths_.game_data_root.empty()];
-  [choose_backup_ setEnabled:!busy];
-  [choose_folder_ setEnabled:!busy];
-  [export_diagnostics_ setEnabled:!busy];
-  [quit_ setEnabled:!busy || !exporting];
-  [quit_ setTitle:(busy && !exporting) ? @"Cancel" : @"Quit"];
+  BOOL save_work = save_work_active_.load();
+  BOOL save_manager_visible = save_window_ && [save_window_ isVisible];
+  BOOL launcher_available = !busy && !save_manager_visible;
+  BOOL launch_ready = !paths_.game_data_root.empty() && save_reconciliation_ok_;
+  [play_ setEnabled:launcher_available && launch_ready];
+  [safe_mode_ setEnabled:launcher_available && recovery_needed_ && launch_ready &&
+                              startup_warning_.empty()];
+  [choose_backup_ setEnabled:launcher_available];
+  [choose_folder_ setEnabled:launcher_available];
+  [manage_saves_ setEnabled:launcher_available && save_reconciliation_ok_];
+  [export_diagnostics_ setEnabled:launcher_available];
+  [quit_ setEnabled:!save_manager_visible && !save_work && (!busy || !exporting)];
+  [quit_ setTitle:(busy && !exporting && !save_work) ? @"Cancel" : @"Quit"];
   [status_ setStringValue:message ?: @""];
   if (busy) {
     [progress_ setIndeterminate:YES];
@@ -1471,6 +1823,7 @@ GoldenEyeLauncherController* g_launcher = nil;
   } else {
     [progress_ stopAnimation:nil];
   }
+  [self updateSaveManagerControls];
 }
 
 - (void)showError:(std::string)message {
@@ -1506,17 +1859,597 @@ GoldenEyeLauncherController* g_launcher = nil;
   WriteRememberedRoot(paths_.user_data_root, root);
   cancel_requested_.store(false);
   exporting_.store(false);
-  [self setBusy:NO message:@"Game data is ready. Choose Play to start."];
-  [explanation_
-      setStringValue:@"Your game data is ready. Choose Play when you want to start, or export one "
-                     @"easy-to-send diagnostic ZIP if you need help."];
+  [self setBusy:NO
+         message:recovery_needed_ ? @"Game data is ready. Choose a recovery launch option."
+                                  : @"Game data is ready. Choose Play to start."];
+  if (!startup_warning_.empty()) {
+    [explanation_ setTextColor:[NSColor systemOrangeColor]];
+    std::string warning = startup_warning_;
+    warning += " Play Normally or export diagnostics; Safe Mode is unavailable until this state "
+               "can be repaired.";
+    [explanation_ setStringValue:ToNSString(std::string_view(warning))];
+  } else if (recovery_needed_) {
+    [explanation_ setTextColor:[NSColor systemOrangeColor]];
+    [explanation_
+        setStringValue:@"The previous game session did not close cleanly. Your files are safe. "
+                       @"Use Safe Mode once, play normally, or export diagnostics for help."];
+  } else {
+    [explanation_ setTextColor:[NSColor labelColor]];
+    [explanation_
+        setStringValue:@"Your game data is ready. Choose Play when you want to start, or export "
+                       @"one easy-to-send diagnostic ZIP if you need help."];
+  }
   [choose_backup_ setKeyEquivalent:@""];
-  [play_ setKeyEquivalent:@"\r"];
+  [safe_mode_ setKeyEquivalent:(startup_warning_.empty() && recovery_needed_) ? @"\r" : @""];
+  [play_ setKeyEquivalent:(!recovery_needed_ || !startup_warning_.empty()) ? @"\r" : @""];
 }
 
-- (void)play:(id)sender {
+- (void)createSaveManagerWindowIfNeeded {
+  if (save_window_) {
+    return;
+  }
+
+  NSRect frame = NSMakeRect(0, 0, 600, 430);
+  NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable;
+  save_window_ = [[NSWindow alloc] initWithContentRect:frame
+                                             styleMask:style
+                                               backing:NSBackingStoreBuffered
+                                                 defer:NO];
+  [save_window_ setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
+  [save_window_ setTitle:@"GoldenEye Save Management"];
+  [save_window_ setReleasedWhenClosed:NO];
+  [save_window_ setDelegate:self];
+  [save_window_ center];
+
+  NSView* content = [save_window_ contentView];
+  [content setWantsLayer:YES];
+  [content layer].backgroundColor = [[NSColor colorWithCalibratedRed:0.055
+                                                               green:0.06
+                                                                blue:0.07
+                                                               alpha:1.0] CGColor];
+
+  NSTextField* title = [self labelWithFrame:NSMakeRect(36, 364, 528, 40)
+                                       text:@"Manage Saves"
+                                       font:[NSFont systemFontOfSize:25 weight:NSFontWeightBold]
+                                      color:[NSColor colorWithCalibratedRed:0.88
+                                                                      green:0.70
+                                                                       blue:0.22
+                                                                      alpha:1.0]];
+  [content addSubview:title];
+
+  save_summary_ = [self labelWithFrame:NSMakeRect(36, 294, 528, 58)
+                                  text:@"Checking for GoldenEye save data…"
+                                  font:[NSFont systemFontOfSize:15 weight:NSFontWeightMedium]
+                                 color:[NSColor labelColor]];
+  [save_summary_ setLineBreakMode:NSLineBreakByWordWrapping];
+  [save_summary_ setMaximumNumberOfLines:3];
+  [content addSubview:save_summary_];
+
+  save_backup_ = [[[NSButton alloc] initWithFrame:NSMakeRect(36, 228, 252, 44)] autorelease];
+  [save_backup_ setTitle:@"Back Up Save…"];
+  [save_backup_ setBezelStyle:NSBezelStyleRounded];
+  [save_backup_ setTarget:self];
+  [save_backup_ setAction:@selector(backupSave:)];
+  [content addSubview:save_backup_];
+
+  save_restore_ = [[[NSButton alloc] initWithFrame:NSMakeRect(312, 228, 252, 44)] autorelease];
+  [save_restore_ setTitle:@"Restore Backup…"];
+  [save_restore_ setBezelStyle:NSBezelStyleRounded];
+  [save_restore_ setTarget:self];
+  [save_restore_ setAction:@selector(restoreSave:)];
+  [content addSubview:save_restore_];
+
+  save_reset_ = [[[NSButton alloc] initWithFrame:NSMakeRect(36, 172, 252, 44)] autorelease];
+  [save_reset_ setTitle:@"Reset to Fresh…"];
+  [save_reset_ setBezelStyle:NSBezelStyleRounded];
+  [save_reset_ setTarget:self];
+  [save_reset_ setAction:@selector(resetSave:)];
+  [content addSubview:save_reset_];
+
+  save_undo_ = [[[NSButton alloc] initWithFrame:NSMakeRect(312, 172, 252, 44)] autorelease];
+  [save_undo_ setTitle:@"Undo Last Change"];
+  [save_undo_ setBezelStyle:NSBezelStyleRounded];
+  [save_undo_ setTarget:self];
+  [save_undo_ setAction:@selector(undoSaveChange:)];
+  [save_undo_ setHidden:YES];
+  [content addSubview:save_undo_];
+
+  save_progress_ =
+      [[[NSProgressIndicator alloc] initWithFrame:NSMakeRect(36, 142, 528, 14)] autorelease];
+  [save_progress_ setStyle:NSProgressIndicatorStyleBar];
+  [save_progress_ setIndeterminate:YES];
+  [save_progress_ setDisplayedWhenStopped:NO];
+  [content addSubview:save_progress_];
+
+  save_status_ = [self labelWithFrame:NSMakeRect(36, 108, 528, 24)
+                                 text:@"Ready"
+                                 font:[NSFont systemFontOfSize:13]
+                                color:[NSColor secondaryLabelColor]];
+  [content addSubview:save_status_];
+
+  NSTextField* notice = [self
+      labelWithFrame:NSMakeRect(36, 46, 438, 48)
+                text:@"Restore and Reset preserve replaced data in a private quarantine. "
+                     @"Game files and launcher settings are never included in save backups."
+                font:[NSFont systemFontOfSize:12]
+               color:[NSColor tertiaryLabelColor]];
+  [notice setLineBreakMode:NSLineBreakByWordWrapping];
+  [notice setMaximumNumberOfLines:3];
+  [content addSubview:notice];
+
+  save_done_ = [[[NSButton alloc] initWithFrame:NSMakeRect(490, 48, 74, 32)] autorelease];
+  [save_done_ setTitle:@"Done"];
+  [save_done_ setBezelStyle:NSBezelStyleRounded];
+  [save_done_ setTarget:self];
+  [save_done_ setAction:@selector(closeSaveManager:)];
+  [content addSubview:save_done_];
+}
+
+- (BOOL)beginSaveWork:(NSString*)message {
+  if (busy_.exchange(true)) {
+    return NO;
+  }
+  save_work_active_.store(true);
+  cancel_requested_.store(false);
+  [self setBusy:YES message:message];
+  [save_status_ setTextColor:[NSColor secondaryLabelColor]];
+  [save_status_ setStringValue:message ?: @"Working…"];
+  return YES;
+}
+
+- (void)finishSaveWork:(NSString*)launcherMessage saveMessage:(NSString*)saveMessage {
+  save_work_active_.store(false);
+  [self setBusy:NO message:launcherMessage ?: @"Save Management is open."];
+  [save_status_ setTextColor:[NSColor secondaryLabelColor]];
+  [save_status_ setStringValue:saveMessage ?: @"Ready"];
+}
+
+- (void)applySaveSnapshot:(const ge::save::Snapshot&)snapshot {
+  save_snapshot_ = snapshot;
+  save_snapshot_valid_ = YES;
+  [save_summary_ setTextColor:[NSColor labelColor]];
+  [save_summary_ setStringValue:FormatSaveSnapshot(snapshot)];
+  [self updateSaveManagerControls];
+}
+
+- (void)showSaveError:(const std::string&)message title:(NSString*)title {
+  [save_status_ setTextColor:[NSColor systemRedColor]];
+  [save_status_ setStringValue:ToNSString(std::string_view(message))];
+  NSAlert* alert = [[[NSAlert alloc] init] autorelease];
+  [alert setAlertStyle:NSAlertStyleCritical];
+  [alert setMessageText:title ?: @"Save operation failed"];
+  [alert setInformativeText:ToNSString(std::string_view(message))];
+  [alert addButtonWithTitle:@"OK"];
+  NSWindow* parent = save_window_ && [save_window_ isVisible] ? save_window_ : window_;
+  [alert beginSheetModalForWindow:parent completionHandler:nil];
+}
+
+- (void)refreshSaveSnapshot {
+  if (![self beginSaveWork:@"Checking GoldenEye save data…"]) {
+    return;
+  }
+  GoldenEyeLauncherController* controller = [self retain];
+  auto root = paths_.user_data_root;
+  std::thread([controller, root = std::move(root)]() mutable {
+    @autoreleasepool {
+      ge::save::Snapshot snapshot;
+      ge::save::Status status = ge::save::Discover(root, &snapshot);
+      dispatch_async(dispatch_get_main_queue(), ^{
+        if (status) {
+          [controller applySaveSnapshot:snapshot];
+          [controller finishSaveWork:@"Save Management is open." saveMessage:@"Ready"];
+        } else {
+          controller->save_snapshot_valid_ = NO;
+          [controller->save_summary_ setTextColor:[NSColor systemRedColor]];
+          [controller->save_summary_ setStringValue:@"Save data could not be inspected safely."];
+          [controller finishSaveWork:@"Save inspection failed."
+                         saveMessage:@"Save data could not be inspected."];
+          [controller showSaveError:status.message title:@"Save data could not be inspected"];
+        }
+        [controller release];
+      });
+    }
+  }).detach();
+}
+
+- (void)manageSaves:(id)sender {
   (void)sender;
+  if (busy_.load() || !save_reconciliation_ok_) {
+    if (!save_reconciliation_ok_) {
+      [status_ setStringValue:@"Save recovery must finish before saves can be managed."];
+    }
+    return;
+  }
+  [self createSaveManagerWindowIfNeeded];
+  [save_window_ makeKeyAndOrderFront:nil];
+  [NSApp activateIgnoringOtherApps:YES];
+  [self setBusy:NO message:@"Save Management is open."];
+  [self refreshSaveSnapshot];
+}
+
+- (void)closeSaveManager:(id)sender {
+  (void)sender;
+  if (busy_.load() || save_work_active_.load()) {
+    [save_status_ setStringValue:@"Please wait for the save operation to finish…"];
+    return;
+  }
+  [save_window_ orderOut:nil];
+  [window_ makeKeyAndOrderFront:nil];
+  [self setBusy:NO
+          message:save_reconciliation_ok_
+                      ? @"Ready."
+                      : @"Save recovery failed safely — export diagnostics, then restart."];
+}
+
+- (void)beginSaveBackup:(std::filesystem::path)destination {
+  if (![self beginSaveWork:@"Creating verified save backup…"]) {
+    return;
+  }
+  GoldenEyeLauncherController* controller = [self retain];
+  auto root = paths_.user_data_root;
+  std::thread([controller, root = std::move(root),
+               destination = std::move(destination)]() mutable {
+    @autoreleasepool {
+      ge::save::BackupInfo info;
+      ge::save::Status status = ge::save::CreateBackup(root, destination, &info);
+      dispatch_async(dispatch_get_main_queue(), ^{
+        if (status) {
+          [controller finishSaveWork:@"Save backup created."
+                         saveMessage:@"Backup saved and verified."];
+          NSURL* saved_url = [NSURL fileURLWithPath:ToNSString(destination)];
+          if (saved_url) {
+            [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[ saved_url ]];
+          }
+        } else {
+          [controller finishSaveWork:@"Save backup failed."
+                         saveMessage:@"No backup was created."];
+          [controller showSaveError:status.message title:@"Save backup could not be created"];
+        }
+        [controller release];
+      });
+    }
+  }).detach();
+}
+
+- (void)backupSave:(id)sender {
+  (void)sender;
+  if (busy_.load() || !save_snapshot_valid_ || !static_cast<bool>(save_snapshot_)) {
+    return;
+  }
+  NSDateFormatter* formatter = [[[NSDateFormatter alloc] init] autorelease];
+  [formatter setLocale:[[[NSLocale alloc] initWithLocaleIdentifier:@"en_US_POSIX"] autorelease]];
+  [formatter setDateFormat:@"yyyyMMdd-HHmmss"];
+  NSString* filename = [NSString stringWithFormat:@"GoldenEye-Save-%@.gesave",
+                                                  [formatter stringFromDate:[NSDate date]]];
+  NSSavePanel* panel = [NSSavePanel savePanel];
+  [panel setTitle:@"Back up GoldenEye save data"];
+  [panel setMessage:@"Creates one verified .gesave file containing only GoldenEye save and "
+                    @"title-profile data."];
+  [panel setPrompt:@"Back Up"];
+  [panel setNameFieldStringValue:filename];
+  [panel setAllowedContentTypes:@[ GoldenEyeSaveBackupType() ]];
+  [panel setCanCreateDirectories:YES];
+  [panel setExtensionHidden:NO];
+  [panel beginSheetModalForWindow:save_window_
+                completionHandler:^(NSModalResponse response) {
+                  if (response != NSModalResponseOK || ![panel URL]) {
+                    [save_status_ setStringValue:@"Backup cancelled."];
+                    return;
+                  }
+                  std::filesystem::path destination([[[panel URL] path] fileSystemRepresentation]);
+                  if (LowerASCII(destination.extension().string()) != ge::save::kBackupExtension) {
+                    destination.replace_extension(ge::save::kBackupExtension);
+                  }
+                  [self beginSaveBackup:std::move(destination)];
+                }];
+}
+
+- (void)beginRestoreBackup:(std::filesystem::path)archive {
+  if (![self beginSaveWork:@"Restoring verified save backup…"]) {
+    return;
+  }
+  GoldenEyeLauncherController* controller = [self retain];
+  auto root = paths_.user_data_root;
+  std::thread([controller, root = std::move(root), archive = std::move(archive)]() mutable {
+    @autoreleasepool {
+      ge::save::MutationResult result = ge::save::RestoreBackup(root, archive);
+      ge::save::RecoveryResult recovery;
+      if (!result) {
+        recovery = ge::save::RecoverInterruptedTransaction(root);
+      }
+      ge::save::Snapshot snapshot;
+      ge::save::Status discovery;
+      if (result || recovery) {
+        discovery = ge::save::Discover(root, &snapshot);
+      }
+      dispatch_async(dispatch_get_main_queue(), ^{
+        if (result) {
+          controller->save_undo_quarantine_ = result.quarantine_path;
+          controller->save_undo_is_redo_ = NO;
+          if (discovery) {
+            [controller applySaveSnapshot:snapshot];
+          } else {
+            controller->save_snapshot_valid_ = NO;
+            [controller->save_summary_ setStringValue:@"Save restored; refresh failed."];
+          }
+          NSString* message = result.quarantine_path.empty()
+                                  ? @"Backup restored. There was no prior save to quarantine."
+                                  : @"Backup restored. Undo Last Change is available now.";
+          [controller finishSaveWork:@"Save backup restored." saveMessage:message];
+          if (!discovery) {
+            [controller showSaveError:discovery.message
+                                title:@"Save restored, but status could not be refreshed"];
+          }
+        } else {
+          if (!recovery) {
+            std::string failure = result.status.message;
+            if (!failure.empty()) {
+              failure += " ";
+            }
+            failure += recovery.status.message;
+            [controller finishSaveWork:@"Save recovery is required."
+                           saveMessage:@"The launcher stopped safely before gameplay."];
+            [controller failClosedForSaveRecovery:recovery.status.message];
+            [controller showSaveError:failure title:@"Save recovery could not finish"];
+          } else {
+            if (discovery) {
+              [controller applySaveSnapshot:snapshot];
+            }
+            [controller finishSaveWork:@"Save restore failed."
+                           saveMessage:@"Your existing save was recovered safely."];
+            [controller showSaveError:result.status.message
+                                  title:@"Save backup could not be restored"];
+          }
+        }
+        [controller release];
+      });
+    }
+  }).detach();
+}
+
+- (void)inspectAndConfirmRestore:(std::filesystem::path)archive {
+  if (![self beginSaveWork:@"Inspecting save backup…"]) {
+    return;
+  }
+  GoldenEyeLauncherController* controller = [self retain];
+  std::thread([controller, archive = std::move(archive)]() mutable {
+    @autoreleasepool {
+      ge::save::BackupInfo info;
+      ge::save::Status status = ge::save::InspectBackup(archive, &info);
+      dispatch_async(dispatch_get_main_queue(), ^{
+        if (!status) {
+          [controller finishSaveWork:@"Save backup inspection failed."
+                         saveMessage:@"The selected file was not changed."];
+          [controller showSaveError:status.message title:@"This is not a valid GoldenEye backup"];
+          [controller release];
+          return;
+        }
+
+        [controller finishSaveWork:@"Verified backup ready for confirmation."
+                       saveMessage:@"Backup verified. Confirm restore to continue."];
+        NSAlert* alert = [[[NSAlert alloc] init] autorelease];
+        [alert setAlertStyle:NSAlertStyleWarning];
+        [alert setMessageText:@"Restore this GoldenEye save backup?"];
+        NSString* detail = [NSString
+            stringWithFormat:@"%@\n\nCurrent GoldenEye save/profile data will be moved into a "
+                             @"private quarantine first. You can immediately undo the restore.",
+                             FormatBackupInfo(info)];
+        [alert setInformativeText:detail];
+        [alert addButtonWithTitle:@"Restore Backup"];
+        [alert addButtonWithTitle:@"Cancel"];
+        [alert beginSheetModalForWindow:controller->save_window_
+                      completionHandler:^(NSModalResponse response) {
+                        if (response == NSAlertFirstButtonReturn) {
+                          [controller beginRestoreBackup:archive];
+                        } else {
+                          [controller->save_status_ setStringValue:@"Restore cancelled."];
+                        }
+                      }];
+        [controller release];
+      });
+    }
+  }).detach();
+}
+
+- (void)restoreSave:(id)sender {
+  (void)sender;
+  if (busy_.load()) {
+    return;
+  }
+  NSOpenPanel* panel = [NSOpenPanel openPanel];
+  [panel setTitle:@"Choose a GoldenEye save backup"];
+  [panel setMessage:@"Select a .gesave backup. It will be fully inspected before restore is "
+                    @"offered."];
+  [panel setPrompt:@"Inspect Backup"];
+  [panel setCanChooseFiles:YES];
+  [panel setCanChooseDirectories:NO];
+  [panel setAllowsMultipleSelection:NO];
+  [panel setAllowedContentTypes:@[ GoldenEyeSaveBackupType() ]];
+  [panel beginSheetModalForWindow:save_window_
+                completionHandler:^(NSModalResponse response) {
+                  if (response != NSModalResponseOK || ![[panel URLs] firstObject]) {
+                    [save_status_ setStringValue:@"Restore cancelled."];
+                    return;
+                  }
+                  NSURL* url = [[panel URLs] firstObject];
+                  std::filesystem::path archive([[url path] fileSystemRepresentation]);
+                  [self inspectAndConfirmRestore:std::move(archive)];
+                }];
+}
+
+- (void)beginResetSave {
+  if (![self beginSaveWork:@"Moving save data into private quarantine…"]) {
+    return;
+  }
+  GoldenEyeLauncherController* controller = [self retain];
+  auto root = paths_.user_data_root;
+  std::thread([controller, root = std::move(root)]() mutable {
+    @autoreleasepool {
+      ge::save::MutationResult result = ge::save::ResetToFresh(root);
+      ge::save::RecoveryResult recovery;
+      if (!result) {
+        recovery = ge::save::RecoverInterruptedTransaction(root);
+      }
+      ge::save::Snapshot snapshot;
+      ge::save::Status discovery;
+      if (result || recovery) {
+        discovery = ge::save::Discover(root, &snapshot);
+      }
+      dispatch_async(dispatch_get_main_queue(), ^{
+        if (result) {
+          controller->save_undo_quarantine_ = result.quarantine_path;
+          controller->save_undo_is_redo_ = NO;
+          if (discovery) {
+            [controller applySaveSnapshot:snapshot];
+          } else {
+            controller->save_snapshot_valid_ = NO;
+            [controller->save_summary_ setStringValue:@"Save reset; refresh failed."];
+          }
+          [controller finishSaveWork:@"GoldenEye save reset."
+                         saveMessage:@"Save reset to fresh. Undo Last Change is available now."];
+          if (!discovery) {
+            [controller showSaveError:discovery.message
+                                title:@"Save reset, but status could not be refreshed"];
+          }
+        } else {
+          if (!recovery) {
+            std::string failure = result.status.message;
+            if (!failure.empty()) {
+              failure += " ";
+            }
+            failure += recovery.status.message;
+            [controller finishSaveWork:@"Save recovery is required."
+                           saveMessage:@"The launcher stopped safely before gameplay."];
+            [controller failClosedForSaveRecovery:recovery.status.message];
+            [controller showSaveError:failure title:@"Save recovery could not finish"];
+          } else {
+            if (discovery) {
+              [controller applySaveSnapshot:snapshot];
+            }
+            [controller finishSaveWork:@"Save reset failed."
+                           saveMessage:@"No save data was removed; the prior state is safe."];
+            [controller showSaveError:result.status.message
+                                  title:@"GoldenEye save could not be reset"];
+          }
+        }
+        [controller release];
+      });
+    }
+  }).detach();
+}
+
+- (void)resetSave:(id)sender {
+  (void)sender;
+  if (busy_.load() || !save_snapshot_valid_ || !static_cast<bool>(save_snapshot_)) {
+    return;
+  }
+  NSAlert* alert = [[[NSAlert alloc] init] autorelease];
+  [alert setAlertStyle:NSAlertStyleCritical];
+  [alert setMessageText:@"Reset GoldenEye save and profile data?"];
+  [alert setInformativeText:@"This starts GoldenEye fresh. Existing managed save/profile data is "
+                            @"moved into a private quarantine rather than deleted, and Undo Last "
+                            @"Change will be offered immediately."];
+  [alert addButtonWithTitle:@"Reset Save Data"];
+  [alert addButtonWithTitle:@"Cancel"];
+  [alert beginSheetModalForWindow:save_window_
+                completionHandler:^(NSModalResponse response) {
+                  if (response == NSAlertFirstButtonReturn) {
+                    [self beginResetSave];
+                  } else {
+                    [save_status_ setStringValue:@"Reset cancelled."];
+                  }
+                }];
+}
+
+- (void)undoSaveChange:(id)sender {
+  (void)sender;
+  if (busy_.load() || save_undo_quarantine_.empty()) {
+    return;
+  }
+  const BOOL was_redo = save_undo_is_redo_;
+  if (![self beginSaveWork:was_redo ? @"Redoing last save change…"
+                                    : @"Undoing last save change…"]) {
+    return;
+  }
+  GoldenEyeLauncherController* controller = [self retain];
+  auto root = paths_.user_data_root;
+  auto quarantine = save_undo_quarantine_;
+  std::thread([controller, root = std::move(root), quarantine = std::move(quarantine),
+               was_redo]() mutable {
+    @autoreleasepool {
+      ge::save::MutationResult result = ge::save::UndoQuarantine(root, quarantine);
+      ge::save::RecoveryResult recovery;
+      if (!result) {
+        recovery = ge::save::RecoverInterruptedTransaction(root);
+      }
+      ge::save::Snapshot snapshot;
+      ge::save::Status discovery;
+      if (result || recovery) {
+        discovery = ge::save::Discover(root, &snapshot);
+      }
+      dispatch_async(dispatch_get_main_queue(), ^{
+        if (result) {
+          controller->save_undo_quarantine_ = result.quarantine_path;
+          controller->save_undo_is_redo_ =
+              result.quarantine_path.empty() ? NO : (was_redo ? NO : YES);
+          if (discovery) {
+            [controller applySaveSnapshot:snapshot];
+          } else {
+            controller->save_snapshot_valid_ = NO;
+            [controller->save_summary_ setStringValue:@"Undo completed; refresh failed."];
+          }
+          NSString* launcher_message = was_redo ? @"Save change reapplied."
+                                                 : @"Last save change undone.";
+          NSString* save_message =
+              result.quarantine_path.empty()
+                  ? (was_redo ? @"Save change reapplied." : @"Previous save data restored.")
+                  : (was_redo ? @"Save change reapplied. Undo Last Change is available."
+                              : @"Previous save restored. Redo Last Change is available.");
+          [controller finishSaveWork:launcher_message saveMessage:save_message];
+          if (!discovery) {
+            [controller showSaveError:discovery.message
+                                title:@"Undo completed, but status could not be refreshed"];
+          }
+        } else {
+          if (!result.quarantine_path.empty()) {
+            controller->save_undo_quarantine_ = result.quarantine_path;
+          }
+          if (!recovery) {
+            std::string failure = result.status.message;
+            if (!failure.empty()) {
+              failure += " ";
+            }
+            failure += recovery.status.message;
+            [controller finishSaveWork:@"Save recovery is required."
+                           saveMessage:@"The launcher stopped safely before gameplay."];
+            [controller failClosedForSaveRecovery:recovery.status.message];
+            [controller showSaveError:failure title:@"Save recovery could not finish"];
+          } else {
+            if (discovery) {
+              [controller applySaveSnapshot:snapshot];
+            }
+            [controller finishSaveWork:@"Undo failed."
+                           saveMessage:@"The prior save state was recovered safely."];
+            [controller showSaveError:result.status.message
+                                  title:@"Last save change could not be undone"];
+          }
+        }
+        [controller release];
+      });
+    }
+  }).detach();
+}
+
+- (void)launchGameInSafeMode:(BOOL)safeMode {
   if (busy_.load() || paths_.game_data_root.empty() || !resume_) {
+    return;
+  }
+  if (!save_reconciliation_ok_) {
+    [status_ setStringValue:@"Play is disabled until the interrupted save change is recovered."];
+    return;
+  }
+  if (safeMode && !startup_warning_.empty()) {
+    [status_ setStringValue:@"Safe Mode is unavailable; choose Play Normally or export diagnostics."];
     return;
   }
 
@@ -1529,6 +2462,7 @@ GoldenEyeLauncherController* g_launcher = nil;
   if (!validation.valid) {
     paths_.game_data_root.clear();
     [play_ setEnabled:NO];
+    [safe_mode_ setEnabled:NO];
     [play_ setKeyEquivalent:@""];
     [choose_backup_ setKeyEquivalent:@"\r"];
     [explanation_
@@ -1538,18 +2472,69 @@ GoldenEyeLauncherController* g_launcher = nil;
     return;
   }
 
-  [status_ setStringValue:@"Starting GoldenEye Metal…"];
+  std::string recovery_error;
+  if (safeMode && !ge::launch_recovery::BeginSafeMode(
+                      paths_.user_data_root, paths_.config_path, &recovery_error)) {
+    NSAlert* alert = [[[NSAlert alloc] init] autorelease];
+    [alert setAlertStyle:NSAlertStyleCritical];
+    [alert setMessageText:@"Safe Mode could not be prepared"];
+    [alert setInformativeText:ToNSString(std::string_view(recovery_error))];
+    [alert addButtonWithTitle:@"OK"];
+    [alert beginSheetModalForWindow:window_ completionHandler:nil];
+    [status_ setStringValue:@"No settings were changed. You can play normally or try again."];
+    return;
+  }
+  if (!ge::launch_recovery::BeginRun(paths_.user_data_root, &recovery_error)) {
+    if (safeMode) {
+      (void)ge::launch_recovery::CancelSafeMode(paths_.user_data_root, paths_.config_path);
+    }
+    NSAlert* alert = [[[NSAlert alloc] init] autorelease];
+    [alert setAlertStyle:NSAlertStyleCritical];
+    [alert setMessageText:@"Crash recovery could not be prepared"];
+    [alert setInformativeText:ToNSString(std::string_view(recovery_error))];
+    [alert addButtonWithTitle:@"OK"];
+    [alert beginSheetModalForWindow:window_ completionHandler:nil];
+    [status_ setStringValue:@"The game was not started. Your files were not changed."];
+    return;
+  }
+  if (safeMode) {
+    ApplySafeModeOverrides();
+  }
+
+  [status_ setStringValue:safeMode ? @"Starting GoldenEye Metal in Safe Mode…"
+                                      : @"Starting GoldenEye Metal…"];
   [window_ displayIfNeeded];
 
   auto resume = std::move(resume_);
   auto paths = paths_;
   resume(std::move(paths));
 
+  NSWindow* game_window = FindGameplayWindow(window_);
+  if (game_window) {
+    ArmCleanRunMarkerRemoval(game_window, paths_.user_data_root, paths_.config_path,
+                             safeMode == YES);
+  } else {
+    // A failed initialization intentionally leaves the marker behind so the
+    // next interactive launch offers recovery and diagnostics.
+    REXLOG_ERROR(
+        "GoldenEye gameplay window was not created; leaving recovery marker for next launch");
+  }
+
   [window_ orderOut:nil];
   [window_ setDelegate:nil];
   [window_ close];
   g_launcher = nil;
   [self release];
+}
+
+- (void)play:(id)sender {
+  (void)sender;
+  [self launchGameInSafeMode:NO];
+}
+
+- (void)safeMode:(id)sender {
+  (void)sender;
+  [self launchGameInSafeMode:YES];
 }
 
 - (void)beginImport:(std::filesystem::path)source {
@@ -1787,7 +2772,15 @@ GoldenEyeLauncherController* g_launcher = nil;
 
 - (void)quit:(id)sender {
   (void)sender;
+  if (save_window_ && [save_window_ isVisible]) {
+    [self closeSaveManager:nil];
+    return;
+  }
   if (busy_.load()) {
+    if (save_work_active_.load()) {
+      [status_ setStringValue:@"Please wait for the save operation to finish…"];
+      return;
+    }
     if (exporting_.load()) {
       [status_ setStringValue:@"Please wait for the diagnostic export to finish…"];
       return;
@@ -1801,8 +2794,24 @@ GoldenEyeLauncherController* g_launcher = nil;
 }
 
 - (BOOL)windowShouldClose:(NSWindow*)sender {
-  (void)sender;
+  if (sender == save_window_) {
+    if (save_work_active_.load() || busy_.load()) {
+      [save_status_ setStringValue:@"Please wait for the save operation to finish…"];
+      return NO;
+    }
+    [self closeSaveManager:nil];
+    return NO;
+  }
+  if (save_window_ && [save_window_ isVisible]) {
+    [save_status_ setStringValue:@"Close Save Management before quitting GoldenEye Metal."];
+    [save_window_ makeKeyAndOrderFront:nil];
+    return NO;
+  }
   if (busy_.load()) {
+    if (save_work_active_.load()) {
+      [status_ setStringValue:@"Please wait for the save operation to finish…"];
+      return NO;
+    }
     if (exporting_.load()) {
       [status_ setStringValue:@"Please wait for the diagnostic export to finish…"];
       return NO;
@@ -1821,6 +2830,9 @@ GoldenEyeLauncherController* g_launcher = nil;
 namespace ge {
 
 void ConfigureLauncherPaths(rex::PathConfig& paths) {
+  g_save_reconciliation_ok = true;
+  g_save_reconciliation_repaired = false;
+  g_save_reconciliation_warning.clear();
   auto support = ApplicationSupportRoot();
   if (REXCVAR_GET(user_data_root).empty()) {
     paths.user_data_root = support;
@@ -1832,7 +2844,24 @@ void ConfigureLauncherPaths(rex::PathConfig& paths) {
   std::error_code ec;
   std::filesystem::create_directories(paths.user_data_root, ec);
   if (!ec) {
+    // ReXApp loads config immediately after this hook returns. Restore the
+    // player's pre-Safe-Mode snapshot here so temporary one-run overrides can
+    // never become the input configuration for a later process.
+    g_startup_recovery =
+        launch_recovery::PrepareStartup(paths.user_data_root, paths.config_path);
+    const auto save_recovery = save::RecoverInterruptedTransaction(paths.user_data_root);
+    g_save_reconciliation_ok = static_cast<bool>(save_recovery);
+    g_save_reconciliation_repaired = save_recovery.recovered;
+    if (!save_recovery) {
+      g_save_reconciliation_warning = save_recovery.status.message;
+    }
     CleanupStaleImportArtifacts(paths.user_data_root);
+  } else {
+    g_startup_recovery.warning =
+        "Crash recovery could not access the private Application Support folder.";
+    g_save_reconciliation_ok = false;
+    g_save_reconciliation_warning =
+        "Save recovery could not access the private Application Support folder.";
   }
 }
 
@@ -1850,14 +2879,14 @@ std::optional<rex::PathConfig> PrepareLauncherPaths(const rex::PathConfig& defau
     } else {
       valid = game_data::ValidatePackage(paths.game_data_root).valid;
     }
-    if (valid && explicit_noninteractive) {
+    if (valid && explicit_noninteractive && g_save_reconciliation_ok) {
       return paths;
     }
     if (!valid || force_setup) {
       paths.game_data_root.clear();
     }
   }
-  if (explicit_noninteractive && paths.game_data_root.empty() &&
+  if (g_save_reconciliation_ok && explicit_noninteractive && paths.game_data_root.empty() &&
       (HasProcessArgument(@"--headless") ||
        (std::getenv("GOLDENEYE_LAUNCHER_BYPASS_UI") &&
         std::string_view(std::getenv("GOLDENEYE_LAUNCHER_BYPASS_UI")) == "1"))) {
@@ -1884,7 +2913,8 @@ std::optional<rex::PathConfig> PrepareLauncherPaths(const rex::PathConfig& defau
   }
   g_launcher = [[GoldenEyeLauncherController alloc] initWithPaths:paths
                                                            resume:std::move(resume)
-                                                       appContext:&app_context];
+                                                       appContext:&app_context
+                                                          recovery:g_startup_recovery];
   [g_launcher show];
   return std::nullopt;
 }

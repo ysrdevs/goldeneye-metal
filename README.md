@@ -41,9 +41,12 @@ The launcher verifies the supported game revision before importing it. Your file
 Mac: the app does not include, download, or upload game data. You can choose a different source
 from the launcher later.
 
-After a crash, reopen the launcher and choose **Export Diagnostic Bundle…**. Save the ZIP anywhere
-and send that one file with your report. It includes the relevant logs and matching macOS crash
-reports, while excluding game data, saves, cache, and settings.
+If a game session does not close cleanly, the launcher offers **Start in Safe Mode** for one run or
+**Play Normally**. You can also choose **Export Diagnostic Bundle…** and send the resulting ZIP
+with a report; it excludes game data, saves, cache, and settings.
+
+Choose **Manage Saves…** to create a portable `.gesave` backup, restore a backup, or reset local
+progress. Restore and reset preserve the previous data so the action can be undone immediately.
 
 The release is Developer ID signed, Apple-notarized, and stapled. See the
 [player guide](docs/PLAYER_GUIDE.md) for detailed controls, controller setup, import behavior, and
@@ -61,12 +64,14 @@ troubleshooting.
 | B / back | Shift |
 | Start | Return |
 | D-pad | Arrow keys |
+| Original / remastered graphics | F |
 | Host settings / release cursor | Escape |
 | Quit | Command-Q |
 
 Modern controllers work over USB or Bluetooth, including DualShock 4, DualSense, Xbox One, and
 Xbox Series X|S controllers. Controllers can be connected or removed while the game is running,
-and keyboard/mouse can remain active at the same time.
+and keyboard/mouse can remain active at the same time. The Controls page includes Modern,
+Classic, and Southpaw layouts plus per-button remapping.
 
 ## What this project is
 
@@ -90,9 +95,17 @@ Working today:
 
 - the classification, gun-barrel, RARE, menu, briefing, and first Dam gameplay sequences;
 - native Metal presentation on Apple Silicon;
-- native keyboard/mouse input and modern SDL gamepad support;
-- a local game-data importer, explicit Play launcher, and one-click diagnostic export;
-- an on-screen FPS counter and clean macOS window/menu quitting.
+- native keyboard/mouse input, modern gamepads, layout presets, and button remapping;
+- a local game-data importer, crash-aware Safe Mode, save management, true local-mission pause,
+  and diagnostic export;
+- live performance presets, MetalFX/Sharp output scaling, filtering, FXAA and colour controls;
+- optional FPS or detailed performance overlays and a diagnostics-ready 60-second report;
+- a guarded Testing page with all 14 verified retail runtime cheats and graphics-mode switching;
+- clean macOS window/menu quitting.
+
+Metal renders the game internally at its native **1280x720**. Bilinear, Sharp, and MetalFX Spatial
+can scale that image to the window or Retina display, but they do not increase the game's internal
+rendering resolution.
 
 Correct Dam captures have shown **46.5–60 FPS**, but this is not a claim of locked 60 FPS. The main
 work now is consistent performance across broader scenes, lower resolve/fence cost, physical

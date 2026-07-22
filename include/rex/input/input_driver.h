@@ -13,7 +13,7 @@
 #include <cstddef>
 #include <functional>
 
-#include <rex/input/input.h>
+#include <rex/input/controller.h>
 #include <rex/kernel.h>
 #include <rex/ui/window.h>
 
@@ -38,6 +38,23 @@ class InputDriver {
   virtual X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
                                 X_INPUT_KEYSTROKE* out_keystroke) = 0;
 
+  // Raw and tuned physical-controller state for host settings and diagnostics.
+  // This is deliberately separate from GetState so host UI remains usable
+  // while guest input is suppressed by a modal overlay.
+  virtual bool GetControllerSnapshot(uint32_t /*user_index*/,
+                                     ControllerSnapshot* out_snapshot) {
+    if (out_snapshot) {
+      *out_snapshot = {};
+    }
+    return false;
+  }
+
+  // A short host-initiated pulse used by controller setup UIs. Unlike guest
+  // SetState, it is permitted while modal host UI has disabled guest input.
+  virtual X_RESULT PlayControllerTestRumble(uint32_t /*user_index*/) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+
   virtual void OnWindowAvailable(rex::ui::Window* /*window*/) {}
   virtual void OnWindowUnavailable() {}
 
@@ -45,6 +62,22 @@ class InputDriver {
   // drivers only need the polling callback below; capture-based drivers can
   // use this notification to release platform state immediately.
   virtual void OnInputActiveChanged(bool /*active*/) {}
+
+  // Select whether mouse motion should emulate the guest right stick or be
+  // handled directly by the application. Keyboard and mouse buttons are
+  // unaffected.
+  virtual void SetMouseMotionMode(MouseMotionMode /*mode*/) {}
+
+  // Consume one paired sample when application mouse mode is active. Returns
+  // true while this driver owns application mouse input, including frames with
+  // no movement, so title hooks may still update their idle camera state.
+  virtual bool ConsumeApplicationMouseMotion(uint32_t /*user_index*/,
+                                             MouseMotionDelta* out_delta) {
+    if (out_delta) {
+      *out_delta = {};
+    }
+    return false;
+  }
 
   void set_is_active_callback(std::function<bool()> is_active_callback) {
     is_active_callback_ = is_active_callback;

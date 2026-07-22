@@ -15,6 +15,21 @@
 
 namespace rex::input {
 
+// How host mouse motion is exposed by keyboard/mouse input drivers. The
+// application mode leaves controller axes neutral so a title-specific native
+// mouse path can consume the same window events without double-applying them.
+enum class MouseMotionMode : uint8_t {
+  kRightStick,
+  kApplication,
+};
+
+// Paired relative host mouse motion. Keeping both axes in one value lets a
+// title consume one coherent sample instead of racing independent counters.
+struct MouseMotionDelta {
+  int32_t x = 0;
+  int32_t y = 0;
+};
+
 enum X_INPUT_CAPS {
   X_INPUT_CAPS_FFB_SUPPORTED = 0x0001,
   X_INPUT_CAPS_WIRELESS = 0x0002,

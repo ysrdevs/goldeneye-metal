@@ -40,6 +40,9 @@ class MnkInputDriver final : public InputDriver,
   void OnWindowAvailable(rex::ui::Window* window) override;
   void OnWindowUnavailable() override;
   void OnInputActiveChanged(bool active) override;
+  void SetMouseMotionMode(MouseMotionMode mode) override;
+  bool ConsumeApplicationMouseMotion(uint32_t user_index,
+                                     MouseMotionDelta* out_delta) override;
 
   // WindowInputListener
   void OnKeyDown(rex::ui::KeyEvent& e) override;
@@ -74,6 +77,7 @@ class MnkInputDriver final : public InputDriver,
   // Mouse delta tracking
   int32_t mouse_dx_ = 0;
   int32_t mouse_dy_ = 0;
+  MouseMotionMode mouse_motion_mode_ = MouseMotionMode::kRightStick;
   int32_t prev_mouse_x_ = 0;
   int32_t prev_mouse_y_ = 0;
   // Read and written only on the window UI thread. All common Window capture

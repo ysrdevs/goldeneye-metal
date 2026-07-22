@@ -42,6 +42,9 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) override;
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
                         X_INPUT_KEYSTROKE* out_keystroke) override;
+  bool GetControllerSnapshot(uint32_t user_index,
+                             ControllerSnapshot* out_snapshot) override;
+  X_RESULT PlayControllerTestRumble(uint32_t user_index) override;
   void OnWindowAvailable(rex::ui::Window* window) override;
   void OnWindowUnavailable() override;
   void OnInputActiveChanged(bool active) override;
@@ -51,8 +54,12 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
     SDL_Gamepad* sdl = nullptr;
     X_INPUT_CAPABILITIES caps = {};
     X_INPUT_STATE state = {};
+    X_INPUT_GAMEPAD last_configured_gamepad = {};
     bool state_changed = false;
+    bool configured_state_valid = false;
     bool is_active = true;
+    bool rumble_supported = false;
+    bool rumble_failure_logged = false;
   };
 
   enum class RepeatState {
@@ -86,6 +93,10 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void OpenUnassignedControllersLocked();
   void CompactControllerSlotsLocked();
   void RefreshControllerStateLocked(ControllerState& controller);
+  X_INPUT_GAMEPAD ApplyControllerTuning(const X_INPUT_GAMEPAD& gamepad) const;
+  X_RESULT SetRumbleLocked(ControllerState& controller, uint16_t left,
+                           uint16_t right, uint32_t duration_ms,
+                           bool host_test);
   void StopRumble();
   static bool SDLCALL EventWatch(void* userdata, SDL_Event* event);
 

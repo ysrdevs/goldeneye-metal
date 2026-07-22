@@ -15,7 +15,6 @@
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
-#include <rex/system/kernel_state.h>  // F1 debug pause
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
@@ -571,15 +570,6 @@ void Window::OnFileDrop(FileDropEvent& e, WindowDestructionReceiver& destruction
 }
 
 void Window::OnKeyDown(KeyEvent& e, WindowDestructionReceiver& destruction_receiver) {
-  // F1 = debug freeze-frame: toggle suspend of all guest threads (initial press
-  // only, ignore key-repeat). Handled before listeners so the game never sees it.
-  if (e.virtual_key() == VirtualKey::kF1 && !e.prev_state()) {
-    if (auto* ks = rex::system::kernel_state()) {
-      ks->ToggleGuestPause();
-    }
-    e.set_handled(true);
-    return;
-  }
   PropagateEventThroughInputListeners(
       [&e](auto listener) {
         listener->OnKeyDown(e);

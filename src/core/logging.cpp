@@ -12,12 +12,15 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cstdio>
 #include <filesystem>
 #include <mutex>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 #include <spdlog/async.h>
+#include <spdlog/details/log_msg.h>
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
@@ -391,6 +394,63 @@ std::shared_ptr<spdlog::logger> GetLogger(LogCategoryId category) {
 
 std::shared_ptr<spdlog::logger> GetLogger() {
   return GetLogger(rex::log::core());
+}
+
+void LogSynchronously(LogCategoryId category, spdlog::level::level_enum level,
+                      std::string_view message) noexcept {
+  bool wrote_to_sink = false;
+  bool wrote_to_file_sink = false;
+  bool file_sink_expected = false;
+  try {
+    bool needs_early_initialization = false;
+    {
+      std::lock_guard lock(g_mutex);
+      needs_early_initialization = !g_initialized && !g_early_initialized;
+    }
+    if (needs_early_initialization) {
+      InitLoggingEarly();
+    }
+
+    std::string category_name = "fatal";
+    std::vector<spdlog::sink_ptr> sinks;
+    spdlog::sink_ptr file_sink;
+    {
+      std::lock_guard lock(g_mutex);
+      if (category.id < g_registry.size() && g_registry[category.id].logger) {
+        category_name = g_registry[category.id].name;
+        sinks = g_registry[category.id].logger->sinks();
+      }
+      file_sink = g_file_sink;
+      file_sink_expected =
+          file_sink && std::find(sinks.begin(), sinks.end(), file_sink) != sinks.end();
+    }
+
+    const spdlog::details::log_msg record(category_name, level, message);
+    for (const auto& sink : sinks) {
+      if (!sink) {
+        continue;
+      }
+      try {
+        // Default and capture sinks are mutex-backed. Calling them directly
+        // serializes with the async worker, then makes the record durable
+        // before a terminal trap can end the process.
+        sink->log(record);
+        sink->flush();
+        wrote_to_sink = true;
+        if (sink == file_sink) {
+          wrote_to_file_sink = true;
+        }
+      } catch (...) {
+      }
+    }
+  } catch (...) {
+  }
+
+  if (!wrote_to_sink || (file_sink_expected && !wrote_to_file_sink)) {
+    std::fwrite(message.data(), 1, message.size(), stderr);
+    std::fputc('\n', stderr);
+    std::fflush(stderr);
+  }
 }
 
 void SetCategoryLevel(LogCategoryId category, spdlog::level::level_enum level) {

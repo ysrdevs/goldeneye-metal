@@ -58,6 +58,14 @@ identity, and basic system information. It never copies game data, saves,
 cache, raw configuration, or remembered paths, and sanitizes private paths and
 persistent crash identifiers before archiving.
 
+An interrupted game run is recorded with a private durable marker. On the next
+interactive launch, the player can start normally, export diagnostics, or use
+conservative one-run Safe Mode settings; the prior config is restored before a
+later normal config load. The launcher also exposes **Manage Saves…** for
+versioned `.gesave` backup, validated restore, reset, and immediate undo. Those
+operations are limited to the known GoldenEye save/profile layout and do not
+touch the imported Game Data, Cache, Logs, or launcher configuration.
+
 The import window exposes Cancel while work is active. Package extraction is
 bounded by size and time, game-file extraction checks cancellation between
 chunks, and atomic publication leaves an existing valid cache untouched on

@@ -16,10 +16,12 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <limits>
 #include <mutex>
 
-#include "ge_init.h"          // PPCRegister/PPCContext + generated function decls
-#include <rex/cvar.h>         // REXCVAR_* (mouse-look settings)
+#include "ge_init.h"   // PPCRegister/PPCContext + generated function decls
+#include <rex/cvar.h>  // REXCVAR_* (mouse-look settings)
+#include <rex/input/input_system.h>
 #include <rex/ui/keybinds.h>  // ParseVirtualKey (keyboard rebinding)
 #include <rex/ui/virtual_key.h>
 #include <rex/hook.h>  // ThreadState, kernel_state, memory
@@ -48,6 +50,10 @@
 #endif
 #include <string>
 #include <string_view>
+
+#include "ge_crash_guards.h"
+#include "ge_host_pause.h"
+#include "ge_testing_tools.h"
 
 namespace ge {
 // Relaunch this same executable as a fresh, detached process. Used by the ONLINE
@@ -1192,16 +1198,20 @@ REXCVAR_DEFINE_DOUBLE(ge_aim_turn_distance, 0.4, "Input",
     .range(0.0, 1.0);
 REXCVAR_DEFINE_BOOL(ge_gun_sway, true, "Input", "Gun sway as the camera turns");
 
+#if !defined(__APPLE__)
 REXCVAR_DEFINE_DOUBLE(ge_mouse_sens, 1.0, "Input", "Mouse look sensitivity").range(0.05, 20.0);
 // Mouse-look on/off. ON: the mouse looks (added on top of the pad -- both work
 // at once, so you can put the controller down) and the cursor is captured during
-// play. OFF: no mouse-look, cursor free, controller only.
+// play. OFF: no mouse-look, cursor free, controller only. macOS uses the common
+// MnK enable and sensitivity settings instead, avoiding duplicate controls.
 REXCVAR_DEFINE_BOOL(ge_mouselook_enable, true, "Input",
                     "Mouse look (works alongside the controller; captures the cursor in-game)");
+#endif
 
 namespace {
-std::atomic<int> g_mouse_dx{0};
-std::atomic<int> g_mouse_dy{0};
+std::mutex g_mouse_delta_mutex;
+int g_mouse_dx = 0;
+int g_mouse_dy = 0;
 std::atomic<bool> g_mouselook_suppressed{false};  // set true while the pause menu is open
 // True while the rebind menu is waiting for a key. We must swallow ALL game input
 // (keyboard injection AND the real controller) so the key being bound doesn't also
@@ -1217,7 +1227,11 @@ HCURSOR g_blank_cursor = nullptr;
 bool g_captured = false;
 
 bool ge_mouselook_on() {
+#if defined(__APPLE__)
+  return REXCVAR_QUERY(bool, mnk_mouse_enabled);
+#else
   return REXCVAR_GET(ge_mouselook_enable);
+#endif
 }
 
 bool ge_game_has_focus() {
@@ -1253,6 +1267,22 @@ HWND ge_game_window() {
 bool ge_mouse_active() {
   return ge_mouselook_on() && !g_mouselook_suppressed.load(std::memory_order_relaxed) &&
          ge_game_has_focus();
+}
+
+void ge_add_mouse_delta(int dx, int dy) {
+  std::lock_guard lock(g_mouse_delta_mutex);
+  g_mouse_dx = static_cast<int>(std::clamp(static_cast<int64_t>(g_mouse_dx) + dx,
+                                           static_cast<int64_t>(std::numeric_limits<int>::min()),
+                                           static_cast<int64_t>(std::numeric_limits<int>::max())));
+  g_mouse_dy = static_cast<int>(std::clamp(static_cast<int64_t>(g_mouse_dy) + dy,
+                                           static_cast<int64_t>(std::numeric_limits<int>::min()),
+                                           static_cast<int64_t>(std::numeric_limits<int>::max())));
+}
+
+void ge_clear_mouse_delta() {
+  std::lock_guard lock(g_mouse_delta_mutex);
+  g_mouse_dx = 0;
+  g_mouse_dy = 0;
 }
 
 #if defined(_WIN32)
@@ -1309,8 +1339,7 @@ LRESULT CALLBACK GeRawWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       // Only collect while active, so deltas don't queue while alt-tabbed/paused
       // and snap the view on return.
       if (ge_mouse_active()) {
-        g_mouse_dx.fetch_add(ri.data.mouse.lLastX, std::memory_order_relaxed);
-        g_mouse_dy.fetch_add(ri.data.mouse.lLastY, std::memory_order_relaxed);
+        ge_add_mouse_delta(ri.data.mouse.lLastX, ri.data.mouse.lLastY);
       }
     }
     return 0;
@@ -1371,11 +1400,12 @@ void ge_start_mouse_once() {
 #endif
 }
 
-int ge_take_mouse_dx() {
-  return g_mouse_dx.exchange(0, std::memory_order_relaxed);
-}
-int ge_take_mouse_dy() {
-  return g_mouse_dy.exchange(0, std::memory_order_relaxed);
+rex::input::MouseMotionDelta ge_take_mouse_delta() {
+  std::lock_guard lock(g_mouse_delta_mutex);
+  rex::input::MouseMotionDelta result{g_mouse_dx, g_mouse_dy};
+  g_mouse_dx = 0;
+  g_mouse_dy = 0;
+  return result;
 }
 }  // namespace
 
@@ -1383,8 +1413,10 @@ namespace ge {
 // Start the raw-mouse + cursor-capture thread once, at app startup, so capture
 // works regardless of whether the guest look hooks have fired yet.
 void InitMouseLook() {
+#if defined(_WIN32)
   REXKRNL_INFO("GEMOUSE InitMouseLook (enable={})", REXCVAR_GET(ge_mouselook_enable));
   ge_start_mouse_once();
+#endif
 }
 
 // Called by the app when the pause menu opens/closes so mouse motion isn't
@@ -1392,8 +1424,7 @@ void InitMouseLook() {
 void SetMouselookSuppressed(bool v) {
   g_mouselook_suppressed.store(v, std::memory_order_relaxed);
   if (v) {  // drop any queued motion so closing the menu doesn't snap the view
-    g_mouse_dx.store(0, std::memory_order_relaxed);
-    g_mouse_dy.store(0, std::memory_order_relaxed);
+    ge_clear_mouse_delta();
   } else {
     g_rebind_capturing.store(false, std::memory_order_relaxed);  // never stick on close
   }
@@ -1439,29 +1470,45 @@ enum GESettingFlag {
 };
 }  // namespace
 
-void ge_mouse_camera(uint8_t* base) {
+void ge_mouse_camera(uint8_t* base, rex::input::MouseMotionDelta mouse_delta) {
   // Persistent state (= GoldeneyeGame member vars in xenia).
   static uint32_t prev_pause = 0, prev_disabled = 0, prev_aim_mode = 0;
   static bool start_centering = false, disable_sway = false;
   static float centering_speed = 0.0125f;
 
+#if defined(__APPLE__)
+  // Preserve the sensitivity macOS users already configure in the native MnK
+  // controls while routing motion through the title's direct camera path.
+  const float sensitivity = static_cast<float>(REXCVAR_QUERY(double, mnk_sensitivity));
+#else
   const float sensitivity = static_cast<float>(REXCVAR_GET(ge_mouse_sens));
+#endif
   const float menu_sensitivity = static_cast<float>(REXCVAR_GET(ge_menu_sensitivity));
   const bool invert_x = REXCVAR_GET(ge_invert_x);
   const bool invert_y = REXCVAR_GET(ge_invert_y);
   const bool disable_autoaim = REXCVAR_GET(ge_disable_autoaim);
   const bool gun_sway = REXCVAR_GET(ge_gun_sway);
 
-  // Consume this frame's raw mouse delta once; used for both menu and camera.
-  const float mdx = static_cast<float>(ge_take_mouse_dx());
-  const float mdy = static_cast<float>(ge_take_mouse_dy());
+  // The paired sample has already been consumed once by the platform input
+  // owner; use it for both the game menu and camera in this guest frame.
+  const float mdx = static_cast<float>(mouse_delta.x);
+  const float mdy = static_cast<float>(mouse_delta.y);
 
   // Move the menu selection crosshair (the game's own menus read these).
   {
     float menuX = LDF32(base, GE_MENU_XY);
     float menuY = LDF32(base, GE_MENU_XY + 4);
+#if defined(__APPLE__)
+    // The menu cursor is already expressed in a 1280x720 logical coordinate
+    // space. Apply native macOS mouse distance directly; treating it as stick
+    // velocity is what made menus sluggish and nonlinear.
+    menuX += mdx * menu_sensitivity;
+    menuY += mdy * menu_sensitivity;
+#else
+    // Preserve the established Win32 raw-input calibration.
     menuX += (mdx / 5.f) * menu_sensitivity;
     menuY += (mdy / 5.f) * menu_sensitivity;
+#endif
     STF32(base, GE_MENU_XY, menuX);
     STF32(base, GE_MENU_XY + 4, menuY);
   }
@@ -1648,6 +1695,8 @@ void ge_mouse_camera(uint8_t* base) {
 // ===========================================================================
 namespace {
 constexpr uint32_t GE_PAD0 = 0x830C8B9Cu;  // unk_830C8B9C, slot-0 gamepad
+constexpr uint32_t GE_PAD_STRIDE = 16u;
+constexpr uint32_t GE_LOCAL_PAD_COUNT = 4u;
 
 // XInput button bits (match the masks the guest unpacks).
 constexpr uint16_t BTN_DPAD_UP = 0x0001, BTN_DPAD_DOWN = 0x0002, BTN_DPAD_LEFT = 0x0004,
@@ -1655,6 +1704,54 @@ constexpr uint16_t BTN_DPAD_UP = 0x0001, BTN_DPAD_DOWN = 0x0002, BTN_DPAD_LEFT =
                    BTN_LTHUMB = 0x0040, BTN_RTHUMB = 0x0080, BTN_LSHOULDER = 0x0100,
                    BTN_RSHOULDER = 0x0200, BTN_A = 0x1000, BTN_B = 0x2000, BTN_X = 0x4000,
                    BTN_Y = 0x8000;
+
+ge::host_pause::InputSample ge_physical_input_sample(uint32_t user_index) {
+  ge::host_pause::InputSample result;
+  auto* runtime = rex::Runtime::instance();
+  auto* input = runtime && runtime->input_system()
+                    ? static_cast<rex::input::InputSystem*>(runtime->input_system())
+                    : nullptr;
+  rex::input::ControllerSnapshot snapshot;
+  if (!input || !input->GetControllerSnapshot(user_index, &snapshot) || !snapshot.connected) {
+    return result;
+  }
+  result.buttons = static_cast<uint16_t>(snapshot.raw_gamepad.buttons);
+  result.left_trigger = snapshot.raw_gamepad.left_trigger;
+  result.right_trigger = snapshot.raw_gamepad.right_trigger;
+  result.thumb_lx = static_cast<int16_t>(snapshot.raw_gamepad.thumb_lx);
+  result.thumb_ly = static_cast<int16_t>(snapshot.raw_gamepad.thumb_ly);
+  result.thumb_rx = static_cast<int16_t>(snapshot.raw_gamepad.thumb_rx);
+  result.thumb_ry = static_cast<int16_t>(snapshot.raw_gamepad.thumb_ry);
+  return result;
+}
+
+void ge_clear_guest_pads(uint8_t* base) {
+  for (uint32_t user_index = 0; user_index < GE_LOCAL_PAD_COUNT; ++user_index) {
+    const uint32_t pad = GE_PAD0 + user_index * GE_PAD_STRIDE;
+    ST16(base, pad + 0, 0);
+    base[pad + 2] = 0;
+    base[pad + 3] = 0;
+    ST16(base, pad + 4, 0);
+    ST16(base, pad + 6, 0);
+    ST16(base, pad + 8, 0);
+    ST16(base, pad + 10, 0);
+  }
+}
+
+void ge_discard_mouse_motion() {
+#if defined(_WIN32)
+  (void)ge_take_mouse_delta();
+#elif defined(__APPLE__)
+  auto* runtime = rex::Runtime::instance();
+  auto* input = runtime && runtime->input_system()
+                    ? static_cast<rex::input::InputSystem*>(runtime->input_system())
+                    : nullptr;
+  rex::input::MouseMotionDelta discarded = {};
+  if (input) {
+    input->ConsumeApplicationMouseMotion(0, &discarded);
+  }
+#endif
+}
 
 bool ge_auto_start_pressed(const char* mode, uint32_t input_poll) {
   // Keep the existing startup hold intact. In periodic mode, follow it with
@@ -1903,11 +2000,87 @@ REXCVAR_DEFINE_STRING(ge_key_look_down, "", "Input/Keybinds", "Look down (right 
 REXCVAR_DEFINE_STRING(ge_key_look_left, "", "Input/Keybinds", "Look left (right stick left)");
 REXCVAR_DEFINE_STRING(ge_key_look_right, "", "Input/Keybinds", "Look right (right stick right)");
 
+ge::host_pause::InputSample ge_resume_input_sample(uint8_t* base) {
+  // Raw SDL state stays visible while host UI suppresses guest input. Merge it
+  // with the already-polled guest pad so keyboard/mouse emulation is covered as
+  // soon as it becomes active again.
+  ge::host_pause::InputSample result;
+  auto merge_axis = [](int16_t* destination, int16_t candidate) {
+    if (std::abs(static_cast<int>(candidate)) > std::abs(static_cast<int>(*destination))) {
+      *destination = candidate;
+    }
+  };
+  for (uint32_t user_index = 0; user_index < GE_LOCAL_PAD_COUNT; ++user_index) {
+    const ge::host_pause::InputSample physical = ge_physical_input_sample(user_index);
+    result.buttons |= physical.buttons;
+    result.left_trigger = std::max(result.left_trigger, physical.left_trigger);
+    result.right_trigger = std::max(result.right_trigger, physical.right_trigger);
+    merge_axis(&result.thumb_lx, physical.thumb_lx);
+    merge_axis(&result.thumb_ly, physical.thumb_ly);
+    merge_axis(&result.thumb_rx, physical.thumb_rx);
+    merge_axis(&result.thumb_ry, physical.thumb_ry);
+
+    const uint32_t pad = GE_PAD0 + user_index * GE_PAD_STRIDE;
+    result.buttons |= LD16(base, pad + 0);
+    result.left_trigger = std::max(result.left_trigger, base[pad + 2]);
+    result.right_trigger = std::max(result.right_trigger, base[pad + 3]);
+    merge_axis(&result.thumb_lx, static_cast<int16_t>(LD16(base, pad + 4)));
+    merge_axis(&result.thumb_ly, static_cast<int16_t>(LD16(base, pad + 6)));
+    merge_axis(&result.thumb_rx, static_cast<int16_t>(LD16(base, pad + 8)));
+    merge_axis(&result.thumb_ry, static_cast<int16_t>(LD16(base, pad + 10)));
+  }
+
+#if defined(_WIN32)
+  // Win32's title-specific keyboard path is injected below this transition
+  // gate, so sample its physical binds explicitly as well.
+  if (REXCVAR_GET(ge_keyboard_enable)) {
+    auto merge_button = [&](const char* cvar, uint16_t button) {
+      if (ge_key_down(cvar)) {
+        result.buttons |= button;
+      }
+    };
+    merge_button("ge_key_a", BTN_A);
+    merge_button("ge_key_b", BTN_B);
+    merge_button("ge_key_x", BTN_X);
+    merge_button("ge_key_y", BTN_Y);
+    merge_button("ge_key_lb", BTN_LSHOULDER);
+    merge_button("ge_key_rb", BTN_RSHOULDER);
+    merge_button("ge_key_l3", BTN_LTHUMB);
+    merge_button("ge_key_r3", BTN_RTHUMB);
+    merge_button("ge_key_dup", BTN_DPAD_UP);
+    merge_button("ge_key_ddown", BTN_DPAD_DOWN);
+    merge_button("ge_key_dleft", BTN_DPAD_LEFT);
+    merge_button("ge_key_dright", BTN_DPAD_RIGHT);
+    merge_button("ge_key_start", BTN_START);
+    merge_button("ge_key_back", BTN_BACK);
+    result.left_trigger = ge_key_down("ge_key_lt") ? UINT8_MAX : result.left_trigger;
+    result.right_trigger = ge_key_down("ge_key_rt") ? UINT8_MAX : result.right_trigger;
+    if (ge_key_down("ge_key_mv_left"))
+      result.thumb_lx = -INT16_MAX;
+    if (ge_key_down("ge_key_mv_right"))
+      result.thumb_lx = INT16_MAX;
+    if (ge_key_down("ge_key_mv_up"))
+      result.thumb_ly = INT16_MAX;
+    if (ge_key_down("ge_key_mv_down"))
+      result.thumb_ly = -INT16_MAX;
+    if (ge_key_down("ge_key_look_left"))
+      result.thumb_rx = -INT16_MAX;
+    if (ge_key_down("ge_key_look_right"))
+      result.thumb_rx = INT16_MAX;
+    if (ge_key_down("ge_key_look_up"))
+      result.thumb_ry = INT16_MAX;
+    if (ge_key_down("ge_key_look_down"))
+      result.thumb_ry = -INT16_MAX;
+  }
+#endif
+  return result;
+}
+
 // Runs once per controller poll, after XamInputGetState fills the slot-0 buffer
 // and before the guest dispatches it. OR our keyboard buttons in, and set the
 // left stick / triggers when their keys are held (pad input is preserved).
-void ge_mouse_camera(uint8_t* base);           // defined above
-void ge_apply_ce_data_patches(uint8_t* base);  // ge_ce_patches.cpp
+void ge_mouse_camera(uint8_t* base, rex::input::MouseMotionDelta mouse_delta);  // defined above
+void ge_apply_ce_data_patches(uint8_t* base);                                   // ge_ce_patches.cpp
 
 void ge_inject_keyboard(PPCRegister& /*r11*/) {
   PPCContext* ctx;
@@ -1925,28 +2098,54 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
     REXKRNL_INFO("GECE community data bug-fixes applied");
   }
 
-  // Rebind capture: the menu is listening for a key to bind. Swallow ALL slot-0
-  // controller input (buttons, triggers, both sticks) so the key/button being
+  // Host UI requests are consumed here because this hook runs on GoldenEye's
+  // game thread. The bridge preserves the live PPC register context around the
+  // verified retail routines it invokes.
+  const ge::host_pause::ProcessResult pause_result = ge::host_pause::ProcessGameThread(*ctx, base);
+  ge::testing::ProcessTestingToolRequests(*ctx, base);
+
+  // The host menu may close while a controller, mouse button or keyboard key is
+  // still held. Wait for complete neutral input, keep the final neutral poll
+  // swallowed, and discard mouse motion accumulated behind the transition.
+  // This runs only after the retail resume is acknowledged.
+  static ge::host_pause::ResumeInputLatch resume_input_latch;
+  if (pause_result.input_resume_pulse || resume_input_latch.active()) {
+    const ge::host_pause::InputSample physical_input = ge_resume_input_sample(base);
+    if (pause_result.input_resume_pulse) {
+      resume_input_latch.Arm(physical_input);
+    }
+    if (resume_input_latch.ShouldSuppress(physical_input)) {
+      ge_clear_guest_pads(base);
+      ge_discard_mouse_motion();
+      return;
+    }
+  }
+
+  // Rebind capture: the menu is listening for a key to bind. Swallow every
+  // local controller slot (buttons, triggers, both sticks) so the key/button being
   // bound doesn't also drive the game, and skip keyboard injection + mouse-look.
   if (g_rebind_capturing.load(std::memory_order_relaxed)) {
-    ST16(base, GE_PAD0 + 0, 0);   // buttons
-    base[GE_PAD0 + 2] = 0;        // LT
-    base[GE_PAD0 + 3] = 0;        // RT
-    ST16(base, GE_PAD0 + 4, 0);   // LX
-    ST16(base, GE_PAD0 + 6, 0);   // LY
-    ST16(base, GE_PAD0 + 8, 0);   // RX
-    ST16(base, GE_PAD0 + 10, 0);  // RY
+    ge_clear_guest_pads(base);
     return;
   }
 
-  // The direct guest-memory mouse hook is backed by Win32 raw input. macOS uses
-  // the native common MnK driver to feed the guest right stick instead; running
-  // this hook there with zero raw deltas would still alter auto-aim and gun
-  // state.
+  // Windows submits raw input directly. GoldenEye's macOS app submits native
+  // relative window events and tells the common MnK driver not to duplicate
+  // that motion as a guest right-stick pulse.
 #if defined(_WIN32)
   ge_start_mouse_once();
-  if (REXCVAR_GET(ge_mouselook_enable))
-    ge_mouse_camera(base);
+  if (ge_mouse_active())
+    ge_mouse_camera(base, ge_take_mouse_delta());
+#elif defined(__APPLE__)
+  rex::input::MouseMotionDelta mouse_delta = {};
+  auto* runtime = rex::Runtime::instance();
+  auto* input = runtime && runtime->input_system()
+                    ? static_cast<rex::input::InputSystem*>(runtime->input_system())
+                    : nullptr;
+  if (input && input->ConsumeApplicationMouseMotion(0, &mouse_delta) &&
+      !g_mouselook_suppressed.load(std::memory_order_relaxed)) {
+    ge_mouse_camera(base, mouse_delta);
+  }
 #endif
 
   static std::atomic<uint32_t> auto_start_poll{0};
@@ -2137,6 +2336,30 @@ bool ge_recover_packed_data_load(uint32_t load_site, uint32_t callback_result,
   }
   return true;
 }
+
+bool ge_recover_packed_data_purecall(uint32_t call_site, uint32_t callback_target,
+                                     uint32_t stream_offset, uint32_t owner, uint32_t guest_sp,
+                                     std::atomic<uint64_t>& hits, PPCRegister& result) {
+  if (!ge::crash_guards::RecoverPackedDataPureVirtualDispatch(callback_target, result.u64)) {
+    return false;
+  }
+
+  // A resource whose vtable+16 slot has become _purecall is already being
+  // destroyed or is otherwise unavailable. This accessor already defines zero
+  // as "no packed data", so return that value before the title enters its CRT
+  // termination path. The configured hook jumps through the original epilogue.
+  const uint64_t hit = hits.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (ge_should_log_sparse_recovery(hit)) {
+    REXKRNL_WARN(
+        "[GE-GUARD-823DFB70-purecall-v1] recovered site=0x{:08X} hit={} "
+        "owner=0x{:08X} callback=0x{:08X} stream_offset=0x{:08X} guest_sp=0x{:08X}",
+        call_site, hit, owner, callback_target, stream_offset, guest_sp);
+    if (auto* logger = rex::GetLoggerRaw(rex::log::krnl())) {
+      logger->flush();
+    }
+  }
+  return true;
+}
 }  // namespace
 
 // sub_823CFC00 walks two intrusive cleanup lists while holding the owner's
@@ -2208,6 +2431,22 @@ void ge_cleanup_callback_leave(PPCRegister& r1, PPCRegister& r26, PPCRegister& r
   if (auto* logger = rex::GetLoggerRaw(rex::log::krnl())) {
     logger->flush();
   }
+}
+
+// Guard both vtable+16 calls before dispatch. A purecall target here means this
+// packed-data resource has reached a base/destructed state. Returning the
+// accessor's existing empty value is safe; intercepting _purecall globally is
+// deliberately avoided.
+bool ge_skip_packed_data_purecall_header(PPCRegister& r11, PPCRegister& r3, PPCRegister& r31,
+                                         PPCRegister& r1) {
+  static std::atomic<uint64_t> hits{0};
+  return ge_recover_packed_data_purecall(0x823DFBA8u, r11.u32, 0, r31.u32, r1.u32, hits, r3);
+}
+
+bool ge_skip_packed_data_purecall_value(PPCRegister& r11, PPCRegister& r3, PPCRegister& r30,
+                                        PPCRegister& r31, PPCRegister& r1) {
+  static std::atomic<uint64_t> hits{0};
+  return ge_recover_packed_data_purecall(0x823DFBD0u, r11.u32, r30.u32, r31.u32, r1.u32, hits, r3);
 }
 
 // First packed-data callback load: lbz r11,2(r3) at 0x823DFBAC.

@@ -3,10 +3,17 @@
 #import <Metal/Metal.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fcntl.h>
+#include <system_error>
 #include <unordered_map>
+#include <unistd.h>
 #include <utility>
 
 namespace rex::graphics::metal {
@@ -351,6 +358,276 @@ void ReleaseOwnedProbeTextures(std::vector<id<MTLTexture>>& textures,
 
 }  // namespace
 
+namespace {
+
+constexpr uintmax_t kMaximumPipelineArchiveBytes = uintmax_t(128) * 1024 * 1024;
+
+uint64_t PipelineCacheNowNs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
+
+NSString* PathToNSString(const std::filesystem::path& path) {
+  const std::string path_utf8 = path.string();
+  return [NSString stringWithUTF8String:path_utf8.c_str()];
+}
+
+std::string NSErrorDescription(NSError* error, const char* fallback) {
+  if (!error) {
+    return fallback;
+  }
+  NSString* description = [error localizedDescription];
+  return description ? std::string([description UTF8String]) : fallback;
+}
+
+bool FsyncPath(const std::filesystem::path& path, std::string* error_out) {
+  int descriptor = open(path.c_str(), O_RDONLY);
+  if (descriptor < 0) {
+    if (error_out) {
+      *error_out = "open for fsync failed: " + std::string(std::strerror(errno));
+    }
+    return false;
+  }
+  bool succeeded = fsync(descriptor) == 0;
+  int saved_errno = errno;
+  close(descriptor);
+  if (!succeeded && error_out) {
+    *error_out = "fsync failed: " + std::string(std::strerror(saved_errno));
+  }
+  return succeeded;
+}
+
+}  // namespace
+
+uint64_t GetMetalDeviceCacheKey(void* metal_device) {
+  if (!metal_device) {
+    return 0;
+  }
+  id<MTLDevice> device = (id<MTLDevice>)metal_device;
+  uint64_t registry_id = uint64_t([device registryID]);
+  if (registry_id) {
+    return registry_id;
+  }
+
+  // registryID is available on every supported macOS release, but retain a
+  // deterministic fallback for unusual virtual/test devices.
+  constexpr uint64_t kFnvOffset = UINT64_C(14695981039346656037);
+  constexpr uint64_t kFnvPrime = UINT64_C(1099511628211);
+  uint64_t hash = kFnvOffset;
+  const char* name = [[device name] UTF8String];
+  if (name) {
+    for (const unsigned char* character = reinterpret_cast<const unsigned char*>(name); *character;
+         ++character) {
+      hash ^= *character;
+      hash *= kFnvPrime;
+    }
+  }
+  return hash;
+}
+
+void* CreateMetalPipelineBinaryArchive(void* metal_device,
+                                       const std::filesystem::path& archive_path,
+                                       bool* loaded_existing_out,
+                                       std::string* warning_or_error_out) {
+  if (loaded_existing_out) {
+    *loaded_existing_out = false;
+  }
+  if (warning_or_error_out) {
+    warning_or_error_out->clear();
+  }
+  if (!metal_device || archive_path.empty()) {
+    if (warning_or_error_out) {
+      *warning_or_error_out = "missing Metal device or archive path";
+    }
+    return nullptr;
+  }
+
+  std::error_code filesystem_error;
+  const bool archive_exists = std::filesystem::exists(archive_path, filesystem_error);
+  bool load_existing = false;
+  if (filesystem_error) {
+    if (warning_or_error_out) {
+      *warning_or_error_out = "could not inspect existing Metal pipeline archive";
+    }
+  } else if (archive_exists) {
+    load_existing = std::filesystem::is_regular_file(archive_path, filesystem_error);
+    if (filesystem_error || !load_existing) {
+      if (warning_or_error_out) {
+        *warning_or_error_out = filesystem_error
+                                    ? "could not inspect existing Metal pipeline archive"
+                                    : "existing Metal pipeline archive is not a regular file; "
+                                      "creating a fresh archive";
+      }
+      load_existing = false;
+    }
+  }
+  if (load_existing) {
+    uintmax_t archive_size = std::filesystem::file_size(archive_path, filesystem_error);
+    if (filesystem_error || archive_size == 0 || archive_size > kMaximumPipelineArchiveBytes) {
+      load_existing = false;
+      if (warning_or_error_out) {
+        *warning_or_error_out =
+            filesystem_error
+                ? "could not inspect existing Metal pipeline archive"
+                : archive_size == 0
+                      ? "existing Metal pipeline archive is empty; creating a fresh archive"
+                      : "existing Metal pipeline archive exceeds the 128 MiB safety limit; "
+                        "creating a fresh archive";
+      }
+    }
+  }
+
+  MTLBinaryArchiveDescriptor* descriptor = [[MTLBinaryArchiveDescriptor alloc] init];
+  id<MTLBinaryArchive> archive = nil;
+  if (load_existing) {
+    NSString* archive_path_string = PathToNSString(archive_path);
+    if (archive_path_string) {
+      descriptor.url = [NSURL fileURLWithPath:archive_path_string];
+      NSError* load_error = nil;
+      archive = [(id<MTLDevice>)metal_device newBinaryArchiveWithDescriptor:descriptor
+                                                                      error:&load_error];
+      if (!archive && warning_or_error_out) {
+        *warning_or_error_out =
+            "existing Metal pipeline archive was rejected; creating a fresh archive: " +
+            NSErrorDescription(load_error, "unknown Metal archive load error");
+      }
+    }
+  }
+
+  if (!archive) {
+    descriptor.url = nil;
+    NSError* create_error = nil;
+    archive = [(id<MTLDevice>)metal_device newBinaryArchiveWithDescriptor:descriptor
+                                                                    error:&create_error];
+    if (!archive && warning_or_error_out) {
+      *warning_or_error_out =
+          "could not create Metal pipeline archive: " +
+          NSErrorDescription(create_error, "unknown Metal archive creation error");
+    }
+  } else if (loaded_existing_out) {
+    *loaded_existing_out = true;
+  }
+  [descriptor release];
+
+  if (archive) {
+    [archive setLabel:@"ReXGlue title pipeline cache"];
+  }
+  return archive;
+}
+
+bool SerializeMetalPipelineBinaryArchive(void* binary_archive,
+                                         const std::filesystem::path& archive_path,
+                                         uint64_t* serialized_size_out,
+                                         std::string* error_out) {
+  if (serialized_size_out) {
+    *serialized_size_out = 0;
+  }
+  if (error_out) {
+    error_out->clear();
+  }
+  if (!binary_archive || archive_path.empty()) {
+    if (error_out) {
+      *error_out = "missing Metal pipeline archive or destination path";
+    }
+    return false;
+  }
+
+  std::error_code filesystem_error;
+  std::filesystem::create_directories(archive_path.parent_path(), filesystem_error);
+  if (filesystem_error) {
+    if (error_out) {
+      *error_out = "could not create Metal pipeline cache directory: " +
+                   filesystem_error.message();
+    }
+    return false;
+  }
+
+  static std::atomic<uint64_t> temporary_file_sequence{0};
+  std::filesystem::path temporary_path = archive_path;
+  temporary_path += ".tmp-" + std::to_string(uint64_t(getpid())) + "-" +
+                    std::to_string(temporary_file_sequence.fetch_add(1));
+  std::filesystem::remove(temporary_path, filesystem_error);
+  filesystem_error.clear();
+
+  // This path also runs on the background cache worker. Give temporary
+  // Foundation and Metal objects an explicit lifetime on non-AppKit threads.
+  bool serialized = false;
+  std::string objective_c_error;
+  @autoreleasepool {
+    NSString* temporary_path_string = PathToNSString(temporary_path);
+    if (!temporary_path_string) {
+      objective_c_error = "Metal pipeline cache path is not valid UTF-8";
+    } else {
+      NSError* serialize_error = nil;
+      serialized = [(id<MTLBinaryArchive>)binary_archive
+          serializeToURL:[NSURL fileURLWithPath:temporary_path_string]
+                   error:&serialize_error];
+      if (!serialized) {
+        objective_c_error =
+            NSErrorDescription(serialize_error, "unknown Metal archive serialization error");
+      }
+    }
+  }
+  if (!serialized) {
+    if (error_out) {
+      *error_out = std::move(objective_c_error);
+    }
+    std::filesystem::remove(temporary_path, filesystem_error);
+    return false;
+  }
+
+  uintmax_t temporary_size = std::filesystem::file_size(temporary_path, filesystem_error);
+  if (filesystem_error || temporary_size == 0 ||
+      temporary_size > kMaximumPipelineArchiveBytes) {
+    if (error_out) {
+      *error_out = filesystem_error
+                       ? "could not inspect serialized Metal pipeline archive"
+                       : temporary_size == 0
+                             ? "Metal serialized an empty pipeline archive"
+                             : "serialized Metal pipeline archive exceeds the 128 MiB safety limit";
+    }
+    std::filesystem::remove(temporary_path, filesystem_error);
+    return false;
+  }
+
+  if (!FsyncPath(temporary_path, error_out)) {
+    std::filesystem::remove(temporary_path, filesystem_error);
+    return false;
+  }
+
+  // POSIX rename within one directory atomically replaces the old archive, so
+  // interruption can leave either the previous complete file or the new one,
+  // never a partially serialized destination.
+  if (rename(temporary_path.c_str(), archive_path.c_str()) != 0) {
+    if (error_out) {
+      *error_out = "atomic Metal pipeline archive replacement failed: " +
+                   std::string(std::strerror(errno));
+    }
+    std::filesystem::remove(temporary_path, filesystem_error);
+    return false;
+  }
+
+  // Best effort: the file itself is durable already. Syncing the directory
+  // also persists the rename across a sudden power loss on filesystems that
+  // require it.
+  int directory_descriptor = open(archive_path.parent_path().c_str(), O_RDONLY);
+  if (directory_descriptor >= 0) {
+    fsync(directory_descriptor);
+    close(directory_descriptor);
+  }
+  if (serialized_size_out) {
+    *serialized_size_out = uint64_t(temporary_size);
+  }
+  return true;
+}
+
+void ReleaseMetalPipelineBinaryArchive(void* binary_archive) {
+  if (binary_archive) {
+    [(id<MTLBinaryArchive>)binary_archive release];
+  }
+}
+
 void* CreateMslLibrary(void* metal_device, const std::string& source, std::string* error_out) {
   if (!metal_device || source.empty()) {
     if (error_out) {
@@ -391,7 +668,13 @@ bool ValidateMslSource(void* metal_device, const std::string& source, std::strin
 
 void* CreateRenderPipelineState(void* metal_device, void* vertex_library, void* fragment_library,
                                 std::string* error_out,
-                                const ProbeColorTargetState* color_target_state) {
+                                const ProbeColorTargetState* color_target_state,
+                                void* binary_archive,
+                                RenderPipelineCacheTelemetry* cache_telemetry_out) {
+  RenderPipelineCacheTelemetry cache_telemetry;
+  if (cache_telemetry_out) {
+    *cache_telemetry_out = {};
+  }
   if (!metal_device || !vertex_library || !fragment_library) {
     if (error_out) {
       *error_out = "missing Metal device or shader library";
@@ -458,11 +741,61 @@ void* CreateRenderPipelineState(void* metal_device, void* vertex_library, void* 
   }
 
   NSError* error = nil;
-  id<MTLRenderPipelineState> pipeline_state =
-      [(id<MTLDevice>)metal_device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+  id<MTLRenderPipelineState> pipeline_state = nil;
+  if (binary_archive) {
+    cache_telemetry.archive_enabled = true;
+    descriptor.binaryArchives = @[(id<MTLBinaryArchive>)binary_archive];
+
+    uint64_t lookup_start_ns = PipelineCacheNowNs();
+    pipeline_state = [(id<MTLDevice>)metal_device
+        newRenderPipelineStateWithDescriptor:descriptor
+                                     options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                  reflection:nil
+                                       error:&error];
+    cache_telemetry.archive_lookup_ns = PipelineCacheNowNs() - lookup_start_ns;
+    if (pipeline_state) {
+      cache_telemetry.archive_hit = true;
+      cache_telemetry.pipeline_build_ns = cache_telemetry.archive_lookup_ns;
+    } else {
+      cache_telemetry.archive_miss = true;
+      NSError* archive_add_error = nil;
+      uint64_t archive_add_start_ns = PipelineCacheNowNs();
+      bool archive_add_succeeded = [(id<MTLBinaryArchive>)binary_archive
+          addRenderPipelineFunctionsWithDescriptor:descriptor
+                                             error:&archive_add_error];
+      cache_telemetry.archive_add_ns = PipelineCacheNowNs() - archive_add_start_ns;
+      if (!archive_add_succeeded) {
+        cache_telemetry.archive_update_failed = true;
+        cache_telemetry.archive_error =
+            NSErrorDescription(archive_add_error, "unknown Metal archive update error");
+      }
+
+      // A miss or an outdated archive must never affect correctness. Compile
+      // through Metal's normal path, still attaching the archive so functions
+      // successfully added above can be reused immediately.
+      error = nil;
+      uint64_t build_start_ns = PipelineCacheNowNs();
+      pipeline_state = [(id<MTLDevice>)metal_device
+          newRenderPipelineStateWithDescriptor:descriptor
+                                       options:MTLPipelineOptionNone
+                                    reflection:nil
+                                         error:&error];
+      cache_telemetry.pipeline_build_ns = PipelineCacheNowNs() - build_start_ns;
+      cache_telemetry.archive_updated = archive_add_succeeded && pipeline_state;
+    }
+  } else {
+    uint64_t build_start_ns = PipelineCacheNowNs();
+    pipeline_state =
+        [(id<MTLDevice>)metal_device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+    cache_telemetry.pipeline_build_ns = PipelineCacheNowNs() - build_start_ns;
+  }
   [descriptor release];
   [vertex_function release];
   [fragment_function release];
+
+  if (cache_telemetry_out) {
+    *cache_telemetry_out = std::move(cache_telemetry);
+  }
 
   if (!pipeline_state) {
     if (error_out) {
@@ -966,13 +1299,6 @@ bool EnsureDummyProbeResources(PipelineProbeContext* context, std::string* error
     *error_out = "failed to create persistent probe fallback texture or sampler";
   }
   return false;
-}
-
-uint64_t GetProbeSamplerKey(const ProbeSamplerSlot& slot) {
-  return uint64_t(slot.min_linear) | (uint64_t(slot.mag_linear) << 8) |
-         (uint64_t(slot.mip_linear) << 16) | (uint64_t(slot.address_mode_s) << 24) |
-         (uint64_t(slot.address_mode_t) << 32) | (uint64_t(slot.address_mode_r) << 40) |
-         (uint64_t(slot.max_anisotropy) << 48);
 }
 
 void CreateCachedProbeSamplers(PipelineProbeContext* context, const ProbeSamplerSlot* slots,
