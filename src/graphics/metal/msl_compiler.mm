@@ -226,9 +226,11 @@ MTLBlendOperation GetMetalBlendOperation(uint32_t operation) {
   }
 }
 
-id<MTLTexture> CreateProbeTexture(id<MTLDevice> device, const ProbeTextureSlot& slot) {
+id<MTLTexture> CreateProbeTexture(id<MTLDevice> device, const ProbeTextureSlot& slot,
+                                  bool retain_external) {
   if (slot.metal_texture) {
-    return [(id<MTLTexture>)slot.metal_texture retain];
+    id<MTLTexture> texture = (id<MTLTexture>)slot.metal_texture;
+    return retain_external ? [texture retain] : texture;
   }
   if (!slot.rgba || !slot.width || !slot.height || !slot.bytes_per_row) {
     return nil;
@@ -262,24 +264,26 @@ id<MTLTexture> CreateProbeTexture(id<MTLDevice> device, const ProbeTextureSlot& 
 }
 
 void CreateProbeTextures(id<MTLDevice> device, const ProbeTextureSlot* slots, size_t slot_count,
-                         id<MTLTexture> fallback_texture,
-                         std::vector<id<MTLTexture>>& textures_out) {
+                         id<MTLTexture> fallback_texture, std::vector<id<MTLTexture>>& textures_out,
+                         bool retain_external = true) {
   textures_out.clear();
   textures_out.reserve(slot_count);
   for (size_t i = 0; i < slot_count; ++i) {
-    id<MTLTexture> texture = slots ? CreateProbeTexture(device, slots[i]) : nil;
+    id<MTLTexture> texture = slots ? CreateProbeTexture(device, slots[i], retain_external) : nil;
     textures_out.push_back(texture ? texture : fallback_texture);
   }
 }
 
 void BindProbeTextures(id<MTLRenderCommandEncoder> encoder,
                        const std::vector<id<MTLTexture>>& textures, bool vertex_stage) {
-  for (NSUInteger i = 0; i < textures.size(); ++i) {
-    if (vertex_stage) {
-      [encoder setVertexTexture:textures[i] atIndex:i];
-    } else {
-      [encoder setFragmentTexture:textures[i] atIndex:i];
-    }
+  if (textures.empty()) {
+    return;
+  }
+  NSRange range = NSMakeRange(0, textures.size());
+  if (vertex_stage) {
+    [encoder setVertexTextures:textures.data() withRange:range];
+  } else {
+    [encoder setFragmentTextures:textures.data() withRange:range];
   }
 }
 
@@ -327,12 +331,14 @@ void CreateProbeSamplers(id<MTLDevice> device, const ProbeSamplerSlot* slots, si
 
 void BindProbeSamplers(id<MTLRenderCommandEncoder> encoder,
                        const std::vector<id<MTLSamplerState>>& samplers, bool vertex_stage) {
-  for (NSUInteger i = 0; i < samplers.size(); ++i) {
-    if (vertex_stage) {
-      [encoder setVertexSamplerState:samplers[i] atIndex:i];
-    } else {
-      [encoder setFragmentSamplerState:samplers[i] atIndex:i];
-    }
+  if (samplers.empty()) {
+    return;
+  }
+  NSRange range = NSMakeRange(0, samplers.size());
+  if (vertex_stage) {
+    [encoder setVertexSamplerStates:samplers.data() withRange:range];
+  } else {
+    [encoder setFragmentSamplerStates:samplers.data() withRange:range];
   }
 }
 
@@ -347,9 +353,12 @@ void ReleaseOwnedProbeSamplers(std::vector<id<MTLSamplerState>>& samplers,
 }
 
 void ReleaseOwnedProbeTextures(std::vector<id<MTLTexture>>& textures,
-                               id<MTLTexture> fallback_texture) {
-  for (id<MTLTexture> texture : textures) {
-    if (texture && texture != fallback_texture) {
+                               id<MTLTexture> fallback_texture,
+                               const ProbeTextureSlot* borrowed_slots = nullptr) {
+  for (size_t i = 0; i < textures.size(); ++i) {
+    id<MTLTexture> texture = textures[i];
+    bool borrowed = borrowed_slots && borrowed_slots[i].metal_texture;
+    if (texture && texture != fallback_texture && !borrowed) {
       [texture release];
     }
   }
@@ -1771,26 +1780,69 @@ bool EnsureOpenPipelineProbeEncoder(PipelineProbeContext* context, std::string* 
 
 void ClearTrackedOpenProbeBindings(PipelineProbeContext* context) {
   id<MTLRenderCommandEncoder> encoder = context->open_render_encoder;
-  for (uint32_t index = 0; index < 32; ++index) {
-    uint32_t bit = uint32_t(1) << index;
-    if (context->tracked_vertex_buffer_mask & bit) {
-      [encoder setVertexBuffer:nil offset:0 atIndex:index];
+  static id<MTLBuffer> const kNilBuffers[32] = {};
+  static NSUInteger const kZeroBufferOffsets[32] = {};
+  static id<MTLTexture> const kNilTextures[128] = {};
+  static id<MTLSamplerState> const kNilSamplers[16] = {};
+  auto buffer_range_count = [](uint32_t mask) {
+    NSUInteger count = 0;
+    while (mask) {
+      ++count;
+      mask >>= 1;
     }
-    if (context->tracked_fragment_buffer_mask & bit) {
-      [encoder setFragmentBuffer:nil offset:0 atIndex:index];
+    return count;
+  };
+  NSUInteger vertex_buffer_count = buffer_range_count(context->tracked_vertex_buffer_mask);
+  if (vertex_buffer_count) {
+    [encoder setVertexBuffers:kNilBuffers
+                      offsets:kZeroBufferOffsets
+                    withRange:NSMakeRange(0, vertex_buffer_count)];
+  }
+  NSUInteger fragment_buffer_count = buffer_range_count(context->tracked_fragment_buffer_mask);
+  if (fragment_buffer_count) {
+    [encoder setFragmentBuffers:kNilBuffers
+                        offsets:kZeroBufferOffsets
+                      withRange:NSMakeRange(0, fragment_buffer_count)];
+  }
+  if (context->tracked_vertex_texture_count) {
+    if (context->tracked_vertex_texture_count <= 128) {
+      [encoder setVertexTextures:kNilTextures
+                       withRange:NSMakeRange(0, context->tracked_vertex_texture_count)];
+    } else {
+      for (NSUInteger index = 0; index < context->tracked_vertex_texture_count; ++index) {
+        [encoder setVertexTexture:nil atIndex:index];
+      }
     }
   }
-  for (NSUInteger index = 0; index < context->tracked_vertex_texture_count; ++index) {
-    [encoder setVertexTexture:nil atIndex:index];
+  if (context->tracked_fragment_texture_count) {
+    if (context->tracked_fragment_texture_count <= 128) {
+      [encoder setFragmentTextures:kNilTextures
+                         withRange:NSMakeRange(0, context->tracked_fragment_texture_count)];
+    } else {
+      for (NSUInteger index = 0; index < context->tracked_fragment_texture_count; ++index) {
+        [encoder setFragmentTexture:nil atIndex:index];
+      }
+    }
   }
-  for (NSUInteger index = 0; index < context->tracked_fragment_texture_count; ++index) {
-    [encoder setFragmentTexture:nil atIndex:index];
+  if (context->tracked_vertex_sampler_count) {
+    if (context->tracked_vertex_sampler_count <= 16) {
+      [encoder setVertexSamplerStates:kNilSamplers
+                            withRange:NSMakeRange(0, context->tracked_vertex_sampler_count)];
+    } else {
+      for (NSUInteger index = 0; index < context->tracked_vertex_sampler_count; ++index) {
+        [encoder setVertexSamplerState:nil atIndex:index];
+      }
+    }
   }
-  for (NSUInteger index = 0; index < context->tracked_vertex_sampler_count; ++index) {
-    [encoder setVertexSamplerState:nil atIndex:index];
-  }
-  for (NSUInteger index = 0; index < context->tracked_fragment_sampler_count; ++index) {
-    [encoder setFragmentSamplerState:nil atIndex:index];
+  if (context->tracked_fragment_sampler_count) {
+    if (context->tracked_fragment_sampler_count <= 16) {
+      [encoder setFragmentSamplerStates:kNilSamplers
+                              withRange:NSMakeRange(0, context->tracked_fragment_sampler_count)];
+    } else {
+      for (NSUInteger index = 0; index < context->tracked_fragment_sampler_count; ++index) {
+        [encoder setFragmentSamplerState:nil atIndex:index];
+      }
+    }
   }
   ResetOpenProbeBindingTracking(context);
 }
@@ -2792,13 +2844,11 @@ bool RenderPipelineProbeToContext(
       vertex_data_buffer = UploadProbeDrawData(context, vertex_data, vertex_data_size, error_out);
     }
     ProbeUploadAllocation uploaded_index_buffer;
-    id<MTLBuffer> external_index_buffer = nil;
     id<MTLBuffer> index_buffer_object = nil;
     NSUInteger index_buffer_offset = 0;
     if (index_buffer) {
       if (index_buffer->metal_buffer) {
-        external_index_buffer = [(id<MTLBuffer>)index_buffer->metal_buffer retain];
-        index_buffer_object = external_index_buffer;
+        index_buffer_object = (id<MTLBuffer>)index_buffer->metal_buffer;
         index_buffer_offset = NSUInteger(index_buffer->offset);
       } else {
         uploaded_index_buffer =
@@ -2808,13 +2858,15 @@ bool RenderPipelineProbeToContext(
       }
     }
     id<MTLBuffer> shared_memory_buffer = nil;
+    bool owns_shared_memory_buffer = false;
     if (shared_memory_metal_buffer) {
-      shared_memory_buffer = [(id<MTLBuffer>)shared_memory_metal_buffer retain];
+      shared_memory_buffer = (id<MTLBuffer>)shared_memory_metal_buffer;
     } else if (shared_memory && shared_memory_size) {
       shared_memory_buffer = [device newBufferWithBytesNoCopy:shared_memory
                                                        length:shared_memory_size
                                                       options:MTLResourceStorageModeShared
                                                   deallocator:nil];
+      owns_shared_memory_buffer = shared_memory_buffer != nil;
     }
     bool missing_argument_buffer =
         !system_buffer.buffer ||
@@ -2830,10 +2882,7 @@ bool RenderPipelineProbeToContext(
          !vertex_data_buffer.buffer) ||
         (index_buffer && !index_buffer_object);
     if (missing_argument_buffer) {
-      if (external_index_buffer) {
-        [external_index_buffer release];
-      }
-      if (shared_memory_buffer) {
+      if (owns_shared_memory_buffer) {
         [shared_memory_buffer release];
       }
       if (error_out) {
@@ -2858,23 +2907,20 @@ bool RenderPipelineProbeToContext(
     std::vector<id<MTLSamplerState>> vertex_sampler_objects;
     std::vector<id<MTLSamplerState>> fragment_sampler_objects;
     CreateProbeTextures(device, vertex_textures, vertex_texture_count, dummy_texture,
-                        vertex_texture_objects);
+                        vertex_texture_objects, false);
     CreateProbeTextures(device, fragment_textures, fragment_texture_count, dummy_texture,
-                        fragment_texture_objects);
+                        fragment_texture_objects, false);
     CreateCachedProbeSamplers(context, vertex_samplers, vertex_sampler_count, dummy_sampler,
                               vertex_sampler_objects);
     CreateCachedProbeSamplers(context, fragment_samplers, fragment_sampler_count, dummy_sampler,
                               fragment_sampler_objects);
 
     auto release_submission_resources = [&]() {
-      if (external_index_buffer) {
-        [external_index_buffer release];
-      }
-      if (shared_memory_buffer) {
+      if (owns_shared_memory_buffer) {
         [shared_memory_buffer release];
       }
-      ReleaseOwnedProbeTextures(vertex_texture_objects, dummy_texture);
-      ReleaseOwnedProbeTextures(fragment_texture_objects, dummy_texture);
+      ReleaseOwnedProbeTextures(vertex_texture_objects, dummy_texture, vertex_textures);
+      ReleaseOwnedProbeTextures(fragment_texture_objects, dummy_texture, fragment_textures);
       vertex_sampler_objects.clear();
       fragment_sampler_objects.clear();
     };
@@ -2915,64 +2961,72 @@ bool RenderPipelineProbeToContext(
                    backReferenceValue:depth_stencil_state ? depth_stencil_state->back.reference
                                                           : 0];
     [encoder setBlendColorRed:blend_red green:blend_green blue:blend_blue alpha:blend_alpha];
-    [encoder setVertexBuffer:system_buffer.buffer offset:system_buffer.offset atIndex:0];
-    [encoder setFragmentBuffer:system_buffer.buffer offset:system_buffer.offset atIndex:0];
-    if (vertex_fetch_constants_buffer_index != UINT32_MAX) {
-      [encoder setVertexBuffer:fetch_buffer.buffer
-                        offset:fetch_buffer.offset
-                       atIndex:vertex_fetch_constants_buffer_index];
-      TrackOpenProbeBufferBinding(context, true, vertex_fetch_constants_buffer_index);
-    }
-    if (fragment_fetch_constants_buffer_index != UINT32_MAX) {
-      [encoder setFragmentBuffer:fetch_buffer.buffer
-                          offset:fetch_buffer.offset
-                         atIndex:fragment_fetch_constants_buffer_index];
-      TrackOpenProbeBufferBinding(context, false, fragment_fetch_constants_buffer_index);
-    }
-    if (vertex_bool_loop_constants_buffer_index != UINT32_MAX) {
-      [encoder setVertexBuffer:bool_loop_buffer.buffer
-                        offset:bool_loop_buffer.offset
-                       atIndex:vertex_bool_loop_constants_buffer_index];
-      TrackOpenProbeBufferBinding(context, true, vertex_bool_loop_constants_buffer_index);
-    }
-    if (fragment_bool_loop_constants_buffer_index != UINT32_MAX) {
-      [encoder setFragmentBuffer:bool_loop_buffer.buffer
-                          offset:bool_loop_buffer.offset
-                         atIndex:fragment_bool_loop_constants_buffer_index];
-      TrackOpenProbeBufferBinding(context, false, fragment_bool_loop_constants_buffer_index);
-    }
-    if (vertex_float_constants_buffer_index != UINT32_MAX) {
-      [encoder setVertexBuffer:float_buffer.buffer
-                        offset:float_buffer.offset
-                       atIndex:vertex_float_constants_buffer_index];
-      TrackOpenProbeBufferBinding(context, true, vertex_float_constants_buffer_index);
-    }
+    id<MTLBuffer> vertex_buffers[32] = {};
+    NSUInteger vertex_buffer_offsets[32] = {};
+    id<MTLBuffer> fragment_buffers[32] = {};
+    NSUInteger fragment_buffer_offsets[32] = {};
+    uint32_t vertex_buffer_mask = 0;
+    uint32_t fragment_buffer_mask = 0;
+    auto queue_buffer = [&](bool vertex_stage, id<MTLBuffer> buffer, NSUInteger offset,
+                            uint32_t index) {
+      if (index == UINT32_MAX) {
+        return;
+      }
+      if (index < 32) {
+        id<MTLBuffer>* buffers = vertex_stage ? vertex_buffers : fragment_buffers;
+        NSUInteger* offsets = vertex_stage ? vertex_buffer_offsets : fragment_buffer_offsets;
+        buffers[index] = buffer;
+        offsets[index] = offset;
+        uint32_t& mask = vertex_stage ? vertex_buffer_mask : fragment_buffer_mask;
+        mask |= uint32_t(1) << index;
+      } else if (vertex_stage) {
+        [encoder setVertexBuffer:buffer offset:offset atIndex:index];
+      } else {
+        [encoder setFragmentBuffer:buffer offset:offset atIndex:index];
+      }
+    };
+    queue_buffer(true, system_buffer.buffer, system_buffer.offset, 0);
+    queue_buffer(false, system_buffer.buffer, system_buffer.offset, 0);
+    queue_buffer(true, fetch_buffer.buffer, fetch_buffer.offset,
+                 vertex_fetch_constants_buffer_index);
+    queue_buffer(false, fetch_buffer.buffer, fetch_buffer.offset,
+                 fragment_fetch_constants_buffer_index);
+    queue_buffer(true, bool_loop_buffer.buffer, bool_loop_buffer.offset,
+                 vertex_bool_loop_constants_buffer_index);
+    queue_buffer(false, bool_loop_buffer.buffer, bool_loop_buffer.offset,
+                 fragment_bool_loop_constants_buffer_index);
+    queue_buffer(true, float_buffer.buffer, float_buffer.offset,
+                 vertex_float_constants_buffer_index);
     const ProbeUploadAllocation& fragment_constants_to_bind =
         fragment_float_buffer.buffer ? fragment_float_buffer : float_buffer;
-    if (fragment_float_constants_buffer_index != UINT32_MAX) {
-      [encoder setFragmentBuffer:fragment_constants_to_bind.buffer
-                          offset:fragment_constants_to_bind.offset
-                         atIndex:fragment_float_constants_buffer_index];
-      TrackOpenProbeBufferBinding(context, false, fragment_float_constants_buffer_index);
+    queue_buffer(false, fragment_constants_to_bind.buffer, fragment_constants_to_bind.offset,
+                 fragment_float_constants_buffer_index);
+    queue_buffer(true, shared_memory_buffer, 0, vertex_shared_memory_buffer_index);
+    queue_buffer(false, shared_memory_buffer, 0, fragment_shared_memory_buffer_index);
+    queue_buffer(true, vertex_data_buffer.buffer, vertex_data_buffer.offset,
+                 vertex_data_buffer_index);
+    auto buffer_range_count = [](uint32_t mask) {
+      NSUInteger count = 0;
+      while (mask) {
+        ++count;
+        mask >>= 1;
+      }
+      return count;
+    };
+    NSUInteger vertex_buffer_count = buffer_range_count(vertex_buffer_mask);
+    if (vertex_buffer_count) {
+      [encoder setVertexBuffers:vertex_buffers
+                        offsets:vertex_buffer_offsets
+                      withRange:NSMakeRange(0, vertex_buffer_count)];
     }
-    if (vertex_shared_memory_buffer_index != UINT32_MAX) {
-      [encoder setVertexBuffer:shared_memory_buffer
-                        offset:0
-                       atIndex:vertex_shared_memory_buffer_index];
-      TrackOpenProbeBufferBinding(context, true, vertex_shared_memory_buffer_index);
+    NSUInteger fragment_buffer_count = buffer_range_count(fragment_buffer_mask);
+    if (fragment_buffer_count) {
+      [encoder setFragmentBuffers:fragment_buffers
+                          offsets:fragment_buffer_offsets
+                        withRange:NSMakeRange(0, fragment_buffer_count)];
     }
-    if (fragment_shared_memory_buffer_index != UINT32_MAX) {
-      [encoder setFragmentBuffer:shared_memory_buffer
-                          offset:0
-                         atIndex:fragment_shared_memory_buffer_index];
-      TrackOpenProbeBufferBinding(context, false, fragment_shared_memory_buffer_index);
-    }
-    if (vertex_data_buffer_index != UINT32_MAX) {
-      [encoder setVertexBuffer:vertex_data_buffer.buffer
-                        offset:vertex_data_buffer.offset
-                       atIndex:vertex_data_buffer_index];
-      TrackOpenProbeBufferBinding(context, true, vertex_data_buffer_index);
-    }
+    context->tracked_vertex_buffer_mask = vertex_buffer_mask;
+    context->tracked_fragment_buffer_mask = fragment_buffer_mask;
     BindProbeTextures(encoder, vertex_texture_objects, true);
     BindProbeTextures(encoder, fragment_texture_objects, false);
     BindProbeSamplers(encoder, vertex_sampler_objects, true);
@@ -2998,9 +3052,9 @@ bool RenderPipelineProbeToContext(
     context->color_resolve_dirty = context->sample_count > 1;
     context->depth_stencil_target->initialized = true;
 
-    // Normal command buffers retain every encoded resource. Balance all local
-    // ownership immediately; the retained command buffer owns the in-flight
-    // lifetime until the context is drained.
+    // Normal command buffers retain every encoded resource. Release resources
+    // created by this call immediately; cache/caller-owned Metal objects were
+    // borrowed without redundant per-draw retain/release pairs.
     release_submission_resources();
 
     // A no-copy buffer aliases caller-owned bytes rather than snapshotting them.

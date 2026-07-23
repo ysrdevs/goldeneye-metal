@@ -27,6 +27,8 @@ PROFILE = "[metal-profile]"
 KV = re.compile(r"([A-Za-z_][A-Za-z0-9_-]*)=([^\s]+)")
 RANGE = re.compile(r"(?:swaps|attempts)=(\d+)-(\d+)")
 STAGES = ("draw", "copy", "swap", "wait_reg_mem")
+SAMPLED_STAGES = ("draw_probe_sample", "draw_render_sample")
+EXPORTED_STAGES = STAGES + SAMPLED_STAGES
 PROFILE_WINDOW_SIZE = 64
 WINDOW_FIELDS = ("elapsed_ns", "avg_frame_ns", "fps")
 COMMAND_FIELDS = (
@@ -187,7 +189,7 @@ def parse_log(path: Path) -> tuple[list[dict[str, Any]], list[str], dict[str, in
                     event = str(values.get("event", "unknown"))
                     window["stages"][event] = values
                     window["_stage_counts"][event] += 1
-                elif str(values.get("event", "unknown")) in STAGES:
+                elif str(values.get("event", "unknown")) in EXPORTED_STAGES:
                     violations.append(
                         f"line {line_number}: command ledger has no matching window: "
                         f"swaps {key[0]}-{key[1]}"
@@ -402,6 +404,7 @@ def aggregate(selected: list[dict[str, Any]]) -> dict[str, Any]:
         "windows": len(selected),
         "metric_samples": {},
         "stages": {},
+        "sampled_stages": {},
         "wait_reasons": {},
     }
     fps = finite_values([window.get("fps") for window in selected])
@@ -469,6 +472,33 @@ def aggregate(selected: list[dict[str, Any]]) -> dict[str, Any]:
             "max_call_ns": max(finite_values([m.get("max_call_ns") for m in metrics]), default=0),
             "selected_elapsed_percent": (
                 sum(total_ns) / elapsed_ns * 100.0 if elapsed_ns > 0 else None
+            ),
+        }
+
+    for stage in SAMPLED_STAGES:
+        metrics = [w["stages"].get(stage, {}) for w in selected]
+        calls = finite_values([metric.get("calls") for metric in metrics])
+        total_ns = finite_values([metric.get("total_ns") for metric in metrics])
+        total_calls = sum(calls)
+        if not total_calls:
+            continue
+        sampled_total_ns = sum(total_ns)
+        window_mean_ns = [
+            float(metric["total_ns"]) / float(metric["calls"])
+            for metric in metrics
+            if is_finite_number(metric.get("total_ns"))
+            and is_finite_number(metric.get("calls"))
+            and float(metric["calls"]) > 0
+        ]
+        output["sampled_stages"][stage] = {
+            "total_samples": total_calls,
+            "total_ns": sampled_total_ns,
+            "mean_ns_per_sample": sampled_total_ns / total_calls,
+            "median_window_mean_ns_per_sample": percentile(window_mean_ns, 0.5),
+            "p95_window_mean_ns_per_sample": percentile(window_mean_ns, 0.95),
+            "max_sample_ns": max(
+                finite_values([metric.get("max_call_ns") for metric in metrics]),
+                default=0,
             ),
         }
 
@@ -614,15 +644,20 @@ def write_outputs(
     with (output / "summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, sort_keys=True)
         handle.write("\n")
+    reported_stages = STAGES + tuple(
+        stage
+        for stage in SAMPLED_STAGES
+        if any(stage in window.get("stages", {}) for window in windows)
+    )
     columns = ["swap_start", "swap_end", "dam_candidate", "selected", "fps", "elapsed_ns", "avg_frame_ns"]
-    for stage in STAGES:
+    for stage in reported_stages:
         columns += [f"{stage}_{field}" for field in ("calls", "avg_calls_per_swap", "total_ns", "avg_ns_per_swap", "max_call_ns", "max_swap_ns")]
     with (output / "windows.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
         for window in windows:
             row = {key: window.get(key, "") for key in columns}
-            for stage in STAGES:
+            for stage in reported_stages:
                 for field in ("calls", "avg_calls_per_swap", "total_ns", "avg_ns_per_swap", "max_call_ns", "max_swap_ns"):
                     row[f"{stage}_{field}"] = stage_value(window, stage, field)
             writer.writerow(row)
@@ -644,6 +679,19 @@ def write_outputs(
                 f"p95={format_metric(pacing.get('window_p95_frame_ms'), suffix='ms')} "
                 f"p99={format_metric(pacing.get('window_p99_frame_ms'), suffix='ms')} "
                 f"window-1%-low={format_metric(pacing.get('window_one_percent_low_fps'), suffix='fps')}\n"
+            )
+        for stage, values in summary["aggregate"]["sampled_stages"].items():
+            median_window_ns = values.get("median_window_mean_ns_per_sample")
+            median_window_ms = (
+                float(median_window_ns) / 1_000_000.0
+                if is_finite_number(median_window_ns)
+                else None
+            )
+            handle.write(
+                f"sample {stage}: count={int(values['total_samples'])} "
+                f"mean={format_metric(values.get('mean_ns_per_sample') / 1_000_000.0, suffix='ms')} "
+                f"median-window={format_metric(median_window_ms, suffix='ms')} "
+                f"max={format_metric(values.get('max_sample_ns') / 1_000_000.0, suffix='ms')}\n"
             )
         for reason, values in summary["aggregate"]["wait_reasons"].items():
             total_ns = values.get("total_ns")
@@ -967,7 +1015,8 @@ def main() -> int:
     windows, violations, counts = parse_log(args.log)
     selected = select_windows(windows, args.warmup, args.measure)
     aggregate_data = aggregate(selected)
-    issues = violations + wait_reg_mem_violations(windows) + list(args.external_failure)
+    capture_issues = violations + wait_reg_mem_violations(windows) + list(args.external_failure)
+    issues = list(capture_issues)
     if len(selected) == args.measure:
         issues += performance_violations(
             aggregate_data,
@@ -975,7 +1024,11 @@ def main() -> int:
             args.max_window_p99_ms,
             args.max_window_fps_cv_percent,
         )
-    ready = len(selected) == args.measure and not issues
+    # Selection always uses the first contiguous Dam run, so performance gate
+    # failures cannot become healthy by waiting for later windows. Stop the
+    # harness once the requested clean capture exists; final output still
+    # applies and reports every performance gate.
+    ready = len(selected) == args.measure and not capture_issues
     if args.output:
         success = write_outputs(
             args.output,

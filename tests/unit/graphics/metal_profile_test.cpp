@@ -53,6 +53,10 @@ TEST_CASE("Metal wait reasons and presenter counters remain distinct",
           "[graphics][metal][profile]") {
   CHECK(std::string_view(profiling::CommandEventName(profiling::CommandEvent::kWaitRegMem)) ==
         "wait_reg_mem");
+  CHECK(std::string_view(profiling::CommandEventName(profiling::CommandEvent::kDrawProbeSample)) ==
+        "draw_probe_sample");
+  CHECK(std::string_view(profiling::CommandEventName(profiling::CommandEvent::kDrawRenderSample)) ==
+        "draw_render_sample");
   CHECK(profiling::GetWaitReason("resource-mutation") == profiling::WaitReason::kResourceMutation);
   CHECK(profiling::GetWaitReason("global-cap") == profiling::WaitReason::kGlobalCap);
   CHECK(profiling::GetWaitReason("future-reason") == profiling::WaitReason::kOther);

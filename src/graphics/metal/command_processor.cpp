@@ -9812,6 +9812,13 @@ bool MetalCommandProcessor::TryRenderPipelineProbe(
     MetalShader& vertex_shader, MetalShader* pixel_shader, void* pipeline_state,
     xenos::PrimitiveType prim_type, uint32_t index_count, bool host_render_target_debug,
     const PrimitiveProcessor::ProcessingResult* primitive_processing_result) {
+  // Detailed draw timing is sampled because this route may run well over a
+  // thousand times per frame. The outer sample includes all CPU preparation;
+  // the nested sample isolates the primary Metal resource/binding/draw call.
+  bool profile_draw_sample = profile_enabled_ && (profiled_pipeline_probe_count_++ %
+                                                  profiling::kDetailedDrawSamplePeriod) == 0;
+  profiling::ScopedCommandEvent draw_probe_profile(profile_draw_sample ? &profile_window_ : nullptr,
+                                                   profiling::CommandEvent::kDrawProbeSample);
   last_host_render_target_probe_read_ = false;
   if (!pipeline_state || !metal_device_ || !memory_) {
     return false;
@@ -10379,6 +10386,9 @@ bool MetalCommandProcessor::TryRenderPipelineProbe(
       persistent_probe_ok = false;
     }
     if (persistent_probe_ok) {
+      profiling::ScopedCommandEvent draw_render_profile(
+          profile_draw_sample ? &profile_window_ : nullptr,
+          profiling::CommandEvent::kDrawRenderSample);
       persistent_probe_ok = RenderPipelineProbeToContext(
           persistent_context, pipeline_state, &probe_system_constants,
           sizeof(probe_system_constants), vertex_float_constants_data, vertex_float_constants_size,

@@ -504,6 +504,7 @@ class MetalCommandProcessor final : public CommandProcessor {
   profiling::CommandProfileWindow profile_window_;
   uint64_t profiled_swap_count_ = 0;
   uint64_t profile_window_start_ns_ = 0;
+  uint64_t profiled_pipeline_probe_count_ = 0;
   bool profile_enabled_ = profiling::IsEnabled();
   bool logged_incomplete_ = false;
   bool last_host_render_target_probe_read_ = false;

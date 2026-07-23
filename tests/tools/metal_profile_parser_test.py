@@ -82,6 +82,42 @@ class MetalProfileParserTest(unittest.TestCase):
             self.assertEqual(waits["sites"][0]["address"], 0x100)
             self.assertAlmostEqual(waits["sites"][0]["average_polls_per_call"], 10)
 
+    def test_sampled_draw_stages_are_optional_and_aggregated_separately(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            log = root / "raw.log"
+            log.write_text(
+                window_lines(0, 60.0, 16_666_667)
+                + "\n"
+                + "[metal-profile] command swaps=1-64 event=draw_probe_sample calls=10 "
+                "avg_calls_per_swap=0.156 total_ns=5000000 avg_ns_per_swap=78125 "
+                "max_call_ns=700000 max_swap_ns=900000 max_calls_per_swap=1\n"
+                + "[metal-profile] command swaps=1-64 event=draw_render_sample calls=10 "
+                "avg_calls_per_swap=0.156 total_ns=3000000 avg_ns_per_swap=46875 "
+                "max_call_ns=500000 max_swap_ns=600000 max_calls_per_swap=1\n",
+                encoding="utf-8",
+            )
+            windows, violations, counts = parser.parse_log(log)
+            self.assertEqual(violations, [])
+            self.assertEqual(counts, {})
+            self.assertTrue(windows[0]["complete"])
+            aggregate = parser.aggregate(parser.select_windows(windows, warmup=0, measure=1))
+            self.assertEqual(aggregate["sampled_stages"]["draw_probe_sample"]["total_samples"], 10)
+            self.assertEqual(
+                aggregate["sampled_stages"]["draw_probe_sample"]["mean_ns_per_sample"],
+                500_000,
+            )
+            self.assertEqual(
+                aggregate["sampled_stages"]["draw_probe_sample"][
+                    "median_window_mean_ns_per_sample"
+                ],
+                500_000,
+            )
+            self.assertEqual(
+                aggregate["sampled_stages"]["draw_render_sample"]["mean_ns_per_sample"],
+                300_000,
+            )
+
     def test_optional_performance_gates_fail_summary(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -109,6 +145,30 @@ class MetalProfileParserTest(unittest.TestCase):
             text_summary = (output / "summary.txt").read_text(encoding="utf-8")
             self.assertIn("WAIT_REG_MEM: command_calls=384", text_summary)
             self.assertIn("WAIT_REG_MEM site memory:0x00000100", text_summary)
+
+    def test_ready_mode_stops_after_a_complete_capture_even_if_a_gate_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = self.make_log(Path(temporary))
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "tools/metal_profile_parser.py"),
+                    str(log),
+                    "--warmup",
+                    "1",
+                    "--measure",
+                    "3",
+                    "--min-mean-fps",
+                    "99",
+                    "--ready",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_incomplete_non_64_and_invalid_numeric_windows_are_rejected(self):
         cases = {

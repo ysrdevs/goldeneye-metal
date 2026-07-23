@@ -11,6 +11,9 @@
 namespace rex::graphics::metal::profiling {
 
 constexpr uint32_t kReportInterval = 64;
+// Coprime with the 64-draw Metal command-buffer batch so samples don't always
+// land on encoder creation or finalization.
+constexpr uint32_t kDetailedDrawSamplePeriod = 61;
 
 inline bool IsEnabled() {
   static const bool enabled = []() {
@@ -74,6 +77,8 @@ enum class CommandEvent : uint8_t {
   kIssueSwap,
   kTextureFallbackDecode,
   kWaitRegMem,
+  kDrawProbeSample,
+  kDrawRenderSample,
   kCount,
 };
 
@@ -89,6 +94,10 @@ constexpr const char* CommandEventName(CommandEvent event) {
       return "texture_fallback_decode";
     case CommandEvent::kWaitRegMem:
       return "wait_reg_mem";
+    case CommandEvent::kDrawProbeSample:
+      return "draw_probe_sample";
+    case CommandEvent::kDrawRenderSample:
+      return "draw_render_sample";
     default:
       return "unknown";
   }
