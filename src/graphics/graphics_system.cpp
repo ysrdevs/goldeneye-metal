@@ -223,16 +223,19 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
 }
 
 void GraphicsSystem::Shutdown() {
+  if (vsync_worker_thread_) {
+    // The vblank worker reads command_processor_ on every tick. Stop and join
+    // it before destroying the command processor so shutdown can't race a
+    // SetDesiredSwapPostEffect or MarkVblank call on a freed object.
+    vsync_worker_running_.store(false, std::memory_order_release);
+    vsync_worker_thread_->Wait(0, 0, 0, nullptr);
+    vsync_worker_thread_.reset();
+  }
+
   if (command_processor_) {
     EndTracing();
     command_processor_->Shutdown();
     command_processor_.reset();
-  }
-
-  if (vsync_worker_thread_) {
-    vsync_worker_running_ = false;
-    vsync_worker_thread_->Wait(0, 0, 0, nullptr);
-    vsync_worker_thread_.reset();
   }
 
   if (presenter_) {
