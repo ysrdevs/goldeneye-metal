@@ -63,6 +63,34 @@ constexpr uint32_t kMaxAsyncProbeSubmissionsBetweenGlobalWaits = 2048;
 constexpr uint64_t kPipelineArchiveQuietSwaps = 120;
 constexpr uint64_t kPipelineArchiveMaximumDirtySwaps = 600;
 
+constexpr uint32_t GetMetalSampleCount(xenos::MsaaSamples msaa_samples) {
+  return uint32_t(1) << std::min(uint32_t(msaa_samples), uint32_t(2));
+}
+
+constexpr bool IsHostDepthRenderingMode(xenos::EdramMode mode) {
+  return mode == xenos::EdramMode::kColorDepth || mode == xenos::EdramMode::kDepthOnly;
+}
+static_assert(IsHostDepthRenderingMode(xenos::EdramMode::kDepthOnly));
+
+inline uint32_t GetGuestDepthStencilIdentity(reg::RB_DEPTH_INFO depth_info) {
+  // EDRAM addressing is periodic in 11 bits. Ignore the unused twelfth base
+  // bit and register padding so aliases attach to the same host allocation.
+  return uint32_t(depth_info.depth_base) |
+         (uint32_t(depth_info.depth_format) << xenos::kEdramBaseTilesBits);
+}
+
+inline uint64_t GetHostDepthStencilKey(uint32_t depth_info_value, uint32_t surface_info_value) {
+  reg::RB_DEPTH_INFO depth_info = {};
+  reg::RB_SURFACE_INFO surface_info = {};
+  depth_info.value = depth_info_value;
+  surface_info.value = surface_info_value;
+  uint32_t pitch_tiles =
+      xenos::GetSurfacePitchTiles(surface_info.surface_pitch, surface_info.msaa_samples, false);
+  uint32_t key_parts[3] = {GetGuestDepthStencilIdentity(depth_info), pitch_tiles,
+                           uint32_t(surface_info.msaa_samples)};
+  return XXH3_64bits(key_parts, sizeof(key_parts));
+}
+
 // Split the Xenos 32bpp tiled-address calculation into row-invariant and
 // column portions. Resolve writes otherwise realign the pitch and rebuild the
 // row macro for every one of the ~3.7 million pixels written per frame.
@@ -467,9 +495,8 @@ ProbeSamplerSlot MakeProbeSamplerSlot(const RegisterFile& register_file,
                                                  &mip_min_level, &mip_max_level);
   const bool has_mips = mip_max_level > mip_min_level;
   const int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
-  const ProbeSamplerFiltering filtering =
-      ResolveProbeSamplerFiltering(mag_filter, min_filter, mip_filter, aniso_filter, has_mips,
-                                   anisotropic_override);
+  const ProbeSamplerFiltering filtering = ResolveProbeSamplerFiltering(
+      mag_filter, min_filter, mip_filter, aniso_filter, has_mips, anisotropic_override);
   slot.mag_linear = filtering.mag_linear;
   slot.min_linear = filtering.min_linear;
   slot.mip_linear = filtering.mip_linear;
@@ -848,6 +875,11 @@ bool MetalPipelineProbesEnabled() {
 bool MetalVerboseDiagnosticsEnabled() {
   static const bool enabled = EnvEnabled("GOLDENEYE_METAL_VERBOSE_DIAGNOSTICS");
   return enabled;
+}
+
+bool ShouldLogMetalDiagnostic(uint32_t index, uint32_t startup_count, uint32_t periodic_mask) {
+  return index <= startup_count ||
+         (MetalVerboseDiagnosticsEnabled() && (index & periodic_mask) == 0);
 }
 
 bool MetalHostRenderTargetDebugEnabled() {
@@ -1387,7 +1419,9 @@ MetalCommandProcessor::MetalCommandProcessor(GraphicsSystem* graphics_system,
                                              system::KernelState* kernel_state)
     : CommandProcessor(graphics_system, kernel_state) {}
 
-MetalCommandProcessor::~MetalCommandProcessor() { ShutdownPipelineArchive(); }
+MetalCommandProcessor::~MetalCommandProcessor() {
+  ShutdownPipelineArchive();
+}
 
 void MetalCommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                                     uint32_t title_id, bool blocking) {
@@ -1436,7 +1470,7 @@ void MetalCommandProcessor::InitializeShaderStorage(const std::filesystem::path&
 
 void* MetalCommandProcessor::CreateCachedRenderPipelineState(
     void* vertex_library, void* fragment_library, std::string* error_out,
-    const ProbeColorTargetState* color_target_state) {
+    const ProbeColorTargetState* color_target_state, uint32_t sample_count) {
   // Archive serialization runs off the render thread. Never make a new game
   // pipeline wait for it: if the worker owns the archive, compile through
   // Metal's ordinary path and leave that one entry for a later run. Normal
@@ -1448,16 +1482,15 @@ void* MetalCommandProcessor::CreateCachedRenderPipelineState(
     ++pipeline_archive_busy_bypass_count_;
     if (pipeline_archive_busy_bypass_count_ <= 8 ||
         (pipeline_archive_busy_bypass_count_ & 0x3F) == 0) {
-      REXLOG_INFO(
-          "Metal pipeline archive busy; compiling without persistence #{}",
-          pipeline_archive_busy_bypass_count_);
+      REXLOG_INFO("Metal pipeline archive busy; compiling without persistence #{}",
+                  pipeline_archive_busy_bypass_count_);
     }
   }
 
   RenderPipelineCacheTelemetry telemetry;
   void* pipeline_state = rex::graphics::metal::CreateRenderPipelineState(
       metal_device_, vertex_library, fragment_library, error_out, color_target_state,
-      archive_lock.owns_lock() ? pipeline_binary_archive_ : nullptr, &telemetry);
+      archive_lock.owns_lock() ? pipeline_binary_archive_ : nullptr, &telemetry, sample_count);
 
   pipeline_build_ns_ += telemetry.pipeline_build_ns;
   if (telemetry.archive_enabled) {
@@ -1469,8 +1502,8 @@ void* MetalCommandProcessor::CreateCachedRenderPipelineState(
     }
     if (telemetry.archive_miss) {
       ++pipeline_archive_miss_count_;
-      rex::perf::RecordMetalPipelineCompile(
-          GetRenderPipelineCacheMissDurationNs(telemetry), pipeline_state != nullptr);
+      rex::perf::RecordMetalPipelineCompile(GetRenderPipelineCacheMissDurationNs(telemetry),
+                                            pipeline_state != nullptr);
     }
     if (telemetry.archive_updated) {
       if (!pipeline_binary_archive_dirty_) {
@@ -1492,9 +1525,8 @@ void* MetalCommandProcessor::CreateCachedRenderPipelineState(
     if (lookup_count <= 16 || (lookup_count & 0x3F) == 0) {
       REXLOG_INFO(
           "Metal pipeline archive lookup #{}: {} (lookup {} us, archive add {} us, build {} us)",
-          lookup_count, telemetry.archive_hit ? "hit" : "miss",
-          telemetry.archive_lookup_ns / 1000, telemetry.archive_add_ns / 1000,
-          telemetry.pipeline_build_ns / 1000);
+          lookup_count, telemetry.archive_hit ? "hit" : "miss", telemetry.archive_lookup_ns / 1000,
+          telemetry.archive_add_ns / 1000, telemetry.pipeline_build_ns / 1000);
     }
   } else {
     rex::perf::RecordMetalPipelineCompile(telemetry.pipeline_build_ns, pipeline_state != nullptr);
@@ -1518,13 +1550,12 @@ void MetalCommandProcessor::FinalizePipelineArchiveSerializationLocked() {
   pipeline_archive_save_result_size_ = 0;
   pipeline_archive_save_result_elapsed_ns_ = 0;
   pipeline_archive_save_result_error_.clear();
-  HandlePipelineArchiveSerializationResultLocked(
-      succeeded, archive_size, elapsed_ns, std::move(serialize_error));
+  HandlePipelineArchiveSerializationResultLocked(succeeded, archive_size, elapsed_ns,
+                                                 std::move(serialize_error));
 }
 
 void MetalCommandProcessor::HandlePipelineArchiveSerializationResultLocked(
-    bool succeeded, uint64_t archive_size, uint64_t elapsed_ns,
-    std::string serialize_error) {
+    bool succeeded, uint64_t archive_size, uint64_t elapsed_ns, std::string serialize_error) {
   pipeline_archive_serialization_ns_ += elapsed_ns;
   pipeline_archive_serialization_max_ns_ =
       std::max(pipeline_archive_serialization_max_ns_, elapsed_ns);
@@ -1533,8 +1564,7 @@ void MetalCommandProcessor::HandlePipelineArchiveSerializationResultLocked(
     pipeline_archive_next_serialize_swap_ = pipeline_archive_swap_count_;
     ++pipeline_archive_serialization_count_;
     REXLOG_INFO("Metal pipeline archive saved #{}: {} bytes in {} us",
-                pipeline_archive_serialization_count_, archive_size,
-                elapsed_ns / 1000);
+                pipeline_archive_serialization_count_, archive_size, elapsed_ns / 1000);
     return;
   }
 
@@ -1554,8 +1584,7 @@ void MetalCommandProcessor::HandlePipelineArchiveSerializationResultLocked(
   bool restored_existing = false;
   std::string recovery_message;
   void* recovered_archive = CreateMetalPipelineBinaryArchive(
-      metal_device_, pipeline_binary_archive_path_, &restored_existing,
-      &recovery_message);
+      metal_device_, pipeline_binary_archive_path_, &restored_existing, &recovery_message);
   if (recovered_archive) {
     ReleaseMetalPipelineBinaryArchive(pipeline_binary_archive_);
     pipeline_binary_archive_ = recovered_archive;
@@ -1585,8 +1614,7 @@ void MetalCommandProcessor::HandlePipelineArchiveSerializationResultLocked(
       "Metal pipeline archive save failed #{} and recovery failed; persistent "
       "caching is disabled for this run: {}; recovery: {}",
       pipeline_archive_serialization_failure_count_, serialize_error,
-      recovery_message.empty() ? "unknown Metal archive recovery error"
-                               : recovery_message);
+      recovery_message.empty() ? "unknown Metal archive recovery error" : recovery_message);
 }
 
 void MetalCommandProcessor::SerializePipelineArchiveIfNeeded(bool force) {
@@ -1641,20 +1669,18 @@ void MetalCommandProcessor::SerializePipelineArchiveIfNeeded(bool force) {
     std::string serialize_error;
     const uint64_t serialize_start_ns = profiling::NowNs();
     const bool succeeded = SerializeMetalPipelineBinaryArchive(
-        pipeline_binary_archive_, pipeline_binary_archive_path_, &archive_size,
-        &serialize_error);
-    HandlePipelineArchiveSerializationResultLocked(
-        succeeded, archive_size, profiling::ElapsedNs(serialize_start_ns),
-        std::move(serialize_error));
+        pipeline_binary_archive_, pipeline_binary_archive_path_, &archive_size, &serialize_error);
+    HandlePipelineArchiveSerializationResultLocked(succeeded, archive_size,
+                                                   profiling::ElapsedNs(serialize_start_ns),
+                                                   std::move(serialize_error));
     return;
   }
 
   void* archive = pipeline_binary_archive_;
   const std::filesystem::path archive_path = pipeline_binary_archive_path_;
   pipeline_archive_save_in_flight_ = true;
-  REXLOG_INFO(
-      "Metal pipeline archive background save queued after {} quiet swaps",
-      dirty_quiet_swaps);
+  REXLOG_INFO("Metal pipeline archive background save queued after {} quiet swaps",
+              dirty_quiet_swaps);
   try {
     pipeline_archive_save_thread_ = std::thread([this, archive, archive_path]() {
       // Excluding archive mutation is the only work this mutex protects. The
@@ -1663,12 +1689,11 @@ void MetalCommandProcessor::SerializePipelineArchiveIfNeeded(bool force) {
       uint64_t archive_size = 0;
       std::string serialize_error;
       const uint64_t serialize_start_ns = profiling::NowNs();
-      const bool succeeded = SerializeMetalPipelineBinaryArchive(
-          archive, archive_path, &archive_size, &serialize_error);
+      const bool succeeded = SerializeMetalPipelineBinaryArchive(archive, archive_path,
+                                                                 &archive_size, &serialize_error);
       pipeline_archive_save_result_succeeded_ = succeeded;
       pipeline_archive_save_result_size_ = archive_size;
-      pipeline_archive_save_result_elapsed_ns_ =
-          profiling::ElapsedNs(serialize_start_ns);
+      pipeline_archive_save_result_elapsed_ns_ = profiling::ElapsedNs(serialize_start_ns);
       pipeline_archive_save_result_error_ = std::move(serialize_error);
       pipeline_archive_save_result_ready_ = true;
       pipeline_archive_save_in_flight_ = false;
@@ -1680,8 +1705,7 @@ void MetalCommandProcessor::SerializePipelineArchiveIfNeeded(bool force) {
     pipeline_archive_last_update_swap_ = pipeline_archive_swap_count_;
     pipeline_archive_next_serialize_swap_ =
         pipeline_archive_swap_count_ + kPipelineArchiveQuietSwaps;
-    REXLOG_WARN("Could not start background Metal pipeline archive save: {}",
-                exception.what());
+    REXLOG_WARN("Could not start background Metal pipeline archive save: {}", exception.what());
   }
 }
 
@@ -1694,8 +1718,7 @@ void MetalCommandProcessor::ShutdownPipelineArchive() {
   SerializePipelineArchiveIfNeeded(true);
   const uint64_t lookup_count = pipeline_archive_hit_count_ + pipeline_archive_miss_count_;
   const uint64_t serialization_attempt_count =
-      pipeline_archive_serialization_count_ +
-      pipeline_archive_serialization_failure_count_;
+      pipeline_archive_serialization_count_ + pipeline_archive_serialization_failure_count_;
   REXLOG_INFO(
       "Metal persistent pipeline cache shutdown: {} hits, {} misses, {} busy bypasses, "
       "{} update failures, "
@@ -1703,15 +1726,14 @@ void MetalCommandProcessor::ShutdownPipelineArchive() {
       "build {} us; MSL libraries {} compiled ({} failed), avg {} us, max {} us",
       pipeline_archive_hit_count_, pipeline_archive_miss_count_,
       pipeline_archive_busy_bypass_count_, pipeline_archive_update_failure_count_,
-      pipeline_archive_serialization_count_,
-      pipeline_archive_serialization_failure_count_,
+      pipeline_archive_serialization_count_, pipeline_archive_serialization_failure_count_,
       serialization_attempt_count
           ? pipeline_archive_serialization_ns_ / serialization_attempt_count / 1000
           : 0,
       pipeline_archive_serialization_max_ns_ / 1000,
       lookup_count ? pipeline_archive_lookup_ns_ / lookup_count / 1000 : 0,
-      lookup_count ? pipeline_build_ns_ / lookup_count / 1000 : 0,
-      msl_library_compile_count_, msl_library_compile_failure_count_,
+      lookup_count ? pipeline_build_ns_ / lookup_count / 1000 : 0, msl_library_compile_count_,
+      msl_library_compile_failure_count_,
       msl_library_compile_count_ ? msl_library_compile_ns_ / msl_library_compile_count_ / 1000 : 0,
       msl_library_compile_max_ns_ / 1000);
   ReleaseMetalPipelineBinaryArchive(pipeline_binary_archive_);
@@ -1787,7 +1809,7 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   }
   static std::atomic<uint32_t> metal_swap_logs{0};
   uint32_t metal_swap_index = metal_swap_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (metal_swap_index <= 16 || (metal_swap_index & 0x3F) == 0) {
+  if (ShouldLogMetalDiagnostic(metal_swap_index, 16, 0x3F)) {
     std::fprintf(stderr, "[metal] IssueSwap#%u fb_pa=0x%08x %ux%u\n", metal_swap_index,
                  frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
     std::fprintf(stderr,
@@ -1811,7 +1833,8 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                  static_cast<unsigned long long>(gpu_completion_batch_count_));
     std::fflush(stderr);
   }
-  if (metal_swap_index <= 32 || (metal_swap_index & 0x3F) == 0) {
+  bool log_draw_route_summary = ShouldLogMetalDiagnostic(metal_swap_index, 32, 0x3F);
+  if (log_draw_route_summary) {
     std::fprintf(stderr,
                  "[metal] draw route summary#%u total=%u color_depth=%u "
                  "shader_color_candidates=%u register_color_candidates=%u "
@@ -1829,6 +1852,7 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   register_color_unrouted_draws_this_swap_ = 0;
   owned_rt_routed_draws_this_swap_ = 0;
   owned_rt_routed_targets_this_swap_ = 0;
+  collect_draw_route_summary_ = MetalVerboseDiagnosticsEnabled() || metal_swap_index < 32;
   if (MetalHeuristicPresentationEnabled() || MetalPipelineProbesEnabled()) {
     RefreshPipelineProbeBacking(fallback_output_width_, fallback_output_height_);
   }
@@ -1899,7 +1923,7 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           if (refreshed) {
             static std::atomic<uint32_t> direct_present_logs{0};
             uint32_t direct_index = direct_present_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (direct_index <= 8 || (direct_index & 0x3F) == 0) {
+            if (ShouldLogMetalDiagnostic(direct_index, 8, 0x3F)) {
               std::fprintf(stderr,
                            "[metal] direct snapshot present#%u base=0x%08x "
                            "size=%ux%u pitch=%u swiz=0x%03x\n",
@@ -2640,6 +2664,16 @@ void MetalCommandProcessor::ClearCaches() {
   if (shared_memory_) {
     shared_memory_->ClearCache();
   }
+  for (auto& rt_entry : host_render_targets_) {
+    if (rt_entry.second.context) {
+      ResetPipelineProbeContext(rt_entry.second.context);
+    }
+  }
+  for (auto& depth_entry : host_depth_stencil_targets_) {
+    if (depth_entry.second.context) {
+      ResetPipelineProbeContext(depth_entry.second.context);
+    }
+  }
 }
 
 void MetalCommandProcessor::ShutdownContext() {
@@ -2676,6 +2710,14 @@ void MetalCommandProcessor::ShutdownContext() {
     ReleaseRenderPipelineState(pipeline_entry.second);
   }
   host_pixel_pipeline_states_.clear();
+  for (auto& pipeline_entry : host_fallback_pixel_pipeline_states_) {
+    ReleaseRenderPipelineState(pipeline_entry.second);
+  }
+  host_fallback_pixel_pipeline_states_.clear();
+  for (auto& pipeline_entry : host_vertex_color_pixel_pipeline_states_) {
+    ReleaseRenderPipelineState(pipeline_entry.second);
+  }
+  host_vertex_color_pixel_pipeline_states_.clear();
   for (auto& pipeline_entry : solid_color_pipeline_states_) {
     ReleaseRenderPipelineState(pipeline_entry.second);
   }
@@ -2688,10 +2730,10 @@ void MetalCommandProcessor::ShutdownContext() {
   fullscreen_vertex_library_ = nullptr;
   ReleaseMslLibrary(host_pixel_vertex_library_);
   host_pixel_vertex_library_ = nullptr;
-  ReleaseRenderPipelineState(host_fallback_pixel_pipeline_state_);
-  host_fallback_pixel_pipeline_state_ = nullptr;
   ReleaseMslLibrary(host_fallback_pixel_fragment_library_);
   host_fallback_pixel_fragment_library_ = nullptr;
+  ReleaseMslLibrary(host_vertex_color_pixel_fragment_library_);
+  host_vertex_color_pixel_fragment_library_ = nullptr;
   ReleaseMslLibrary(dummy_fragment_library_);
   dummy_fragment_library_ = nullptr;
   ReleaseMslLibrary(solid_fragment_library_);
@@ -2705,6 +2747,11 @@ void MetalCommandProcessor::ShutdownContext() {
     rt_entry.second.context = nullptr;
   }
   host_render_targets_.clear();
+  for (auto& depth_entry : host_depth_stencil_targets_) {
+    ReleasePipelineProbeContext(depth_entry.second.context);
+    depth_entry.second.context = nullptr;
+  }
+  host_depth_stencil_targets_.clear();
   ReleasePipelineProbeContext(host_render_target_context_);
   host_render_target_context_ = nullptr;
   host_render_target_context_override_ = nullptr;
@@ -2965,7 +3012,9 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
 
   static std::atomic<uint32_t> metal_draw_logs{0};
   uint32_t metal_draw_index = metal_draw_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-  ++draw_calls_this_swap_;
+  if (collect_draw_route_summary_) {
+    ++draw_calls_this_swap_;
+  }
   if (metal_draw_index <= 16 ||
       (MetalVerboseDiagnosticsEnabled() && (metal_draw_index & 0xFF) == 0)) {
     std::fprintf(stderr, "[metal] IssueDraw#%u prim=%u indices=%u vs=%p ps=%p\n", metal_draw_index,
@@ -3031,7 +3080,9 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   if (delegates_to_copy) {
     return IssueCopy();
   }
-  ++color_depth_draws_this_swap_;
+  if (collect_draw_route_summary_) {
+    ++color_depth_draws_this_swap_;
+  }
   current_host_vertex_shader_type_ = Shader::HostVertexShaderType::kVertex;
   if (kEnableHostVertexShaderVariants) {
     current_host_vertex_shader_type_ =
@@ -3103,15 +3154,9 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       texture_cache_->BeginSubmission(counter());
       texture_cache_->BeginFrame();
     }
-    // Phase 1: start each frame's host render targets fresh. The per-RT
-    // persistent contexts keep their MTLTexture alive across frames; reset
-    // only the initialized flag so the first draw re-clears (MTLLoadActionClear)
-    // and later draws accumulate (MTLLoadActionLoad) within the frame.
-    for (auto& rt_entry : host_render_targets_) {
-      if (rt_entry.second.context) {
-        ResetPipelineProbeContext(rt_entry.second.context);
-      }
-    }
+    // Host color and depth/stencil contents follow guest render-target
+    // lifetime, not the presentation boundary. Resolve-time clear packets
+    // update them explicitly; cache invalidation resets them when required.
   }
   ++draw_count_;
   bool vertex_translation_ok = true;
@@ -3136,7 +3181,7 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       static std::atomic<uint32_t> positionless_vs_logs{0};
       uint32_t positionless_vs_index =
           positionless_vs_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-      if (positionless_vs_index <= 16 || (positionless_vs_index & 0xFF) == 0) {
+      if (ShouldLogMetalDiagnostic(positionless_vs_index, 16, 0xFF)) {
         std::fprintf(stderr,
                      "[metal] positionless VS#%u draw=%u vs=%016llx translated=%u "
                      "valid=%u eM=0x%02x msl_writes=%u\n",
@@ -3193,7 +3238,7 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   if (pixel_shader && ps_param_gen_pos != UINT32_MAX) {
     static std::atomic<uint32_t> param_gen_logs{0};
     uint32_t param_gen_index = param_gen_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (param_gen_index <= 16 || (param_gen_index & 0xFF) == 0) {
+    if (ShouldLogMetalDiagnostic(param_gen_index, 16, 0xFF)) {
       std::fprintf(stderr,
                    "[metal] param-gen draw#%u draw=%u ps=%016llx pos=%u "
                    "interp_mask=0x%04x vs_mod=%016llx ps_mod=%016llx\n",
@@ -3208,7 +3253,7 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   if (pixel_shader && pixel_shader->ucode_data_hash() == UINT64_C(0xbdc93d3c5da8241f)) {
     static std::atomic<uint32_t> bdc_state_logs{0};
     uint32_t bdc_state_index = bdc_state_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (bdc_state_index <= 24 || (bdc_state_index & 0x3F) == 0) {
+    if (ShouldLogMetalDiagnostic(bdc_state_index, 24, 0x3F)) {
       std::vector<uint32_t> bdc_float_constants =
           PackFloatConstantsForShader(*register_file_, *pixel_shader);
       auto packed_float = [&](uint32_t constant_index, uint32_t component) -> float {
@@ -3269,7 +3314,8 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     static std::unordered_set<uint64_t> logged_draw_signatures;
     // The signature table is diagnostic-only. Once it is full, avoid hashing
     // every gameplay draw forever after.
-    if (logged_draw_signatures.size() < 128) {
+    if ((metal_draw_index <= 4096 || MetalVerboseDiagnosticsEnabled()) &&
+        logged_draw_signatures.size() < 128) {
       uint64_t draw_signature_parts[6] = {
           vertex_shader ? vertex_shader->ucode_data_hash() : 0,
           pixel_shader ? pixel_shader->ucode_data_hash() : 0,
@@ -3323,7 +3369,9 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     register_color_mask_all = draw_util::GetNormalizedColorMask(*register_file_, 0xF);
     if (register_color_mask_all) {
       register_color_candidate_draw = true;
-      ++register_color_candidate_draws_this_swap_;
+      if (collect_draw_route_summary_) {
+        ++register_color_candidate_draws_this_swap_;
+      }
     }
   }
   auto active_color_write_mask = [&]() -> uint32_t {
@@ -3340,6 +3388,31 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
     return register_color_mask_all;
   };
+  reg::RB_DEPTHCONTROL normalized_depth_control =
+      draw_util::GetNormalizedDepthControl(*register_file_);
+  bool depth_write_draw =
+      normalized_depth_control.z_enable && normalized_depth_control.z_write_enable;
+  bool stencil_write_draw = false;
+  if (normalized_depth_control.stencil_enable) {
+    auto front_mask = register_file_->Get<reg::RB_STENCILREFMASK>();
+    auto back_mask = register_file_->Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF);
+    auto operations_write = [](xenos::StencilOp fail, xenos::StencilOp depth_fail,
+                               xenos::StencilOp pass) {
+      return fail != xenos::StencilOp::kKeep || depth_fail != xenos::StencilOp::kKeep ||
+             pass != xenos::StencilOp::kKeep;
+    };
+    stencil_write_draw =
+        (front_mask.stencilwritemask && operations_write(normalized_depth_control.stencilfail,
+                                                         normalized_depth_control.stencilzfail,
+                                                         normalized_depth_control.stencilzpass)) ||
+        (normalized_depth_control.backface_enable && back_mask.stencilwritemask &&
+         operations_write(normalized_depth_control.stencilfail_bf,
+                          normalized_depth_control.stencilzfail_bf,
+                          normalized_depth_control.stencilzpass_bf));
+  }
+  xenos::EdramMode edram_mode = register_file_->Get<reg::RB_MODECONTROL>().edram_mode;
+  bool depth_rendering_mode = IsHostDepthRenderingMode(edram_mode);
+  bool depth_stencil_write_draw = depth_rendering_mode && (depth_write_draw || stencil_write_draw);
   bool owned_rt_routed_this_draw = false;
   if (!register_color_candidate_draw && vertex_shader && pixel_shader &&
       !vertex_shader->writes_position() && !vertex_shader->memexport_eM_written() &&
@@ -3347,13 +3420,15 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       !pixel_shader->writes_depth() && !pixel_shader->kills_pixels() &&
       !pixel_shader->memexport_eM_written() &&
       pixel_shader->GetTextureBindingsAfterTranslation().empty() &&
-      IsVoidFragmentMsl(pixel_translation)) {
+      IsVoidFragmentMsl(pixel_translation) && !depth_stencil_write_draw) {
     if (register_color_candidate_draw) {
-      ++register_color_unrouted_draws_this_swap_;
+      if (collect_draw_route_summary_) {
+        ++register_color_unrouted_draws_this_swap_;
+      }
       static std::atomic<uint32_t> register_color_unrouted_logs{0};
       uint32_t register_color_unrouted_index =
           register_color_unrouted_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-      if (register_color_unrouted_index <= 64 || (register_color_unrouted_index & 0xFF) == 0) {
+      if (ShouldLogMetalDiagnostic(register_color_unrouted_index, 64, 0xFF)) {
         std::fprintf(
             stderr,
             "[metal] register-color unrouted#%u draw=%u reason=no-effect-skip "
@@ -3374,7 +3449,7 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
     static std::atomic<uint32_t> no_effect_draw_logs{0};
     uint32_t no_effect_draw_index = no_effect_draw_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (no_effect_draw_index <= 16 || (no_effect_draw_index & 0xFF) == 0) {
+    if (ShouldLogMetalDiagnostic(no_effect_draw_index, 16, 0xFF)) {
       std::fprintf(stderr,
                    "[metal] skipped no-effect draw#%u draw=%u prim=%u indices=%u "
                    "vs=%016llx ps=%016llx\n",
@@ -3400,8 +3475,10 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
   };
   if (pixel_shader && pixel_shader->writes_color_targets() &&
-      register_file_->Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kColorDepth) {
-    ++color_target_candidate_draws_this_swap_;
+      edram_mode == xenos::EdramMode::kColorDepth) {
+    if (collect_draw_route_summary_) {
+      ++color_target_candidate_draws_this_swap_;
+    }
   }
   if (metal_device_ && vertex_shader && vertex_translation_ok &&
       HasMemExportSideEffects(*vertex_shader, vertex_translation)) {
@@ -3412,7 +3489,7 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     static std::atomic<uint32_t> memexport_detect_logs{0};
     uint32_t memexport_detect_index =
         memexport_detect_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (memexport_detect_index <= 16 || (memexport_detect_index & 0xFF) == 0) {
+    if (ShouldLogMetalDiagnostic(memexport_detect_index, 16, 0xFF)) {
       std::fprintf(stderr,
                    "[metal] memexport side-effect shader#%u draw=%u vs=%016llx "
                    "eM=0x%02x msl_writes=%u\n",
@@ -3422,9 +3499,35 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                    MslWritesSharedMemory(vertex_translation) ? 1u : 0u);
       std::fflush(stderr);
     }
+    std::vector<draw_util::MemExportRange> vertex_memexport_ranges;
+    draw_util::AddMemExportRanges(*register_file_, *vertex_shader, vertex_memexport_ranges);
+    if (vertex_memexport_ranges.empty()) {
+      REXGPU_ERROR("Metal vertex memexport has no resolved destination ranges (vs={:016X})",
+                   vertex_shader->ucode_data_hash());
+      return false;
+    }
     TraceCpuMemExportShader(*register_file_, *memory_, *vertex_shader, prim_type, index_count,
                             metal_draw_index);
-    ExecuteMemExportVertexShader(*vertex_shader, prim_type, index_count);
+    bool memexport_executed = ExecuteMemExportVertexShader(*vertex_shader, prim_type, index_count);
+    if (!memexport_executed || !shared_memory_) {
+      REXGPU_ERROR("Metal vertex memexport execution or shared-memory publication failed");
+      return false;
+    }
+    // The compatibility one-shot above writes through the no-copy guest
+    // physical mapping. Invalidate the separate resident allocation before
+    // the normal render route requests it, otherwise a previously valid page
+    // could hide the just-produced guest bytes from a partial export.
+    for (const draw_util::MemExportRange& range : vertex_memexport_ranges) {
+      uint64_t start = uint64_t(range.base_address_dwords) << 2;
+      if (start < SharedMemory::kBufferSize &&
+          range.size_bytes <= SharedMemory::kBufferSize - start) {
+        shared_memory_->MemoryInvalidationCallback(uint32_t(start), range.size_bytes, true);
+      } else {
+        REXGPU_ERROR("Invalid Metal vertex memexport range at 0x{:08X} (size {})", uint32_t(start),
+                     range.size_bytes);
+        return false;
+      }
+    }
   }
   if (guest_faces_fully_culled) {
     // Any vertex memexport side effects have already run above. Avoid acquiring
@@ -3443,12 +3546,73 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       route_vertex_shader->AnalyzeUcode(ucode_disasm_buffer_);
     }
   }
+  bool pixel_memexport_draw = edram_mode == xenos::EdramMode::kColorDepth && pixel_shader &&
+                              HasMemExportSideEffects(*pixel_shader, pixel_translation);
   if (metal_device_ && route_vertex_shader && route_vertex_shader->writes_position() &&
-      pixel_shader && pixel_translation_ok &&
-      register_file_->Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kColorDepth &&
-      !IsVoidFragmentMsl(pixel_translation)) {
+      (edram_mode == xenos::EdramMode::kDepthOnly || !pixel_shader || pixel_translation_ok) &&
+      depth_rendering_mode) {
     uint32_t normalized_color_mask = active_color_write_mask();
-    if (normalized_color_mask) {
+    if (pixel_memexport_draw) {
+      uint32_t active_color_target_count = 0;
+      for (uint32_t rt_index = 0; rt_index < xenos::kMaxColorRenderTargets; ++rt_index) {
+        active_color_target_count += ((normalized_color_mask >> (rt_index * 4)) & 0xF) != 0;
+      }
+      // This compatibility route currently renders one Metal color attachment
+      // at a time. Replaying a fragment memexport shader once per attachment
+      // would duplicate guest-memory side effects, so reject that unsupported
+      // combination instead of producing silently incorrect memory.
+      if (active_color_target_count > 1) {
+        REXGPU_ERROR("Metal pixel memexport with {} active color targets is unsupported",
+                     active_color_target_count);
+        return false;
+      }
+    }
+    bool shader_exports_color = pixel_shader && pixel_shader->writes_color_targets() != 0;
+    bool depth_only_draw =
+        depth_stencil_write_draw && (!shader_exports_color || !normalized_color_mask);
+    bool ordinary_color_route =
+        pixel_shader && normalized_color_mask && !IsVoidFragmentMsl(pixel_translation);
+    // A fragment shader may have no render-target or depth/stencil output but
+    // still write a memexport stream. It must be rasterized once with color
+    // writes disabled so the side effect isn't dropped as a no-output draw.
+    bool side_effect_only_draw =
+        pixel_memexport_draw && (!shader_exports_color || !ordinary_color_route);
+    bool zero_color_write_draw = depth_only_draw || side_effect_only_draw;
+    if (zero_color_write_draw) {
+      update_draw_constants();
+      bool preserve_translated_pixel_shader =
+          edram_mode == xenos::EdramMode::kColorDepth && pixel_shader &&
+          (!IsVoidFragmentMsl(pixel_translation) || pixel_shader->kills_pixels() ||
+           pixel_shader->writes_depth() ||
+           HasMemExportSideEffects(*pixel_shader, pixel_translation));
+      MetalShader* routed_pixel_shader = preserve_translated_pixel_shader ? pixel_shader : nullptr;
+      void* pipeline_state = preserve_translated_pixel_shader
+                                 ? EnsureRenderPipeline(*route_vertex_shader, *pixel_shader, 0, 0)
+                                 : EnsureDepthOnlyPipeline(*route_vertex_shader, nullptr);
+      HostRenderTarget* active_host_rt = pipeline_state ? EnsureHostRenderTarget(0) : nullptr;
+      if (active_host_rt && active_host_rt->context) {
+        void* saved_host_render_target_context_override = host_render_target_context_override_;
+        host_render_target_context_override_ = active_host_rt->context;
+        bool routed = TryRenderPipelineProbe(
+            *route_vertex_shader, routed_pixel_shader, pipeline_state, host_prim_type,
+            host_draw_vertex_count, true,
+            primitive_processing_ok ? &primitive_processing_result : nullptr);
+        host_render_target_context_override_ = saved_host_render_target_context_override;
+        if (!routed && pixel_memexport_draw) {
+          return false;
+        }
+        if (routed) {
+          owned_rt_routed_this_draw = true;
+          if (collect_draw_route_summary_) {
+            ++owned_rt_routed_draws_this_swap_;
+            ++owned_rt_routed_targets_this_swap_;
+          }
+        }
+      } else if (pixel_memexport_draw) {
+        return false;
+      }
+    }
+    if (!zero_color_write_draw && ordinary_color_route) {
       update_draw_constants();
       bool routed_this_draw = false;
       for (uint32_t rt_index = 0; rt_index < xenos::kMaxColorRenderTargets; ++rt_index) {
@@ -3472,13 +3636,22 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
         if (!active_host_rt || !active_host_rt->context) {
           continue;
         }
-        routed_this_draw = true;
-        ++owned_rt_routed_targets_this_swap_;
         void* saved_host_render_target_context_override = host_render_target_context_override_;
         host_render_target_context_override_ = active_host_rt->context;
-        TryRenderPipelineProbe(*route_vertex_shader, *pixel_shader, pipeline_state, host_prim_type,
-                               host_draw_vertex_count, true,
-                               primitive_processing_ok ? &primitive_processing_result : nullptr);
+        bool routed = TryRenderPipelineProbe(
+            *route_vertex_shader, pixel_shader, pipeline_state, host_prim_type,
+            host_draw_vertex_count, true,
+            primitive_processing_ok ? &primitive_processing_result : nullptr);
+        if (!routed && pixel_memexport_draw) {
+          host_render_target_context_override_ = saved_host_render_target_context_override;
+          return false;
+        }
+        if (routed) {
+          routed_this_draw = true;
+          if (collect_draw_route_summary_) {
+            ++owned_rt_routed_targets_this_swap_;
+          }
+        }
         if (last_host_render_target_probe_read_ && latest_host_render_target_width_ &&
             latest_host_render_target_height_ && !latest_host_render_target_bgra_.empty()) {
           active_host_rt->bgra = latest_host_render_target_bgra_;
@@ -3491,7 +3664,7 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
           static std::atomic<uint32_t> producer_vertex_logs{0};
           uint32_t producer_vertex_index =
               producer_vertex_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-          if (producer_vertex_index <= 16 || (producer_vertex_index & 0x3F) == 0) {
+          if (ShouldLogMetalDiagnostic(producer_vertex_index, 16, 0x3F)) {
             xenos::xe_gpu_vertex_fetch_t fetch = register_file_->GetVertexFetch(0);
             uint32_t fetch_byte_address = uint32_t(fetch.address * sizeof(uint32_t));
             const uint32_t* vertex_words =
@@ -3570,9 +3743,16 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       }
       if (routed_this_draw) {
         owned_rt_routed_this_draw = true;
-        ++owned_rt_routed_draws_this_swap_;
+        if (collect_draw_route_summary_) {
+          ++owned_rt_routed_draws_this_swap_;
+        }
+      } else if (pixel_memexport_draw) {
+        return false;
       }
     }
+  }
+  if (pixel_memexport_draw && !owned_rt_routed_this_draw) {
+    return false;
   }
   if (MetalHostPixelDiagnosticsEnabled() && metal_device_ && vertex_shader &&
       !vertex_shader->writes_position() && pixel_shader && pixel_translation_ok &&
@@ -3591,7 +3771,9 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
           continue;
         }
         routed_this_draw = true;
-        ++owned_rt_routed_targets_this_swap_;
+        if (collect_draw_route_summary_) {
+          ++owned_rt_routed_targets_this_swap_;
+        }
         std::vector<uint8_t> fullscreen_bgra;
         bool rendered_fullscreen = RenderFullscreenPixelShader(
             *pixel_shader, fallback_output_width_, fallback_output_height_, fullscreen_bgra, false);
@@ -3625,16 +3807,20 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       }
       if (routed_this_draw) {
         owned_rt_routed_this_draw = true;
-        ++owned_rt_routed_draws_this_swap_;
+        if (collect_draw_route_summary_) {
+          ++owned_rt_routed_draws_this_swap_;
+        }
       }
     }
   }
   if (register_color_candidate_draw && !owned_rt_routed_this_draw) {
-    ++register_color_unrouted_draws_this_swap_;
+    if (collect_draw_route_summary_) {
+      ++register_color_unrouted_draws_this_swap_;
+    }
     static std::atomic<uint32_t> register_color_unrouted_logs{0};
     uint32_t register_color_unrouted_index =
         register_color_unrouted_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (register_color_unrouted_index <= 64 || (register_color_unrouted_index & 0xFF) == 0) {
+    if (ShouldLogMetalDiagnostic(register_color_unrouted_index, 64, 0xFF)) {
       std::fprintf(
           stderr,
           "[metal] register-color unrouted#%u draw=%u reason=no-route "
@@ -3659,10 +3845,11 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   bool host_render_target_debug = MetalHostRenderTargetDebugEnabled();
   if (MetalPipelineProbesEnabled() && metal_device_ && vertex_shader &&
       vertex_shader->writes_position() && pixel_shader && vertex_translation_ok &&
-      pixel_translation_ok) {
+      pixel_translation_ok && !HasMemExportSideEffects(*vertex_shader, vertex_translation) &&
+      !HasMemExportSideEffects(*pixel_shader, pixel_translation)) {
     if (void* pipeline_state = EnsureRenderPipeline(*vertex_shader, *pixel_shader)) {
       update_draw_constants();
-      TryRenderPipelineProbe(*vertex_shader, *pixel_shader, pipeline_state, prim_type, index_count,
+      TryRenderPipelineProbe(*vertex_shader, pixel_shader, pipeline_state, prim_type, index_count,
                              false);
     }
   }
@@ -5106,7 +5293,8 @@ bool MetalCommandProcessor::IssueCopy() {
                                              profiling::CommandEvent::kIssueCopy);
   static std::atomic<uint32_t> metal_copy_logs{0};
   uint32_t metal_copy_index = metal_copy_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (metal_copy_index <= 16 || (metal_copy_index & 0x3F) == 0) {
+  bool log_copy_diagnostics = ShouldLogMetalDiagnostic(metal_copy_index, 16, 0x3F);
+  if (log_copy_diagnostics) {
     std::fprintf(stderr, "[metal] IssueCopy#%u\n", metal_copy_index);
     std::fflush(stderr);
   }
@@ -5134,31 +5322,29 @@ bool MetalCommandProcessor::IssueCopy() {
     resolve_info_valid =
         draw_util::GetResolveInfo(*register_file_, *memory_, trace_writer_, resolve_scale_x,
                                   resolve_scale_y, false, false, resolve_info);
-    draw_util::ResolveCopyShaderConstants copy_shader_constants = {};
-    uint32_t copy_group_count_x = 0;
-    uint32_t copy_group_count_y = 0;
-    draw_util::ResolveCopyShaderIndex copy_shader = draw_util::ResolveCopyShaderIndex::kUnknown;
-    const char* copy_shader_name = "none";
-    if (resolve_info_valid) {
-      copy_shader =
-          resolve_info.GetCopyShader(resolve_scale_x, resolve_scale_y, copy_shader_constants,
-                                     copy_group_count_x, copy_group_count_y);
-      if (copy_shader != draw_util::ResolveCopyShaderIndex::kUnknown) {
-        copy_shader_name = draw_util::resolve_copy_shader_info[size_t(copy_shader)].debug_name;
-      } else {
-        copy_shader_name = "unknown";
+    if (log_copy_diagnostics) {
+      draw_util::ResolveCopyShaderConstants copy_shader_constants = {};
+      uint32_t copy_group_count_x = 0;
+      uint32_t copy_group_count_y = 0;
+      draw_util::ResolveCopyShaderIndex copy_shader = draw_util::ResolveCopyShaderIndex::kUnknown;
+      const char* copy_shader_name = "none";
+      if (resolve_info_valid) {
+        copy_shader =
+            resolve_info.GetCopyShader(resolve_scale_x, resolve_scale_y, copy_shader_constants,
+                                       copy_group_count_x, copy_group_count_y);
+        copy_shader_name = copy_shader != draw_util::ResolveCopyShaderIndex::kUnknown
+                               ? draw_util::resolve_copy_shader_info[size_t(copy_shader)].debug_name
+                               : "unknown";
       }
-    }
-    bool watched_framebuffer =
-        RangesOverlap(resolve_info.copy_dest_base, resolve_info.copy_dest_extent_length,
-                      kWatchedFramebufferBase, kWatchedFramebufferLength);
-    bool watched_resolve =
-        RangesOverlap(resolve_info.copy_dest_base, resolve_info.copy_dest_extent_length,
-                      kWatchedResolveBase, kWatchedResolveLength);
-    bool watched_swap =
-        RangesOverlap(resolve_info.copy_dest_base, resolve_info.copy_dest_extent_length,
-                      kWatchedSwapBase, kWatchedSwapLength);
-    if (metal_copy_index <= 16 || (metal_copy_index & 0x3F) == 0) {
+      bool watched_framebuffer =
+          RangesOverlap(resolve_info.copy_dest_base, resolve_info.copy_dest_extent_length,
+                        kWatchedFramebufferBase, kWatchedFramebufferLength);
+      bool watched_resolve =
+          RangesOverlap(resolve_info.copy_dest_base, resolve_info.copy_dest_extent_length,
+                        kWatchedResolveBase, kWatchedResolveLength);
+      bool watched_swap =
+          RangesOverlap(resolve_info.copy_dest_base, resolve_info.copy_dest_extent_length,
+                        kWatchedSwapBase, kWatchedSwapLength);
       std::fprintf(stderr,
                    "[metal] copy-map#%u rb_dest=0x%08x active=%u ctrl=0x%08x src=%u cmd=%u "
                    "clear(c=%u d=%u) pitch=%u height=%u resolve_valid=%u resolve_dest=0x%08x "
@@ -5176,30 +5362,31 @@ bool MetalCommandProcessor::IssueCopy() {
                    watched_resolve ? 1u : 0u, watched_swap ? 1u : 0u, copy_shader_name,
                    copy_group_count_x, copy_group_count_y);
       std::fflush(stderr);
-    }
-    if (resolve_info_valid && (metal_copy_index <= 16 || (metal_copy_index & 0x3F) == 0)) {
-      uint32_t edram_base = 0;
-      uint32_t edram_row_length = 0;
-      uint32_t edram_rows = 0;
-      uint32_t edram_pitch = 0;
-      resolve_info.GetCopyEdramTileSpan(edram_base, edram_row_length, edram_rows, edram_pitch);
-      std::fprintf(stderr,
-                   "[metal] resolve-info#%u valid=1 rect=%ux%u dest_base=0x%08x "
-                   "dest_extent=0x%08x+0x%x dest_pitch=%u dest_height=%u "
-                   "dest_offset=%u,%u edram(base=%u row=%u rows=%u pitch=%u) color(base=%u fmt=%u) "
-                   "depth(base=%u fmt=%u) shader=%s groups=%ux%u\n",
-                   metal_copy_index, resolve_info.coordinate_info.width_div_8 * 8,
-                   resolve_info.height_div_8 * 8, resolve_info.copy_dest_base,
-                   resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
-                   uint32_t(resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32) * 32,
-                   uint32_t(resolve_info.copy_dest_coordinate_info.height_aligned_div_32) * 32,
-                   uint32_t(resolve_info.copy_dest_coordinate_info.offset_x_div_8) * 8,
-                   uint32_t(resolve_info.copy_dest_coordinate_info.offset_y_div_8) * 8, edram_base,
-                   edram_row_length, edram_rows, edram_pitch, resolve_info.color_original_base,
-                   uint32_t(resolve_info.color_edram_info.format), resolve_info.depth_original_base,
-                   uint32_t(resolve_info.depth_edram_info.format), copy_shader_name,
-                   copy_group_count_x, copy_group_count_y);
-      std::fflush(stderr);
+      if (resolve_info_valid) {
+        uint32_t edram_base = 0;
+        uint32_t edram_row_length = 0;
+        uint32_t edram_rows = 0;
+        uint32_t edram_pitch = 0;
+        resolve_info.GetCopyEdramTileSpan(edram_base, edram_row_length, edram_rows, edram_pitch);
+        std::fprintf(
+            stderr,
+            "[metal] resolve-info#%u valid=1 rect=%ux%u dest_base=0x%08x "
+            "dest_extent=0x%08x+0x%x dest_pitch=%u dest_height=%u "
+            "dest_offset=%u,%u edram(base=%u row=%u rows=%u pitch=%u) color(base=%u fmt=%u) "
+            "depth(base=%u fmt=%u) shader=%s groups=%ux%u\n",
+            metal_copy_index, resolve_info.coordinate_info.width_div_8 * 8,
+            resolve_info.height_div_8 * 8, resolve_info.copy_dest_base,
+            resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
+            uint32_t(resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32) * 32,
+            uint32_t(resolve_info.copy_dest_coordinate_info.height_aligned_div_32) * 32,
+            uint32_t(resolve_info.copy_dest_coordinate_info.offset_x_div_8) * 8,
+            uint32_t(resolve_info.copy_dest_coordinate_info.offset_y_div_8) * 8, edram_base,
+            edram_row_length, edram_rows, edram_pitch, resolve_info.color_original_base,
+            uint32_t(resolve_info.color_edram_info.format), resolve_info.depth_original_base,
+            uint32_t(resolve_info.depth_edram_info.format), copy_shader_name, copy_group_count_x,
+            copy_group_count_y);
+        std::fflush(stderr);
+      }
     }
   }
   auto compute_copy_rect = [&](uint32_t resolve_width, uint32_t resolve_height, uint32_t& rect_x,
@@ -5314,7 +5501,7 @@ bool MetalCommandProcessor::IssueCopy() {
     static std::atomic<uint32_t> copy_clear_side_effect_logs{0};
     uint32_t copy_clear_side_effect_index =
         copy_clear_side_effect_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (copy_clear_side_effect_index <= 16 || (copy_clear_side_effect_index & 0xFF) == 0) {
+    if (ShouldLogMetalDiagnostic(copy_clear_side_effect_index, 16, 0xFF)) {
       std::fprintf(stderr,
                    "[metal] copy clear side effect#%u dest=0x%08x src=%u cmd=%u "
                    "clear(c=%u d=%u) color_clear=0x%08x\n",
@@ -5893,7 +6080,7 @@ bool MetalCommandProcessor::IssueCopy() {
               static std::atomic<uint32_t> host_rt_clear_logs{0};
               uint32_t host_rt_clear_index =
                   host_rt_clear_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-              if (host_rt_clear_index <= 16 || (host_rt_clear_index & 0xFF) == 0) {
+              if (ShouldLogMetalDiagnostic(host_rt_clear_index, 16, 0xFF)) {
                 std::fprintf(stderr,
                              "[metal] host RT resolve-clear#%u copy=%u rt=%u rect=%u,%u %ux%u "
                              "size=%ux%u rgba=%02x %02x %02x %02x\n",
@@ -5916,6 +6103,110 @@ bool MetalCommandProcessor::IssueCopy() {
             }
           }
         }
+      }
+    }
+  }
+  if (resolve_info_valid && resolve_info.IsClearingDepth() && register_file_) {
+    uint32_t depth_original_base = resolve_info.depth_original_base & (xenos::kEdramTileCount - 1);
+    reg::RB_SURFACE_INFO current_surface = register_file_->Get<reg::RB_SURFACE_INFO>();
+    auto find_depth_owner = [&]() -> HostDepthStencilTarget* {
+      for (auto& [target_key, target] : host_depth_stencil_targets_) {
+        (void)target_key;
+        if (!target.context) {
+          continue;
+        }
+        reg::RB_DEPTH_INFO stored_depth = {};
+        stored_depth.value = target.depth_info;
+        uint32_t stored_depth_base =
+            (stored_depth.depth_base | (stored_depth.depth_base_bit_11 << 11)) &
+            (xenos::kEdramTileCount - 1);
+        reg::RB_SURFACE_INFO stored_surface = {};
+        stored_surface.value = target.surface_info;
+        uint32_t stored_pitch_tiles = xenos::GetSurfacePitchTiles(
+            stored_surface.surface_pitch, stored_surface.msaa_samples, false);
+        if (stored_depth_base == depth_original_base &&
+            stored_depth.depth_format ==
+                xenos::DepthRenderTargetFormat(resolve_info.depth_edram_info.format) &&
+            stored_surface.msaa_samples == resolve_info.depth_edram_info.msaa_samples &&
+            stored_pitch_tiles == resolve_info.depth_edram_info.pitch_tiles) {
+          return &target;
+        }
+      }
+      return nullptr;
+    };
+    HostDepthStencilTarget* depth_owner = find_depth_owner();
+    if (!depth_owner && current_surface.surface_pitch &&
+        current_surface.msaa_samples == resolve_info.depth_edram_info.msaa_samples &&
+        xenos::GetSurfacePitchTiles(current_surface.surface_pitch, current_surface.msaa_samples,
+                                    false) == resolve_info.depth_edram_info.pitch_tiles) {
+      // A resolve-clear may be the first operation on a depth surface. Create
+      // its host owner from the resolve identity instead of dropping the
+      // non-default depth/stencil value and letting the first later draw
+      // initialize it to 1/0.
+      reg::RB_DEPTH_INFO depth_info = register_file_->Get<reg::RB_DEPTH_INFO>();
+      depth_info.depth_base = depth_original_base;
+      depth_info.depth_base_bit_11 = 0;
+      depth_info.depth_format =
+          xenos::DepthRenderTargetFormat(resolve_info.depth_edram_info.format);
+      depth_owner = EnsureHostDepthStencilTarget(depth_info.value, current_surface.value);
+    }
+    if (depth_owner) {
+      const draw_util::ResolveEdramInfo& depth_edram_info = resolve_info.depth_edram_info;
+      uint32_t clear_x = uint32_t(resolve_info.coordinate_info.edram_offset_x_div_8) * 8;
+      uint32_t clear_y = uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8) * 8;
+      if (depth_edram_info.pitch_tiles) {
+        uint32_t base_delta =
+            (depth_edram_info.base_tiles + xenos::kEdramTileCount - depth_original_base) &
+            (xenos::kEdramTileCount - 1);
+        uint32_t tile_width_pixels =
+            xenos::kEdramTileWidthSamples >>
+            uint32_t(depth_edram_info.msaa_samples >= xenos::MsaaSamples::k4X);
+        uint32_t tile_height_pixels =
+            xenos::kEdramTileHeightSamples >>
+            uint32_t(depth_edram_info.msaa_samples >= xenos::MsaaSamples::k2X);
+        clear_x += (base_delta % depth_edram_info.pitch_tiles) * tile_width_pixels;
+        clear_y += (base_delta / depth_edram_info.pitch_tiles) * tile_height_pixels;
+      }
+      uint32_t clear_width = uint32_t(resolve_info.coordinate_info.width_div_8) * 8;
+      uint32_t clear_height = uint32_t(resolve_info.height_div_8) * 8;
+      uint32_t target_width = std::max<uint32_t>(fallback_output_width_, 1);
+      uint32_t target_height = std::max<uint32_t>(fallback_output_height_, 1);
+      clear_x = std::min(clear_x, target_width);
+      clear_y = std::min(clear_y, target_height);
+      clear_width = std::min(clear_width, target_width - clear_x);
+      clear_height = std::min(clear_height, target_height - clear_y);
+      uint32_t packed_depth = (resolve_info.rb_depth_clear >> 8) & 0xFFFFFF;
+      float clear_depth = xenos::DepthRenderTargetFormat(resolve_info.depth_edram_info.format) ==
+                                  xenos::DepthRenderTargetFormat::kD24FS8
+                              ? xenos::Float20e4To32(packed_depth) * 0.5f
+                              : xenos::UNorm24To32(packed_depth);
+      std::string depth_clear_error;
+      if (!QueuePipelineProbeContextDepthStencilClearRect(
+              depth_owner->context, target_width, target_height, clear_x, clear_y, clear_width,
+              clear_height, clear_depth, uint8_t(resolve_info.rb_depth_clear),
+              &depth_clear_error)) {
+        static std::atomic<uint32_t> depth_clear_failure_logs{0};
+        uint32_t failure_index =
+            depth_clear_failure_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (failure_index <= 8 || (failure_index & 0x3F) == 0) {
+          std::fprintf(stderr, "[metal] host depth/stencil resolve-clear failed#%u: %s\n",
+                       failure_index, depth_clear_error.c_str());
+          std::fflush(stderr);
+        }
+      }
+    } else {
+      static std::atomic<uint32_t> missing_depth_clear_owner_logs{0};
+      uint32_t failure_index =
+          missing_depth_clear_owner_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (failure_index <= 8 || (failure_index & 0x3F) == 0) {
+        std::fprintf(stderr,
+                     "[metal] host depth/stencil resolve-clear has no compatible owner#%u "
+                     "base=%u format=%u msaa=%u pitch=%u pitch_tiles=%u\n",
+                     failure_index, depth_original_base,
+                     uint32_t(resolve_info.depth_edram_info.format),
+                     uint32_t(resolve_info.depth_edram_info.msaa_samples),
+                     current_surface.surface_pitch, resolve_info.depth_edram_info.pitch_tiles);
+        std::fflush(stderr);
       }
     }
   }
@@ -6280,12 +6571,11 @@ bool MetalCommandProcessor::IssueCopy() {
           latest_draw_event_frame_bgra_ = resolved_color_bgra_;
           latest_draw_event_frame_width_ = resolved_color_width_;
           latest_draw_event_frame_height_ = resolved_color_height_;
-          BgraFrameStats resolved_write_stats = GetBgraFrameStats(resolved_color_bgra_);
           static std::atomic<uint32_t> host_pixel_resolve_write_logs{0};
           uint32_t host_pixel_resolve_write_index =
               host_pixel_resolve_write_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-          if (host_pixel_resolve_write_index <= 16 ||
-              (host_pixel_resolve_write_index & 0x3F) == 0) {
+          if (ShouldLogMetalDiagnostic(host_pixel_resolve_write_index, 16, 0x3F)) {
+            BgraFrameStats resolved_write_stats = GetBgraFrameStats(resolved_color_bgra_);
             std::fprintf(stderr,
                          "[metal] wrote host pixel resolve#%u base=0x%08x pitch=%u height=%u "
                          "image=%ux%u rect=%u,%u %ux%u host_vertices=%zu "
@@ -6326,7 +6616,7 @@ bool MetalCommandProcessor::IssueCopy() {
           static std::atomic<uint32_t> resolve_write_logs{0};
           uint32_t resolve_write_index =
               resolve_write_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-          if (resolve_write_index <= 8 || (resolve_write_index & 0x3F) == 0) {
+          if (ShouldLogMetalDiagnostic(resolve_write_index, 8, 0x3F)) {
             std::fprintf(stderr,
                          "[metal] wrote fallback resolve#%u base=0x%08x pitch=%u height=%u "
                          "image=%ux%u rect=%u,%u %ux%u host_vertices=%zu texture=%u\n",
@@ -6347,7 +6637,7 @@ bool MetalCommandProcessor::IssueCopy() {
       }
     }
   }
-  if (memory_ && register_file_ && (metal_copy_index <= 16 || (metal_copy_index & 0x3F) == 0)) {
+  if (memory_ && register_file_ && log_copy_diagnostics) {
     reg::RB_COPY_CONTROL copy_control = register_file_->Get<reg::RB_COPY_CONTROL>();
     reg::RB_COPY_DEST_INFO copy_dest_info = register_file_->Get<reg::RB_COPY_DEST_INFO>();
     reg::RB_COPY_DEST_PITCH copy_dest_pitch = register_file_->Get<reg::RB_COPY_DEST_PITCH>();
@@ -6813,6 +7103,9 @@ bool MetalCommandProcessor::FinalizePipelineProbeSubmissions() {
   for (const auto& target_entry : host_render_targets_) {
     add_context(target_entry.second.context);
   }
+  for (const auto& depth_entry : host_depth_stencil_targets_) {
+    add_context(depth_entry.second.context);
+  }
 
   bool succeeded = true;
   std::string first_error;
@@ -6855,6 +7148,9 @@ bool MetalCommandProcessor::WaitForPipelineProbeSubmissions(const char* reason,
   add_context(host_render_target_context_override_);
   for (const auto& target_entry : host_render_targets_) {
     add_context(target_entry.second.context);
+  }
+  for (const auto& depth_entry : host_depth_stencil_targets_) {
+    add_context(depth_entry.second.context);
   }
 
   bool succeeded = true;
@@ -6967,13 +7263,13 @@ bool MetalCommandProcessor::RefreshHostRenderTargetBacking(uint32_t width, uint3
     }
     return false;
   }
-  uint32_t visible = CountVisibleRgbPixels(host_rt_bgra);
   latest_host_render_target_bgra_ = std::move(host_rt_bgra);
   latest_host_render_target_width_ = width;
   latest_host_render_target_height_ = height;
   static std::atomic<uint32_t> host_rt_read_logs{0};
   uint32_t host_rt_read_index = host_rt_read_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (host_rt_read_index <= 16 || (host_rt_read_index & 0x3F) == 0) {
+  if (ShouldLogMetalDiagnostic(host_rt_read_index, 16, 0x3F)) {
+    uint32_t visible = CountVisibleRgbPixels(latest_host_render_target_bgra_);
     std::fprintf(stderr, "[metal] read host render target debug#%u size=%ux%u visible=%u\n",
                  host_rt_read_index, width, height, visible);
     std::fflush(stderr);
@@ -7033,7 +7329,6 @@ bool MetalCommandProcessor::DumpHostRenderTargetToEdram(const HostRenderTarget& 
   uint32_t sample_y_log2 = uint32_t(surface_info.msaa_samples >= xenos::MsaaSamples::k2X);
   uint32_t sample_count = 1u << uint32_t(surface_info.msaa_samples);
   uint32_t dump_width = std::min(target.width, surface_info.surface_pitch);
-  uint32_t visible = CountVisibleRgbPixels(target.bgra);
   for (uint32_t y = 0; y < target.height; ++y) {
     const uint8_t* source_row = target.bgra.data() + size_t(y) * target.width * 4;
     for (uint32_t x = 0; x < dump_width; ++x) {
@@ -7057,7 +7352,8 @@ bool MetalCommandProcessor::DumpHostRenderTargetToEdram(const HostRenderTarget& 
   }
   static std::atomic<uint32_t> edram_dump_logs{0};
   uint32_t edram_dump_index = edram_dump_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (edram_dump_index <= 32 || (edram_dump_index & 0xFF) == 0) {
+  if (ShouldLogMetalDiagnostic(edram_dump_index, 32, 0xFF)) {
+    uint32_t visible = CountVisibleRgbPixels(target.bgra);
     std::fprintf(stderr,
                  "[metal] edram dump#%u rt=%u base=%u pitch_tiles=%u msaa=%u "
                  "size=%ux%u dump_width=%u visible=%u color=0x%08x surface=0x%08x\n",
@@ -7130,7 +7426,7 @@ bool MetalCommandProcessor::ResolveEdramToBgra(const draw_util::ResolveInfo& res
   }
   static std::atomic<uint32_t> edram_resolve_logs{0};
   uint32_t edram_resolve_index = edram_resolve_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (edram_resolve_index <= 32 || (edram_resolve_index & 0xFF) == 0) {
+  if (ShouldLogMetalDiagnostic(edram_resolve_index, 32, 0xFF)) {
     BgraFrameStats stats = GetBgraFrameStats(bgra_out);
     std::fprintf(stderr,
                  "[metal] edram readback resolve#%u shader=%s groups=%ux%u "
@@ -7155,7 +7451,10 @@ uint64_t MetalCommandProcessor::GetHostRenderTargetKey(uint32_t rt_index) const 
   if (!surface_info.surface_pitch) {
     return 0;
   }
-  uint32_t key_parts[3] = {rt_index, color_info.value, surface_info.value};
+  // Color contents survive depth-buffer rebinds. Depth/stencil identity is
+  // tracked independently and the color context is reattached when needed.
+  uint32_t key_parts[4] = {rt_index, color_info.value, surface_info.surface_pitch,
+                           uint32_t(surface_info.msaa_samples)};
   return XXH3_64bits(key_parts, sizeof(key_parts));
 }
 
@@ -7220,46 +7519,132 @@ MetalCommandProcessor::HostRenderTarget* MetalCommandProcessor::FindHostRenderTa
   return best_target;
 }
 
+MetalCommandProcessor::HostDepthStencilTarget* MetalCommandProcessor::EnsureHostDepthStencilTarget(
+    uint32_t depth_info_value, uint32_t surface_info_value) {
+  if (!metal_device_) {
+    return nullptr;
+  }
+  reg::RB_SURFACE_INFO surface_info = {};
+  surface_info.value = surface_info_value;
+  if (!surface_info.surface_pitch) {
+    return nullptr;
+  }
+
+  uint64_t key = GetHostDepthStencilKey(depth_info_value, surface_info_value);
+  auto [it, inserted] = host_depth_stencil_targets_.try_emplace(key);
+  HostDepthStencilTarget& target = it->second;
+  if (target.context) {
+    return &target;
+  }
+
+  std::string context_error;
+  target.context = CreateHostRenderTargetContext(
+      metal_device_, shared_memory_ ? shared_memory_->command_queue() : nullptr, &context_error);
+  uint32_t sample_count = GetMetalSampleCount(surface_info.msaa_samples);
+  if (!target.context ||
+      !SetPipelineProbeContextSampleCount(target.context, sample_count, &context_error)) {
+    ReleasePipelineProbeContext(target.context);
+    target.context = nullptr;
+    host_depth_stencil_targets_.erase(it);
+    REXLOG_WARN("Metal host depth/stencil target creation failed: {}", context_error);
+    return nullptr;
+  }
+  target.depth_info = depth_info_value;
+  target.surface_info = surface_info_value;
+  (void)inserted;
+  return &target;
+}
+
 MetalCommandProcessor::HostRenderTarget* MetalCommandProcessor::EnsureHostRenderTarget(
     uint32_t rt_index) {
   uint64_t key = GetHostRenderTargetKey(rt_index);
   if (!key || !metal_device_ || !register_file_) {
     return nullptr;
   }
+  uint32_t current_color_info =
+      register_file_->Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[rt_index])
+          .value;
+  uint32_t current_depth_info = register_file_->Get<reg::RB_DEPTH_INFO>().value;
+  uint32_t current_surface_info = register_file_->Get<reg::RB_SURFACE_INFO>().value;
+  reg::RB_SURFACE_INFO surface_info = {};
+  surface_info.value = current_surface_info;
+  uint32_t sample_count = GetMetalSampleCount(surface_info.msaa_samples);
+
   auto [it, inserted] = host_render_targets_.try_emplace(key);
   (void)inserted;
   HostRenderTarget& target = it->second;
-  if (target.context) {
-    return &target;
-  }
   std::string context_error;
-  target.context = CreateHostRenderTargetContext(
-      metal_device_, shared_memory_ ? shared_memory_->command_queue() : nullptr, &context_error);
-  target.rt_index = rt_index;
-  target.color_info =
-      register_file_->Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[rt_index])
-          .value;
-  target.surface_info = register_file_->Get<reg::RB_SURFACE_INFO>().value;
+  bool created_color_context = false;
   if (!target.context) {
-    host_render_targets_.erase(it);
-    static std::atomic<uint32_t> rt_context_fail_logs{0};
-    uint32_t rt_context_fail_index =
-        rt_context_fail_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (rt_context_fail_index <= 8 || (rt_context_fail_index & 0x3F) == 0) {
-      std::fprintf(stderr, "[metal] host RT context failed#%u rt=%u: %s\n", rt_context_fail_index,
-                   rt_index, context_error.c_str());
-      std::fflush(stderr);
+    target.context = CreateHostRenderTargetContext(
+        metal_device_, shared_memory_ ? shared_memory_->command_queue() : nullptr, &context_error);
+    target.rt_index = rt_index;
+    target.color_info = current_color_info;
+    target.surface_info = current_surface_info;
+    if (!target.context) {
+      host_render_targets_.erase(it);
+      static std::atomic<uint32_t> rt_context_fail_logs{0};
+      uint32_t rt_context_fail_index =
+          rt_context_fail_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (rt_context_fail_index <= 8 || (rt_context_fail_index & 0x3F) == 0) {
+        std::fprintf(stderr, "[metal] host RT context failed#%u rt=%u: %s\n", rt_context_fail_index,
+                     rt_index, context_error.c_str());
+        std::fflush(stderr);
+      }
+      return nullptr;
+    }
+    if (!SetPipelineProbeContextSampleCount(target.context, sample_count, &context_error)) {
+      ReleasePipelineProbeContext(target.context);
+      target.context = nullptr;
+      host_render_targets_.erase(it);
+      REXLOG_WARN("Metal host RT {}x MSAA context rejected: {}", sample_count, context_error);
+      return nullptr;
+    }
+    created_color_context = true;
+  }
+
+  // Keep depth/stencil alive independently from every color target. Rebinding
+  // depth therefore changes only the color context's attachment, not its color
+  // texture or the lifetime of either guest depth surface.
+  uint64_t depth_stencil_key = GetHostDepthStencilKey(current_depth_info, current_surface_info);
+  HostDepthStencilTarget* depth_target =
+      EnsureHostDepthStencilTarget(current_depth_info, current_surface_info);
+  if (!depth_target) {
+    if (created_color_context) {
+      ReleasePipelineProbeContext(target.context);
+      target.context = nullptr;
+      host_render_targets_.erase(it);
     }
     return nullptr;
   }
-  static std::atomic<uint32_t> rt_context_logs{0};
-  uint32_t rt_context_index = rt_context_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (rt_context_index <= 16 || (rt_context_index & 0x3F) == 0) {
-    std::fprintf(stderr,
-                 "[metal] host RT context#%u rt=%u key=%016llx color=0x%08x surface=0x%08x\n",
-                 rt_context_index, rt_index, static_cast<unsigned long long>(key),
-                 target.color_info, target.surface_info);
-    std::fflush(stderr);
+  if (target.depth_stencil_key != depth_stencil_key &&
+      !SharePipelineProbeDepthStencilTarget(target.context, depth_target->context,
+                                            &context_error)) {
+    if (created_color_context) {
+      ReleasePipelineProbeContext(target.context);
+      target.context = nullptr;
+      host_render_targets_.erase(it);
+    }
+    REXLOG_WARN("Metal host RT depth/stencil attachment failed: {}", context_error);
+    return nullptr;
+  }
+  target.depth_stencil_key = depth_stencil_key;
+  target.depth_info = current_depth_info;
+  // Hi-Z pitch belongs to the current depth binding and is intentionally not
+  // part of the color key. Keep the latest register value for diagnostics.
+  target.surface_info = current_surface_info;
+
+  if (created_color_context) {
+    static std::atomic<uint32_t> rt_context_logs{0};
+    uint32_t rt_context_index = rt_context_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (rt_context_index <= 16 || (rt_context_index & 0x3F) == 0) {
+      std::fprintf(stderr,
+                   "[metal] host RT context#%u rt=%u key=%016llx color=0x%08x "
+                   "depth=0x%08x surface=0x%08x samples=%u\n",
+                   rt_context_index, rt_index, static_cast<unsigned long long>(key),
+                   target.color_info, target.depth_info, target.surface_info, sample_count);
+      std::fflush(stderr);
+    }
   }
   return &target;
 }
@@ -7912,12 +8297,16 @@ void* MetalCommandProcessor::EnsureRenderPipeline(MetalShader& vertex_shader,
       register_file_
           ? register_file_->values[reg::RB_BLENDCONTROL::rt_register_indices[rt_index]] & 0x1FFF1FFF
           : 0x00010001;
+  uint32_t sample_count = 1;
+  if (register_file_) {
+    sample_count = GetMetalSampleCount(register_file_->Get<reg::RB_SURFACE_INFO>().msaa_samples);
+  }
   uint64_t pipeline_key_parts[6] = {
       vertex_shader.ucode_data_hash(),
       pixel_shader.ucode_data_hash(),
       vertex_modification,
       pixel_modification,
-      rt_index,
+      uint64_t(rt_index) | (uint64_t(sample_count) << 32),
       uint64_t(color_write_mask & 0xF) | (uint64_t(blend_control) << 32)};
   uint64_t pipeline_key = XXH3_64bits(pipeline_key_parts, sizeof(pipeline_key_parts));
   auto existing_pipeline = render_pipeline_states_.find(pipeline_key);
@@ -7939,7 +8328,7 @@ void* MetalCommandProcessor::EnsureRenderPipeline(MetalShader& vertex_shader,
   color_target_state.blend_control = blend_control;
   void* pipeline_state = CreateCachedRenderPipelineState(
       vertex_translation->metal_library(), pixel_translation->metal_library(), &pipeline_error,
-      &color_target_state);
+      &color_target_state, sample_count);
   render_pipeline_states_.emplace(pipeline_key, pipeline_state);
 
   static std::atomic<uint32_t> pipeline_logs{0};
@@ -7969,7 +8358,8 @@ void* MetalCommandProcessor::EnsureRenderPipeline(MetalShader& vertex_shader,
   return pipeline_state;
 }
 
-void* MetalCommandProcessor::EnsureFullscreenPixelPipeline(MetalShader& pixel_shader) {
+void* MetalCommandProcessor::EnsureFullscreenPixelPipeline(MetalShader& pixel_shader,
+                                                           uint32_t sample_count) {
   if (!metal_device_) {
     return nullptr;
   }
@@ -7999,7 +8389,9 @@ void* MetalCommandProcessor::EnsureFullscreenPixelPipeline(MetalShader& pixel_sh
     }
   }
 
-  uint64_t pipeline_key_parts[2] = {pixel_shader.ucode_data_hash(), pixel_modification};
+  sample_count = sample_count == 1 || sample_count == 2 || sample_count == 4 ? sample_count : 1;
+  uint64_t pipeline_key_parts[3] = {pixel_shader.ucode_data_hash(), pixel_modification,
+                                    sample_count};
   uint64_t pipeline_key = XXH3_64bits(pipeline_key_parts, sizeof(pipeline_key_parts));
   auto existing_pipeline = fullscreen_pixel_pipeline_states_.find(pipeline_key);
   if (existing_pipeline != fullscreen_pixel_pipeline_states_.end()) {
@@ -8007,8 +8399,9 @@ void* MetalCommandProcessor::EnsureFullscreenPixelPipeline(MetalShader& pixel_sh
   }
 
   std::string pipeline_error;
-  void* pipeline_state = CreateCachedRenderPipelineState(
-      fullscreen_vertex_library_, pixel_translation->metal_library(), &pipeline_error);
+  void* pipeline_state = CreateCachedRenderPipelineState(fullscreen_vertex_library_,
+                                                         pixel_translation->metal_library(),
+                                                         &pipeline_error, nullptr, sample_count);
   fullscreen_pixel_pipeline_states_.emplace(pipeline_key, pipeline_state);
   static std::atomic<uint32_t> fullscreen_pipeline_logs{0};
   uint32_t fullscreen_pipeline_index =
@@ -8032,7 +8425,8 @@ void* MetalCommandProcessor::EnsureFullscreenPixelPipeline(MetalShader& pixel_sh
   return pipeline_state;
 }
 
-void* MetalCommandProcessor::EnsureHostPixelPipeline(MetalShader& pixel_shader) {
+void* MetalCommandProcessor::EnsureHostPixelPipeline(MetalShader& pixel_shader,
+                                                     uint32_t sample_count) {
   if (!metal_device_) {
     return nullptr;
   }
@@ -8062,7 +8456,9 @@ void* MetalCommandProcessor::EnsureHostPixelPipeline(MetalShader& pixel_shader) 
     }
   }
 
-  uint64_t pipeline_key_parts[2] = {pixel_shader.ucode_data_hash(), pixel_modification};
+  sample_count = sample_count == 1 || sample_count == 2 || sample_count == 4 ? sample_count : 1;
+  uint64_t pipeline_key_parts[3] = {pixel_shader.ucode_data_hash(), pixel_modification,
+                                    sample_count};
   uint64_t pipeline_key = XXH3_64bits(pipeline_key_parts, sizeof(pipeline_key_parts));
   auto existing_pipeline = host_pixel_pipeline_states_.find(pipeline_key);
   if (existing_pipeline != host_pixel_pipeline_states_.end()) {
@@ -8070,8 +8466,9 @@ void* MetalCommandProcessor::EnsureHostPixelPipeline(MetalShader& pixel_shader) 
   }
 
   std::string pipeline_error;
-  void* pipeline_state = CreateCachedRenderPipelineState(
-      host_pixel_vertex_library_, pixel_translation->metal_library(), &pipeline_error);
+  void* pipeline_state = CreateCachedRenderPipelineState(host_pixel_vertex_library_,
+                                                         pixel_translation->metal_library(),
+                                                         &pipeline_error, nullptr, sample_count);
   host_pixel_pipeline_states_.emplace(pipeline_key, pipeline_state);
   static std::atomic<uint32_t> host_pixel_pipeline_logs{0};
   uint32_t host_pixel_pipeline_index =
@@ -8093,7 +8490,7 @@ void* MetalCommandProcessor::EnsureHostPixelPipeline(MetalShader& pixel_shader) 
   return pipeline_state;
 }
 
-void* MetalCommandProcessor::EnsureHostFallbackPixelPipeline() {
+void* MetalCommandProcessor::EnsureHostFallbackPixelPipeline(uint32_t sample_count) {
   if (!metal_device_) {
     return nullptr;
   }
@@ -8132,17 +8529,21 @@ void* MetalCommandProcessor::EnsureHostFallbackPixelPipeline() {
     }
   }
 
-  if (host_fallback_pixel_pipeline_state_) {
-    return host_fallback_pixel_pipeline_state_;
+  sample_count = sample_count == 1 || sample_count == 2 || sample_count == 4 ? sample_count : 1;
+  auto existing_pipeline = host_fallback_pixel_pipeline_states_.find(sample_count);
+  if (existing_pipeline != host_fallback_pixel_pipeline_states_.end()) {
+    return existing_pipeline->second;
   }
 
   std::string pipeline_error;
-  host_fallback_pixel_pipeline_state_ = CreateCachedRenderPipelineState(
-      host_pixel_vertex_library_, host_fallback_pixel_fragment_library_, &pipeline_error);
+  void* pipeline_state = CreateCachedRenderPipelineState(host_pixel_vertex_library_,
+                                                         host_fallback_pixel_fragment_library_,
+                                                         &pipeline_error, nullptr, sample_count);
+  host_fallback_pixel_pipeline_states_.emplace(sample_count, pipeline_state);
   static std::atomic<uint32_t> host_fallback_pipeline_logs{0};
   uint32_t host_fallback_pipeline_index =
       host_fallback_pipeline_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (host_fallback_pixel_pipeline_state_) {
+  if (pipeline_state) {
     if (host_fallback_pipeline_index <= 16 || (host_fallback_pipeline_index & 0x3F) == 0) {
       std::fprintf(stderr, "[metal] host fallback pixel pipeline ready#%u\n",
                    host_fallback_pipeline_index);
@@ -8153,10 +8554,10 @@ void* MetalCommandProcessor::EnsureHostFallbackPixelPipeline() {
                  host_fallback_pipeline_index, pipeline_error.c_str());
     std::fflush(stderr);
   }
-  return host_fallback_pixel_pipeline_state_;
+  return pipeline_state;
 }
 
-void* MetalCommandProcessor::EnsureHostVertexColorPixelPipeline() {
+void* MetalCommandProcessor::EnsureHostVertexColorPixelPipeline(uint32_t sample_count) {
   if (!metal_device_) {
     return nullptr;
   }
@@ -8195,17 +8596,21 @@ void* MetalCommandProcessor::EnsureHostVertexColorPixelPipeline() {
     }
   }
 
-  if (host_vertex_color_pixel_pipeline_state_) {
-    return host_vertex_color_pixel_pipeline_state_;
+  sample_count = sample_count == 1 || sample_count == 2 || sample_count == 4 ? sample_count : 1;
+  auto existing_pipeline = host_vertex_color_pixel_pipeline_states_.find(sample_count);
+  if (existing_pipeline != host_vertex_color_pixel_pipeline_states_.end()) {
+    return existing_pipeline->second;
   }
 
   std::string pipeline_error;
-  host_vertex_color_pixel_pipeline_state_ = CreateCachedRenderPipelineState(
-      host_pixel_vertex_library_, host_vertex_color_pixel_fragment_library_, &pipeline_error);
+  void* pipeline_state = CreateCachedRenderPipelineState(host_pixel_vertex_library_,
+                                                         host_vertex_color_pixel_fragment_library_,
+                                                         &pipeline_error, nullptr, sample_count);
+  host_vertex_color_pixel_pipeline_states_.emplace(sample_count, pipeline_state);
   static std::atomic<uint32_t> host_vertex_color_pipeline_logs{0};
   uint32_t host_vertex_color_pipeline_index =
       host_vertex_color_pipeline_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (host_vertex_color_pixel_pipeline_state_) {
+  if (pipeline_state) {
     if (host_vertex_color_pipeline_index <= 16 || (host_vertex_color_pipeline_index & 0x3F) == 0) {
       std::fprintf(stderr, "[metal] host vertex-color pixel pipeline ready#%u\n",
                    host_vertex_color_pipeline_index);
@@ -8217,7 +8622,7 @@ void* MetalCommandProcessor::EnsureHostVertexColorPixelPipeline() {
                  host_vertex_color_pipeline_index, pipeline_error.c_str());
     std::fflush(stderr);
   }
-  return host_vertex_color_pixel_pipeline_state_;
+  return pipeline_state;
 }
 
 bool MetalCommandProcessor::IsHostPixelProbeAllowed(MetalShader& pixel_shader) const {
@@ -8233,7 +8638,11 @@ bool MetalCommandProcessor::RenderFullscreenPixelShader(MetalShader& pixel_shade
   if (!width || !height || !memory_ || !register_file_) {
     return false;
   }
-  void* pipeline_state = EnsureFullscreenPixelPipeline(pixel_shader);
+  uint32_t sample_count =
+      host_render_target_context
+          ? GetMetalSampleCount(register_file_->Get<reg::RB_SURFACE_INFO>().msaa_samples)
+          : 1;
+  void* pipeline_state = EnsureFullscreenPixelPipeline(pixel_shader, sample_count);
   if (!pipeline_state) {
     return false;
   }
@@ -8383,18 +8792,25 @@ bool MetalCommandProcessor::RenderFullscreenPixelShader(MetalShader& pixel_shade
   std::string render_error;
   bool rendered = false;
   if (host_render_target_context) {
-    rendered = RenderPipelineProbeToContext(
-        GetActiveHostRenderTargetContext(), pipeline_state, &fullscreen_system_constants,
-        sizeof(fullscreen_system_constants), nullptr, 0, fetch_constants_.data(),
-        fetch_constants_.size() * sizeof(uint32_t), memory_->physical_membase(), size_t(0x20000000),
-        nullptr, nullptr, 0, 0, texture_slots.empty() ? nullptr : texture_slots.data(),
-        texture_slots.size(), pixel_shader.GetSamplerBindingsAfterTranslation().size(),
-        uint32_t(xenos::PrimitiveType::kTriangleList), 3, width, height, &render_error, UINT32_MAX,
-        UINT32_MAX, UINT32_MAX, fragment_float_constants_data, fragment_float_constants_size,
-        fragment_float_constants_buffer_index, fragment_fetch_constants_buffer_index, nullptr,
-        fragment_sampler_slots.empty() ? nullptr : fragment_sampler_slots.data(), nullptr, 0,
-        UINT32_MAX, bool_loop_constants_.data(), bool_loop_constants_.size() * sizeof(uint32_t),
-        UINT32_MAX, fragment_bool_loop_constants_buffer_index);
+    void* host_context = GetActiveHostRenderTargetContext();
+    bool sample_count_configured =
+        SetPipelineProbeContextSampleCount(host_context, sample_count, &render_error);
+    rendered =
+        sample_count_configured &&
+        RenderPipelineProbeToContext(
+            host_context, pipeline_state, &fullscreen_system_constants,
+            sizeof(fullscreen_system_constants), nullptr, 0, fetch_constants_.data(),
+            fetch_constants_.size() * sizeof(uint32_t), memory_->physical_membase(),
+            size_t(0x20000000), nullptr, nullptr, 0, 0,
+            texture_slots.empty() ? nullptr : texture_slots.data(), texture_slots.size(),
+            pixel_shader.GetSamplerBindingsAfterTranslation().size(),
+            uint32_t(xenos::PrimitiveType::kTriangleList), 3, width, height, &render_error,
+            UINT32_MAX, UINT32_MAX, UINT32_MAX, fragment_float_constants_data,
+            fragment_float_constants_size, fragment_float_constants_buffer_index,
+            fragment_fetch_constants_buffer_index, nullptr,
+            fragment_sampler_slots.empty() ? nullptr : fragment_sampler_slots.data(), nullptr, 0,
+            UINT32_MAX, bool_loop_constants_.data(), bool_loop_constants_.size() * sizeof(uint32_t),
+            UINT32_MAX, fragment_bool_loop_constants_buffer_index);
     if (rendered && RefreshHostRenderTargetBacking(width, height)) {
       bgra_out = latest_host_render_target_bgra_;
     }
@@ -8506,10 +8922,18 @@ bool MetalCommandProcessor::RenderHostPixelShader(MetalShader& pixel_shader,
   bool use_fallback_fragment =
       !use_host_vertex_color_fragment &&
       ShouldUseHostFallbackPixelShader(pixel_shader.ucode_data_hash(), pixel_translation);
-  void* pipeline_state = use_host_vertex_color_fragment
-                             ? EnsureHostVertexColorPixelPipeline()
-                             : (use_fallback_fragment ? EnsureHostFallbackPixelPipeline()
-                                                      : EnsureHostPixelPipeline(pixel_shader));
+  void* persistent_host_context =
+      persistent_context_override ? persistent_context_override : host_pixel_probe_context_;
+  bool use_persistent_host_context = persistent_host_context && !use_fallback_fragment;
+  uint32_t sample_count =
+      use_persistent_host_context && persistent_context_override
+          ? GetMetalSampleCount(register_file_->Get<reg::RB_SURFACE_INFO>().msaa_samples)
+          : 1;
+  void* pipeline_state =
+      use_host_vertex_color_fragment
+          ? EnsureHostVertexColorPixelPipeline(sample_count)
+          : (use_fallback_fragment ? EnsureHostFallbackPixelPipeline(sample_count)
+                                   : EnsureHostPixelPipeline(pixel_shader, sample_count));
   if (!pipeline_state) {
     return false;
   }
@@ -8691,12 +9115,15 @@ bool MetalCommandProcessor::RenderHostPixelShader(MetalShader& pixel_shader,
   std::string render_error;
   bool rendered = false;
   std::vector<uint8_t> before_context_bgra;
-  void* persistent_host_context =
-      persistent_context_override ? persistent_context_override : host_pixel_probe_context_;
-  bool use_persistent_host_context = persistent_host_context && !use_fallback_fragment;
   if (use_persistent_host_context) {
-    ReadPipelineProbeContext(persistent_host_context, width, height, before_context_bgra, nullptr);
+    bool sample_count_configured =
+        SetPipelineProbeContextSampleCount(persistent_host_context, sample_count, &render_error);
+    if (sample_count_configured) {
+      ReadPipelineProbeContext(persistent_host_context, width, height, before_context_bgra,
+                               nullptr);
+    }
     rendered =
+        sample_count_configured &&
         RenderPipelineProbeToContext(
             persistent_host_context, pipeline_state, &host_system_constants,
             sizeof(host_system_constants), nullptr, 0, fetch_constants_.data(),
@@ -8752,77 +9179,82 @@ bool MetalCommandProcessor::RenderHostPixelShader(MetalShader& pixel_shader,
   if (pixel_shader.ucode_data_hash() == UINT64_C(0x2e372ea28cc404b7)) {
     static std::atomic<uint32_t> producer_probe_logs{0};
     uint32_t producer_probe_index = producer_probe_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-    BgraFrameStats producer_probe_stats = GetBgraFrameStats(bgra_out);
-    bool force_producer_probe_log = rendered && producer_probe_stats.visible_pixels == 0 &&
-                                    ((producer_probe_index & 0x3F) == 0);
-    if (producer_probe_index <= 32 || force_producer_probe_log) {
-      float host_color_min[4] = {INFINITY, INFINITY, INFINITY, INFINITY};
-      float host_color_max[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
-      float probe_i0_min[4] = {INFINITY, INFINITY, INFINITY, INFINITY};
-      float probe_i0_max[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
-      uint32_t host_i0_mask_count = 0;
-      for (size_t i = 0; i < host_vertex_count; ++i) {
-        const MetalHostVertex& host_vertex = host_vertices[host_vertex_start + i];
-        const HostPixelProbeVertex& probe_vertex = probe_vertices[i];
-        const float host_color[4] = {host_vertex.r, host_vertex.g, host_vertex.b, host_vertex.a};
-        for (uint32_t component = 0; component < 4; ++component) {
-          host_color_min[component] = std::min(host_color_min[component], host_color[component]);
-          host_color_max[component] = std::max(host_color_max[component], host_color[component]);
-          probe_i0_min[component] =
-              std::min(probe_i0_min[component], probe_vertex.interpolators[0][component]);
-          probe_i0_max[component] =
-              std::max(probe_i0_max[component], probe_vertex.interpolators[0][component]);
+    bool check_periodic_probe =
+        MetalVerboseDiagnosticsEnabled() && (producer_probe_index & 0x3F) == 0;
+    if (producer_probe_index <= 32 || check_periodic_probe) {
+      BgraFrameStats producer_probe_stats = GetBgraFrameStats(bgra_out);
+      bool log_producer_probe =
+          producer_probe_index <= 32 ||
+          (check_periodic_probe && rendered && producer_probe_stats.visible_pixels == 0);
+      if (log_producer_probe) {
+        float host_color_min[4] = {INFINITY, INFINITY, INFINITY, INFINITY};
+        float host_color_max[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
+        float probe_i0_min[4] = {INFINITY, INFINITY, INFINITY, INFINITY};
+        float probe_i0_max[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
+        uint32_t host_i0_mask_count = 0;
+        for (size_t i = 0; i < host_vertex_count; ++i) {
+          const MetalHostVertex& host_vertex = host_vertices[host_vertex_start + i];
+          const HostPixelProbeVertex& probe_vertex = probe_vertices[i];
+          const float host_color[4] = {host_vertex.r, host_vertex.g, host_vertex.b, host_vertex.a};
+          for (uint32_t component = 0; component < 4; ++component) {
+            host_color_min[component] = std::min(host_color_min[component], host_color[component]);
+            host_color_max[component] = std::max(host_color_max[component], host_color[component]);
+            probe_i0_min[component] =
+                std::min(probe_i0_min[component], probe_vertex.interpolators[0][component]);
+            probe_i0_max[component] =
+                std::max(probe_i0_max[component], probe_vertex.interpolators[0][component]);
+          }
+          if (host_vertex.interpolator_mask & UINT32_C(1)) {
+            ++host_i0_mask_count;
+          }
         }
-        if (host_vertex.interpolator_mask & UINT32_C(1)) {
-          ++host_i0_mask_count;
-        }
+        const MetalHostVertex* first_host =
+            host_vertex_count ? &host_vertices[host_vertex_start] : nullptr;
+        const MetalHostVertex* last_host =
+            host_vertex_count ? &host_vertices[host_vertex_start + host_vertex_count - 1] : nullptr;
+        const HostPixelProbeVertex* first_probe =
+            probe_vertices.empty() ? nullptr : &probe_vertices.front();
+        const HostPixelProbeVertex* last_probe =
+            probe_vertices.empty() ? nullptr : &probe_vertices.back();
+        BgraFrameStats before_stats = GetBgraFrameStats(before_context_bgra);
+        std::fprintf(
+            stderr,
+            "[metal] producer probe#%u rendered=%u visible_before=%u visible_after=%u "
+            "verts=%zu map_loc0_i%u i0_mask=%u/%zu fallback=%u tex=%u "
+            "float_cb=%u floats=%zu host_rgba_range=(%.4g..%.4g %.4g..%.4g "
+            "%.4g..%.4g %.4g..%.4g) probe_i0_range=(%.4g..%.4g %.4g..%.4g "
+            "%.4g..%.4g %.4g..%.4g) first_host_pos=(%.4g %.4g %.4g %.4g) "
+            "first_host_rgba=(%.4g %.4g %.4g %.4g) first_host_mask=0x%04x "
+            "first_probe_i0=(%.4g %.4g %.4g %.4g) last_host_pos=(%.4g %.4g %.4g %.4g) "
+            "last_host_rgba=(%.4g %.4g %.4g %.4g) last_host_mask=0x%04x "
+            "last_probe_i0=(%.4g %.4g %.4g %.4g)\n",
+            producer_probe_index, rendered ? 1u : 0u, before_stats.visible_pixels,
+            producer_probe_stats.visible_pixels, probe_vertices.size(), interpolator_by_location[0],
+            host_i0_mask_count, host_vertex_count, use_fallback_fragment ? 1u : 0u,
+            has_texture_binding ? 1u : 0u, fragment_float_constants_buffer_index,
+            fragment_float_constants.size(), host_color_min[0], host_color_max[0],
+            host_color_min[1], host_color_max[1], host_color_min[2], host_color_max[2],
+            host_color_min[3], host_color_max[3], probe_i0_min[0], probe_i0_max[0], probe_i0_min[1],
+            probe_i0_max[1], probe_i0_min[2], probe_i0_max[2], probe_i0_min[3], probe_i0_max[3],
+            first_host ? first_host->x : 0.0f, first_host ? first_host->y : 0.0f,
+            first_host ? first_host->z : 0.0f, first_host ? first_host->w : 0.0f,
+            first_host ? first_host->r : 0.0f, first_host ? first_host->g : 0.0f,
+            first_host ? first_host->b : 0.0f, first_host ? first_host->a : 0.0f,
+            first_host ? first_host->interpolator_mask : 0u,
+            first_probe ? first_probe->interpolators[0][0] : 0.0f,
+            first_probe ? first_probe->interpolators[0][1] : 0.0f,
+            first_probe ? first_probe->interpolators[0][2] : 0.0f,
+            first_probe ? first_probe->interpolators[0][3] : 0.0f, last_host ? last_host->x : 0.0f,
+            last_host ? last_host->y : 0.0f, last_host ? last_host->z : 0.0f,
+            last_host ? last_host->w : 0.0f, last_host ? last_host->r : 0.0f,
+            last_host ? last_host->g : 0.0f, last_host ? last_host->b : 0.0f,
+            last_host ? last_host->a : 0.0f, last_host ? last_host->interpolator_mask : 0u,
+            last_probe ? last_probe->interpolators[0][0] : 0.0f,
+            last_probe ? last_probe->interpolators[0][1] : 0.0f,
+            last_probe ? last_probe->interpolators[0][2] : 0.0f,
+            last_probe ? last_probe->interpolators[0][3] : 0.0f);
+        std::fflush(stderr);
       }
-      const MetalHostVertex* first_host =
-          host_vertex_count ? &host_vertices[host_vertex_start] : nullptr;
-      const MetalHostVertex* last_host =
-          host_vertex_count ? &host_vertices[host_vertex_start + host_vertex_count - 1] : nullptr;
-      const HostPixelProbeVertex* first_probe =
-          probe_vertices.empty() ? nullptr : &probe_vertices.front();
-      const HostPixelProbeVertex* last_probe =
-          probe_vertices.empty() ? nullptr : &probe_vertices.back();
-      BgraFrameStats before_stats = GetBgraFrameStats(before_context_bgra);
-      std::fprintf(
-          stderr,
-          "[metal] producer probe#%u rendered=%u visible_before=%u visible_after=%u "
-          "verts=%zu map_loc0_i%u i0_mask=%u/%zu fallback=%u tex=%u "
-          "float_cb=%u floats=%zu host_rgba_range=(%.4g..%.4g %.4g..%.4g "
-          "%.4g..%.4g %.4g..%.4g) probe_i0_range=(%.4g..%.4g %.4g..%.4g "
-          "%.4g..%.4g %.4g..%.4g) first_host_pos=(%.4g %.4g %.4g %.4g) "
-          "first_host_rgba=(%.4g %.4g %.4g %.4g) first_host_mask=0x%04x "
-          "first_probe_i0=(%.4g %.4g %.4g %.4g) last_host_pos=(%.4g %.4g %.4g %.4g) "
-          "last_host_rgba=(%.4g %.4g %.4g %.4g) last_host_mask=0x%04x "
-          "last_probe_i0=(%.4g %.4g %.4g %.4g)\n",
-          producer_probe_index, rendered ? 1u : 0u, before_stats.visible_pixels,
-          producer_probe_stats.visible_pixels, probe_vertices.size(), interpolator_by_location[0],
-          host_i0_mask_count, host_vertex_count, use_fallback_fragment ? 1u : 0u,
-          has_texture_binding ? 1u : 0u, fragment_float_constants_buffer_index,
-          fragment_float_constants.size(), host_color_min[0], host_color_max[0], host_color_min[1],
-          host_color_max[1], host_color_min[2], host_color_max[2], host_color_min[3],
-          host_color_max[3], probe_i0_min[0], probe_i0_max[0], probe_i0_min[1], probe_i0_max[1],
-          probe_i0_min[2], probe_i0_max[2], probe_i0_min[3], probe_i0_max[3],
-          first_host ? first_host->x : 0.0f, first_host ? first_host->y : 0.0f,
-          first_host ? first_host->z : 0.0f, first_host ? first_host->w : 0.0f,
-          first_host ? first_host->r : 0.0f, first_host ? first_host->g : 0.0f,
-          first_host ? first_host->b : 0.0f, first_host ? first_host->a : 0.0f,
-          first_host ? first_host->interpolator_mask : 0u,
-          first_probe ? first_probe->interpolators[0][0] : 0.0f,
-          first_probe ? first_probe->interpolators[0][1] : 0.0f,
-          first_probe ? first_probe->interpolators[0][2] : 0.0f,
-          first_probe ? first_probe->interpolators[0][3] : 0.0f, last_host ? last_host->x : 0.0f,
-          last_host ? last_host->y : 0.0f, last_host ? last_host->z : 0.0f,
-          last_host ? last_host->w : 0.0f, last_host ? last_host->r : 0.0f,
-          last_host ? last_host->g : 0.0f, last_host ? last_host->b : 0.0f,
-          last_host ? last_host->a : 0.0f, last_host ? last_host->interpolator_mask : 0u,
-          last_probe ? last_probe->interpolators[0][0] : 0.0f,
-          last_probe ? last_probe->interpolators[0][1] : 0.0f,
-          last_probe ? last_probe->interpolators[0][2] : 0.0f,
-          last_probe ? last_probe->interpolators[0][3] : 0.0f);
-      std::fflush(stderr);
     }
   }
   if (pixel_shader.ucode_data_hash() == UINT64_C(0x21243b8826e3f416)) {
@@ -8950,7 +9382,8 @@ bool MetalCommandProcessor::RenderHostPixelShader(MetalShader& pixel_shader,
   return rendered;
 }
 
-void* MetalCommandProcessor::EnsureSolidColorPipeline(MetalShader& vertex_shader) {
+void* MetalCommandProcessor::EnsureSolidColorPipeline(MetalShader& vertex_shader,
+                                                      uint32_t sample_count) {
   if (!metal_device_) {
     return nullptr;
   }
@@ -8978,7 +9411,9 @@ void* MetalCommandProcessor::EnsureSolidColorPipeline(MetalShader& vertex_shader
   }
 
   uint64_t vertex_modification = GetDefaultShaderModification(vertex_shader);
-  uint64_t pipeline_key_parts[2] = {vertex_shader.ucode_data_hash(), vertex_modification};
+  sample_count = sample_count == 1 || sample_count == 2 || sample_count == 4 ? sample_count : 1;
+  uint64_t pipeline_key_parts[3] = {vertex_shader.ucode_data_hash(), vertex_modification,
+                                    sample_count};
   uint64_t pipeline_key = XXH3_64bits(pipeline_key_parts, sizeof(pipeline_key_parts));
   auto existing_pipeline = solid_color_pipeline_states_.find(pipeline_key);
   if (existing_pipeline != solid_color_pipeline_states_.end()) {
@@ -8986,8 +9421,9 @@ void* MetalCommandProcessor::EnsureSolidColorPipeline(MetalShader& vertex_shader
   }
 
   std::string pipeline_error;
-  void* pipeline_state = CreateCachedRenderPipelineState(
-      vertex_translation->metal_library(), solid_fragment_library_, &pipeline_error);
+  void* pipeline_state =
+      CreateCachedRenderPipelineState(vertex_translation->metal_library(), solid_fragment_library_,
+                                      &pipeline_error, nullptr, sample_count);
   solid_color_pipeline_states_.emplace(pipeline_key, pipeline_state);
   static std::atomic<uint32_t> solid_pipeline_logs{0};
   uint32_t solid_pipeline_index = solid_pipeline_logs.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -9005,6 +9441,54 @@ void* MetalCommandProcessor::EnsureSolidColorPipeline(MetalShader& vertex_shader
                  static_cast<unsigned long long>(vertex_shader.ucode_data_hash()),
                  pipeline_error.c_str());
     std::fflush(stderr);
+  }
+  return pipeline_state;
+}
+
+void* MetalCommandProcessor::EnsureDepthOnlyPipeline(MetalShader& vertex_shader,
+                                                     MetalShader* pixel_shader) {
+  if (!metal_device_ || !register_file_) {
+    return nullptr;
+  }
+  uint64_t vertex_modification = 0;
+  uint64_t ignored_pixel_modification = 0;
+  GetCurrentShaderModifications(&vertex_shader, pixel_shader, vertex_modification,
+                                ignored_pixel_modification);
+  auto* vertex_translation = GetTranslatedShader(vertex_shader, vertex_modification);
+  if (!vertex_translation || !vertex_translation->metal_library()) {
+    return nullptr;
+  }
+  if (!dummy_fragment_library_) {
+    std::string fragment_error;
+    dummy_fragment_library_ =
+        CreateMslLibrary(metal_device_, MakeDummyFragmentMsl(), &fragment_error);
+    if (!dummy_fragment_library_) {
+      REXLOG_WARN("Metal depth-only dummy fragment unavailable: {}", fragment_error);
+      return nullptr;
+    }
+  }
+
+  uint32_t sample_count =
+      GetMetalSampleCount(register_file_->Get<reg::RB_SURFACE_INFO>().msaa_samples);
+  constexpr uint64_t kDepthOnlyPipelineTag = UINT64_C(0x445054484F4E4C59);
+  uint64_t pipeline_key_parts[4] = {kDepthOnlyPipelineTag, vertex_shader.ucode_data_hash(),
+                                    vertex_modification, sample_count};
+  uint64_t pipeline_key = XXH3_64bits(pipeline_key_parts, sizeof(pipeline_key_parts));
+  auto existing = solid_color_pipeline_states_.find(pipeline_key);
+  if (existing != solid_color_pipeline_states_.end()) {
+    return existing->second;
+  }
+
+  ProbeColorTargetState color_state;
+  color_state.write_mask = 0;
+  std::string pipeline_error;
+  void* pipeline_state =
+      CreateCachedRenderPipelineState(vertex_translation->metal_library(), dummy_fragment_library_,
+                                      &pipeline_error, &color_state, sample_count);
+  solid_color_pipeline_states_.emplace(pipeline_key, pipeline_state);
+  if (!pipeline_state) {
+    REXLOG_WARN("Metal depth-only pipeline failed for vertex shader {:016X}: {}",
+                vertex_shader.ucode_data_hash(), pipeline_error);
   }
   return pipeline_state;
 }
@@ -9045,8 +9529,8 @@ void* MetalCommandProcessor::EnsureMemExportPipeline(MetalShader& vertex_shader)
   }
 
   std::string pipeline_error;
-  void* pipeline_state = CreateCachedRenderPipelineState(
-      vertex_translation->metal_library(), dummy_fragment_library_, &pipeline_error);
+  void* pipeline_state = CreateCachedRenderPipelineState(vertex_translation->metal_library(),
+                                                         dummy_fragment_library_, &pipeline_error);
   memexport_pipeline_states_.emplace(pipeline_key, pipeline_state);
   static std::atomic<uint32_t> memexport_pipeline_logs{0};
   uint32_t memexport_pipeline_index =
@@ -9324,23 +9808,37 @@ bool MetalCommandProcessor::EnsureVertexFetchRangesResident(const MetalShader& v
   return false;
 }
 
-void MetalCommandProcessor::TryRenderPipelineProbe(
-    MetalShader& vertex_shader, MetalShader& pixel_shader, void* pipeline_state,
+bool MetalCommandProcessor::TryRenderPipelineProbe(
+    MetalShader& vertex_shader, MetalShader* pixel_shader, void* pipeline_state,
     xenos::PrimitiveType prim_type, uint32_t index_count, bool host_render_target_debug,
     const PrimitiveProcessor::ProcessingResult* primitive_processing_result) {
   last_host_render_target_probe_read_ = false;
   if (!pipeline_state || !metal_device_ || !memory_) {
-    return;
+    return false;
   }
   if (!register_file_) {
-    return;
+    return false;
   }
   void* persistent_context =
       host_render_target_debug ? GetActiveHostRenderTargetContext() : pipeline_probe_context_;
   const char* persistent_label =
       host_render_target_debug ? "host render target debug" : "persistent pipeline probe";
   if (!persistent_context) {
-    return;
+    return false;
+  }
+  uint32_t probe_sample_count =
+      GetMetalSampleCount(register_file_->Get<reg::RB_SURFACE_INFO>().msaa_samples);
+  std::string sample_count_error;
+  if (!SetPipelineProbeContextSampleCount(persistent_context, probe_sample_count,
+                                          &sample_count_error)) {
+    static std::atomic<uint32_t> sample_count_failure_logs{0};
+    uint32_t failure_index = sample_count_failure_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (failure_index <= 8 || (failure_index & 0x3F) == 0) {
+      std::fprintf(stderr, "[metal] persistent target sample-count setup failed#%u: %s\n",
+                   failure_index, sample_count_error.c_str());
+      std::fflush(stderr);
+    }
+    return false;
   }
   constexpr uint32_t kMaxPersistentProbeDrawsPerSwap = 256;
   if (!host_render_target_debug &&
@@ -9353,13 +9851,16 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
                    pipeline_probe_skipped_this_swap_, kMaxPersistentProbeDrawsPerSwap);
       std::fflush(stderr);
     }
-    return;
+    return false;
   }
   uint64_t vertex_modification = 0;
   uint64_t pixel_modification = 0;
-  GetCurrentShaderModifications(&vertex_shader, &pixel_shader, vertex_modification,
+  GetCurrentShaderModifications(&vertex_shader, pixel_shader, vertex_modification,
                                 pixel_modification);
-  uint64_t pipeline_key_parts[5] = {vertex_shader.ucode_data_hash(), pixel_shader.ucode_data_hash(),
+  uint64_t pixel_shader_hash = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
+  size_t fragment_sampler_count =
+      pixel_shader ? pixel_shader->GetSamplerBindingsAfterTranslation().size() : 0;
+  uint64_t pipeline_key_parts[5] = {vertex_shader.ucode_data_hash(), pixel_shader_hash,
                                     vertex_modification, pixel_modification,
                                     uint64_t(reinterpret_cast<uintptr_t>(pipeline_state))};
   uint64_t pipeline_key = XXH3_64bits(pipeline_key_parts, sizeof(pipeline_key_parts));
@@ -9398,14 +9899,16 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
       }
     };
     log_texture_bindings("vs", vertex_shader);
-    log_texture_bindings("ps", pixel_shader);
+    if (pixel_shader) {
+      log_texture_bindings("ps", *pixel_shader);
+    }
     std::fflush(stderr);
   }
 
   uint32_t probe_primitive_type = uint32_t(prim_type);
   uint32_t probe_vertex_count = index_count;
   if (!probe_vertex_count) {
-    return;
+    return false;
   }
   if (!primitive_processing_result &&
       current_host_vertex_shader_type_ ==
@@ -9424,8 +9927,9 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
   auto& vertex_texture_slots = vertex_texture_slots_scratch_;
   auto& fragment_texture_slots = fragment_texture_slots_scratch_;
   if (texture_cache_) {
-    uint32_t used_texture_mask = vertex_shader.GetUsedTextureMaskAfterTranslation() |
-                                 pixel_shader.GetUsedTextureMaskAfterTranslation();
+    uint32_t used_texture_mask =
+        vertex_shader.GetUsedTextureMaskAfterTranslation() |
+        (pixel_shader ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
     if (used_texture_mask) {
       texture_cache_->RequestTextures(used_texture_mask);
       uint32_t textures_resolution_scaled = 0;
@@ -9528,7 +10032,7 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
         static std::atomic<uint32_t> skipped_texture_logs{0};
         uint32_t skipped_texture_index =
             skipped_texture_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (skipped_texture_index <= 12 || (skipped_texture_index & 0x3F) == 0) {
+        if (ShouldLogMetalDiagnostic(skipped_texture_index, 12, 0x3F)) {
           std::fprintf(stderr,
                        "[metal] probe texture dummy#%u %s shader=%016llx binding=%zu fetch=%u "
                        "type=%u fmt=%u dim=%u\n",
@@ -9541,19 +10045,28 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
     }
   };
   prepare_probe_textures("vs", vertex_shader, vertex_texture_storage, vertex_texture_slots);
-  prepare_probe_textures("ps", pixel_shader, fragment_texture_storage, fragment_texture_slots);
+  if (pixel_shader) {
+    prepare_probe_textures("ps", *pixel_shader, fragment_texture_storage, fragment_texture_slots);
+  } else {
+    fragment_texture_storage.clear();
+    fragment_texture_slots.clear();
+  }
   auto& vertex_sampler_slots = vertex_sampler_slots_scratch_;
   auto& fragment_sampler_slots = fragment_sampler_slots_scratch_;
   MakeProbeSamplerSlots(*register_file_, vertex_shader, vertex_sampler_slots);
-  MakeProbeSamplerSlots(*register_file_, pixel_shader, fragment_sampler_slots);
+  if (pixel_shader) {
+    MakeProbeSamplerSlots(*register_file_, *pixel_shader, fragment_sampler_slots);
+  } else {
+    fragment_sampler_slots.clear();
+  }
 
   uint32_t probe_width = std::max<uint32_t>(fallback_output_width_, 1);
   uint32_t probe_height = std::max<uint32_t>(fallback_output_height_, 1);
   draw_util::ViewportInfo probe_viewport_info = {};
   reg::RB_DEPTHCONTROL probe_depth_control = draw_util::GetNormalizedDepthControl(*register_file_);
   draw_util::GetHostViewportInfo(*register_file_, 1, 1, true, probe_width, probe_height, true,
-                                 probe_depth_control, false, false, pixel_shader.writes_depth(),
-                                 probe_viewport_info);
+                                 probe_depth_control, false, false,
+                                 pixel_shader && pixel_shader->writes_depth(), probe_viewport_info);
   draw_util::Scissor probe_scissor = {};
   draw_util::GetScissor(*register_file_, probe_scissor);
   uint32_t probe_scissor_x = std::min(probe_scissor.offset[0], probe_width);
@@ -9562,7 +10075,7 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
   uint32_t probe_scissor_height = std::min(probe_scissor.extent[1], probe_height - probe_scissor_y);
   if (!probe_viewport_info.xy_extent[0] || !probe_viewport_info.xy_extent[1] ||
       !probe_scissor_width || !probe_scissor_height) {
-    return;
+    return false;
   }
   ProbeRasterizationState probe_rasterization_state = {};
   probe_rasterization_state.viewport_x = probe_viewport_info.xy_offset[0];
@@ -9597,7 +10110,7 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
       // Metal has no front-and-back cull mode. The CPU memexport path has
       // already executed any vertex side effects before this color route, so
       // suppressing the host render draw is equivalent for this backend.
-      return;
+      return false;
     }
   }
   ProbeDepthStencilState probe_depth_stencil_state = {};
@@ -9645,12 +10158,67 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
   }
   auto* vertex_translation = static_cast<MetalShader::MetalTranslation*>(
       vertex_shader.GetTranslation(vertex_modification));
-  auto* pixel_shader_translation =
-      static_cast<MetalShader::MetalTranslation*>(pixel_shader.GetTranslation(pixel_modification));
+  auto* pixel_shader_translation = pixel_shader
+                                       ? static_cast<MetalShader::MetalTranslation*>(
+                                             pixel_shader->GetTranslation(pixel_modification))
+                                       : nullptr;
   VertexMslBufferBindings vertex_buffer_bindings = GetVertexMslBufferBindings(vertex_translation);
+  uint32_t fragment_shared_memory_buffer_index =
+      pixel_shader_translation
+          ? pixel_shader_translation->msl_reflection().shared_memory_buffer_index
+          : UINT32_MAX;
+  bool vertex_writes_shared_memory = HasMemExportSideEffects(vertex_shader, vertex_translation);
+  bool pixel_writes_shared_memory =
+      pixel_shader && HasMemExportSideEffects(*pixel_shader, pixel_shader_translation);
+  bool persistent_writes_shared_memory = vertex_writes_shared_memory || pixel_writes_shared_memory;
+  if (persistent_writes_shared_memory && (!shared_memory_ || !shared_memory_->buffer())) {
+    REXGPU_ERROR("Metal memexport draw has no resident shared-memory buffer");
+    return false;
+  }
+  std::vector<draw_util::MemExportRange> memexport_ranges;
+  if (vertex_writes_shared_memory) {
+    draw_util::AddMemExportRanges(*register_file_, vertex_shader, memexport_ranges);
+  }
+  if (pixel_writes_shared_memory) {
+    draw_util::AddMemExportRanges(*register_file_, *pixel_shader, memexport_ranges);
+  }
+  std::vector<std::pair<uint32_t, uint32_t>> memexport_byte_ranges;
+  memexport_byte_ranges.reserve(memexport_ranges.size());
+  for (const draw_util::MemExportRange& range : memexport_ranges) {
+    uint64_t start = uint64_t(range.base_address_dwords) << 2;
+    if (start >= SharedMemory::kBufferSize ||
+        range.size_bytes > SharedMemory::kBufferSize - start) {
+      REXGPU_ERROR("Invalid Metal memexport range at 0x{:08X} (size {})", uint32_t(start),
+                   range.size_bytes);
+      return false;
+    }
+    memexport_byte_ranges.emplace_back(uint32_t(start), range.size_bytes);
+  }
+  memexport_byte_ranges = MergeByteRanges(memexport_byte_ranges);
+  if (persistent_writes_shared_memory && memexport_byte_ranges.empty()) {
+    static std::atomic<uint32_t> unresolved_memexport_range_logs{0};
+    uint32_t failure_index =
+        unresolved_memexport_range_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (failure_index <= 16 || (failure_index & 0x3F) == 0) {
+      std::fprintf(stderr,
+                   "[metal] unresolved memexport destinations#%u vs=%016llx ps=%016llx "
+                   "vs_eM=0x%02x ps_eM=0x%02x\n",
+                   failure_index, static_cast<unsigned long long>(vertex_shader.ucode_data_hash()),
+                   static_cast<unsigned long long>(pixel_shader_hash),
+                   uint32_t(vertex_shader.memexport_eM_written()),
+                   pixel_shader ? uint32_t(pixel_shader->memexport_eM_written()) : 0u);
+      std::fflush(stderr);
+    }
+    return false;
+  }
   void* resident_shared_memory_buffer = nullptr;
-  if (vertex_buffer_bindings.shared_memory != UINT32_MAX) {
-    if (!EnsureVertexFetchRangesResident(vertex_shader)) {
+  if (vertex_buffer_bindings.shared_memory != UINT32_MAX ||
+      fragment_shared_memory_buffer_index != UINT32_MAX) {
+    // Vertex fetches and both shader stages' export destinations must contain
+    // the latest guest bytes before the draw. Memexports may update only part
+    // of a page, so preserving the untouched bytes is required for correctness.
+    if (vertex_buffer_bindings.shared_memory != UINT32_MAX &&
+        !EnsureVertexFetchRangesResident(vertex_shader)) {
       static std::atomic<uint32_t> vertex_residency_failure_logs{0};
       uint32_t failure_index =
           vertex_residency_failure_logs.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -9660,7 +10228,24 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
                      static_cast<unsigned long long>(vertex_shader.ucode_data_hash()));
         std::fflush(stderr);
       }
-      return;
+      return false;
+    }
+    if (!memexport_byte_ranges.empty() &&
+        !shared_memory_->RequestRanges(memexport_byte_ranges.data(),
+                                       memexport_byte_ranges.size())) {
+      static std::atomic<uint32_t> memexport_residency_failure_logs{0};
+      uint32_t failure_index =
+          memexport_residency_failure_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (failure_index <= 16 || (failure_index & 0xFF) == 0) {
+        std::fprintf(
+            stderr,
+            "[metal] memexport residency failed#%u vs=%016llx ps=%016llx "
+            "ranges=%zu\n",
+            failure_index, static_cast<unsigned long long>(vertex_shader.ucode_data_hash()),
+            static_cast<unsigned long long>(pixel_shader_hash), memexport_byte_ranges.size());
+        std::fflush(stderr);
+      }
+      return false;
     }
     resident_shared_memory_buffer = shared_memory_->buffer();
   }
@@ -9679,7 +10264,11 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
   auto& vertex_float_constants = vertex_float_constants_scratch_;
   auto& fragment_float_constants = fragment_float_constants_scratch_;
   PackFloatConstantsForShader(*register_file_, vertex_shader, vertex_float_constants);
-  PackFloatConstantsForShader(*register_file_, pixel_shader, fragment_float_constants);
+  if (pixel_shader) {
+    PackFloatConstantsForShader(*register_file_, *pixel_shader, fragment_float_constants);
+  } else {
+    fragment_float_constants.clear();
+  }
   const void* vertex_float_constants_data =
       vertex_float_constants.empty() ? nullptr : vertex_float_constants.data();
   size_t vertex_float_constants_size = vertex_float_constants.size() * sizeof(uint32_t);
@@ -9696,14 +10285,14 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
           stderr,
           "[metal] shader MSL buffers#%u vs=%016llx ps=%016llx "
           "v_shared=%u v_float=%u v_bool=%u v_fetch=%u "
-          "f_float=%u f_bool=%u f_fetch=%u "
+          "f_shared=%u f_float=%u f_bool=%u f_fetch=%u "
           "fetch47=%08x %08x %08x %08x index(base=%d min=%u max=%u endian=%u "
           "load=0x%08x flags=0x%08x)\n",
           vertex_buffer_binding_index,
           static_cast<unsigned long long>(vertex_shader.ucode_data_hash()),
-          static_cast<unsigned long long>(pixel_shader.ucode_data_hash()),
-          vertex_buffer_bindings.shared_memory, vertex_buffer_bindings.float_constants,
-          vertex_buffer_bindings.bool_loop_constants, vertex_buffer_bindings.fetch_constants,
+          static_cast<unsigned long long>(pixel_shader_hash), vertex_buffer_bindings.shared_memory,
+          vertex_buffer_bindings.float_constants, vertex_buffer_bindings.bool_loop_constants,
+          vertex_buffer_bindings.fetch_constants, fragment_shared_memory_buffer_index,
           fragment_float_constants_buffer_index, fragment_bool_loop_constants_buffer_index,
           fragment_fetch_constants_buffer_index, fetch_47[0], fetch_47[1], fetch_47[2], fetch_47[3],
           system_constants_.vertex_base_index, system_constants_.vertex_index_min,
@@ -9765,7 +10354,7 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
                      primitive_processing_result->guest_index_base);
         std::fflush(stderr);
       }
-      return;
+      return false;
     }
     probe_index_buffer.data = index_data;
     probe_index_buffer.metal_buffer = index_metal_buffer;
@@ -9778,10 +10367,13 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
   SpirvShaderTranslator::SystemConstants probe_system_constants = system_constants_;
   if (persistent_context) {
     std::string persistent_probe_error;
-    bool persistent_writes_shared_memory =
-        HasMemExportSideEffects(vertex_shader, vertex_translation);
-    bool persistent_probe_ok = true;
-    if (persistent_writes_shared_memory &&
+    bool persistent_probe_ok =
+        (!vertex_writes_shared_memory || vertex_buffer_bindings.shared_memory != UINT32_MAX) &&
+        (!pixel_writes_shared_memory || fragment_shared_memory_buffer_index != UINT32_MAX);
+    if (!persistent_probe_ok) {
+      persistent_probe_error = "shader writes shared memory but has no reflected stage binding";
+    }
+    if (persistent_writes_shared_memory && persistent_probe_ok &&
         !WaitForPipelineProbeSubmissions("shared-memory-writer")) {
       persistent_probe_error = "failed to synchronize before shared-memory writer";
       persistent_probe_ok = false;
@@ -9795,17 +10387,18 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
           vertex_texture_slots.empty() ? nullptr : vertex_texture_slots.data(),
           vertex_texture_slots.size(), vertex_shader.GetSamplerBindingsAfterTranslation().size(),
           fragment_texture_slots.empty() ? nullptr : fragment_texture_slots.data(),
-          fragment_texture_slots.size(), pixel_shader.GetSamplerBindingsAfterTranslation().size(),
-          probe_primitive_type, probe_vertex_count, probe_width, probe_height,
-          &persistent_probe_error, vertex_buffer_bindings.shared_memory,
-          vertex_buffer_bindings.float_constants, vertex_buffer_bindings.fetch_constants,
-          fragment_float_constants_data, fragment_float_constants_size,
-          fragment_float_constants_buffer_index, fragment_fetch_constants_buffer_index,
+          fragment_texture_slots.size(), fragment_sampler_count, probe_primitive_type,
+          probe_vertex_count, probe_width, probe_height, &persistent_probe_error,
+          vertex_buffer_bindings.shared_memory, vertex_buffer_bindings.float_constants,
+          vertex_buffer_bindings.fetch_constants, fragment_float_constants_data,
+          fragment_float_constants_size, fragment_float_constants_buffer_index,
+          fragment_fetch_constants_buffer_index,
           vertex_sampler_slots.empty() ? nullptr : vertex_sampler_slots.data(),
           fragment_sampler_slots.empty() ? nullptr : fragment_sampler_slots.data(), nullptr, 0,
           UINT32_MAX, bool_loop_constants_.data(), bool_loop_constants_.size() * sizeof(uint32_t),
           vertex_buffer_bindings.bool_loop_constants, fragment_bool_loop_constants_buffer_index,
-          probe_index_buffer_ptr, &probe_rasterization_state, probe_depth_stencil_state_ptr);
+          probe_index_buffer_ptr, &probe_rasterization_state, probe_depth_stencil_state_ptr,
+          fragment_shared_memory_buffer_index);
     }
     ++pipeline_probe_draws_this_swap_;
     if (!persistent_probe_ok) {
@@ -9814,30 +10407,60 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
         std::fprintf(stderr, "[metal] %s failed#%u vs=%016llx ps=%016llx: %s\n", persistent_label,
                      pipeline_probe_failure_count_,
                      static_cast<unsigned long long>(vertex_shader.ucode_data_hash()),
-                     static_cast<unsigned long long>(pixel_shader.ucode_data_hash()),
+                     static_cast<unsigned long long>(pixel_shader_hash),
                      persistent_probe_error.c_str());
         std::fflush(stderr);
       }
-      return;
+      return false;
     }
     ++async_probe_submission_count_;
     ++async_probe_submissions_since_global_wait_;
     async_probe_max_pending_submission_count_ =
         std::max(async_probe_max_pending_submission_count_,
                  GetPipelineProbeContextPendingSubmissionCount(persistent_context));
-    if ((persistent_writes_shared_memory &&
-         !WaitForPipelineProbeSubmissions("shared-memory-writer")) ||
-        (async_probe_submissions_since_global_wait_ >=
-             kMaxAsyncProbeSubmissionsBetweenGlobalWaits &&
-         !WaitForPipelineProbeSubmissions("global-cap"))) {
+    if (persistent_writes_shared_memory &&
+        !WaitForPipelineProbeSubmissions("shared-memory-writer")) {
       ++pipeline_probe_failure_count_;
-      return;
+      return false;
+    }
+    if (persistent_writes_shared_memory && !memexport_byte_ranges.empty()) {
+      // The writer fence above makes the resident bytes CPU-visible. Publish
+      // metadata first so texture/buffer consumers are invalidated, then copy
+      // the exact conservative ranges to the guest physical mapping.
+      for (const auto& range : memexport_byte_ranges) {
+        shared_memory_->RangeWrittenByGpu(range.first, range.second);
+      }
+      if (!shared_memory_->PublishGpuBufferWritesToGuest(memexport_byte_ranges)) {
+        ++pipeline_probe_failure_count_;
+        static std::atomic<uint32_t> memexport_publication_failure_logs{0};
+        uint32_t failure_index =
+            memexport_publication_failure_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (failure_index <= 16 || (failure_index & 0x3F) == 0) {
+          std::fprintf(
+              stderr,
+              "[metal] memexport publication failed#%u vs=%016llx ps=%016llx "
+              "ranges=%zu\n",
+              failure_index, static_cast<unsigned long long>(vertex_shader.ucode_data_hash()),
+              static_cast<unsigned long long>(pixel_shader_hash), memexport_byte_ranges.size());
+          std::fflush(stderr);
+        }
+        return false;
+      }
+    }
+    if (async_probe_submissions_since_global_wait_ >= kMaxAsyncProbeSubmissionsBetweenGlobalWaits &&
+        !WaitForPipelineProbeSubmissions("global-cap")) {
+      ++pipeline_probe_failure_count_;
+      return false;
     }
     ++pipeline_probe_success_count_;
-    bool should_read =
-        !host_render_target_debug && (first_pipeline_probe || pipeline_probe_success_count_ <= 8 ||
-                                      (pipeline_probe_success_count_ & 0x3F) == 0);
-    if (host_render_target_debug && MetalHostRenderTargetDebugEnabled()) {
+    // Readback diagnostics can fall through to solid/fullscreen rerenders.
+    // Never enter that path for a shader with memory side effects because a
+    // diagnostic draw must not execute a guest-visible export a second time.
+    bool should_read = !persistent_writes_shared_memory && !host_render_target_debug &&
+                       (first_pipeline_probe || pipeline_probe_success_count_ <= 8 ||
+                        (pipeline_probe_success_count_ & 0x3F) == 0);
+    if (!persistent_writes_shared_memory && host_render_target_debug &&
+        MetalHostRenderTargetDebugEnabled()) {
       should_read = first_pipeline_probe || pipeline_probe_success_count_ <= 8 ||
                     (pipeline_probe_success_count_ & 0x3F) == 0;
     }
@@ -9848,7 +10471,8 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
             RefreshHostRenderTargetBacking(probe_width, probe_height);
         nonzero = BgraHasNonZeroRgb(latest_host_render_target_bgra_);
         if (!nonzero && MetalHostRenderTargetSolidTestEnabled()) {
-          if (void* solid_pipeline_state = EnsureSolidColorPipeline(vertex_shader)) {
+          if (void* solid_pipeline_state =
+                  EnsureSolidColorPipeline(vertex_shader, probe_sample_count)) {
             std::string solid_context_error;
             bool solid_context_ok = RenderPipelineProbeToContext(
                 persistent_context, solid_pipeline_state, &probe_system_constants,
@@ -9935,8 +10559,7 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
                 fetch_constants_.size() * sizeof(uint32_t), memory_->physical_membase(),
                 size_t(0x20000000), nullptr, nullptr, 0, 0,
                 fragment_texture_slots.empty() ? nullptr : fragment_texture_slots.data(),
-                fragment_texture_slots.size(),
-                pixel_shader.GetSamplerBindingsAfterTranslation().size(),
+                fragment_texture_slots.size(), fragment_sampler_count,
                 uint32_t(xenos::PrimitiveType::kTriangleList), 3, probe_width, probe_height,
                 fullscreen_probe_bgra, &fullscreen_probe_error, UINT32_MAX, UINT32_MAX, UINT32_MAX,
                 nullptr, 0, fragment_float_constants_data, fragment_float_constants_size,
@@ -9957,7 +10580,7 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
                            "accepted=%u ps=%016llx %s\n",
                            fullscreen_probe_index, fullscreen_probe_ok ? 1u : 0u,
                            fullscreen_visible, fullscreen_nonzero ? 1u : 0u,
-                           static_cast<unsigned long long>(pixel_shader.ucode_data_hash()),
+                           static_cast<unsigned long long>(pixel_shader_hash),
                            fullscreen_probe_ok ? "" : fullscreen_probe_error.c_str());
               std::fflush(stderr);
             }
@@ -9979,7 +10602,7 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
                            "[metal] persistent fullscreen PS pipeline failed#%u ps=%016llx: "
                            "%s\n",
                            fullscreen_pipeline_index,
-                           static_cast<unsigned long long>(pixel_shader.ucode_data_hash()),
+                           static_cast<unsigned long long>(pixel_shader_hash),
                            fullscreen_pipeline_error.c_str());
               std::fflush(stderr);
             }
@@ -10006,10 +10629,10 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
                    persistent_label, pipeline_probe_success_count_, pipeline_probe_draws_this_swap_,
                    nonzero ? 1u : 0u,
                    static_cast<unsigned long long>(vertex_shader.ucode_data_hash()),
-                   static_cast<unsigned long long>(pixel_shader.ucode_data_hash()));
+                   static_cast<unsigned long long>(pixel_shader_hash));
       std::fflush(stderr);
     }
-    return;
+    return true;
   }
   std::vector<uint8_t> probe_bgra;
   std::string probe_error;
@@ -10021,8 +10644,8 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
       vertex_texture_slots.empty() ? nullptr : vertex_texture_slots.data(),
       vertex_texture_slots.size(), vertex_shader.GetSamplerBindingsAfterTranslation().size(),
       fragment_texture_slots.empty() ? nullptr : fragment_texture_slots.data(),
-      fragment_texture_slots.size(), pixel_shader.GetSamplerBindingsAfterTranslation().size(),
-      probe_primitive_type, probe_vertex_count, probe_width, probe_height, probe_bgra, &probe_error,
+      fragment_texture_slots.size(), fragment_sampler_count, probe_primitive_type,
+      probe_vertex_count, probe_width, probe_height, probe_bgra, &probe_error,
       vertex_buffer_bindings.shared_memory, vertex_buffer_bindings.float_constants,
       vertex_buffer_bindings.fetch_constants, probe_initial_bgra, probe_initial_row_pitch,
       fragment_float_constants_data, fragment_float_constants_size,
@@ -10038,11 +10661,10 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
       std::fprintf(stderr, "[metal] guest pipeline probe failed#%u vs=%016llx ps=%016llx: %s\n",
                    pipeline_probe_failure_count_,
                    static_cast<unsigned long long>(vertex_shader.ucode_data_hash()),
-                   static_cast<unsigned long long>(pixel_shader.ucode_data_hash()),
-                   probe_error.c_str());
+                   static_cast<unsigned long long>(pixel_shader_hash), probe_error.c_str());
       std::fflush(stderr);
     }
-    return;
+    return false;
   }
 
   bool nonzero = BgraHasNonZeroRgb(probe_bgra);
@@ -10074,7 +10696,7 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
             fetch_constants_.size() * sizeof(uint32_t), memory_->physical_membase(),
             size_t(0x20000000), nullptr, nullptr, 0, 0,
             fragment_texture_slots.empty() ? nullptr : fragment_texture_slots.data(),
-            fragment_texture_slots.size(), pixel_shader.GetSamplerBindingsAfterTranslation().size(),
+            fragment_texture_slots.size(), fragment_sampler_count,
             uint32_t(xenos::PrimitiveType::kTriangleList), 3, probe_width, probe_height,
             fullscreen_probe_bgra, &fullscreen_probe_error, UINT32_MAX, UINT32_MAX, UINT32_MAX,
             nullptr, 0, fragment_float_constants_data, fragment_float_constants_size,
@@ -10088,7 +10710,7 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
           std::fprintf(stderr, "[metal] fullscreen PS probe#%u ok=%u nonzero=%u ps=%016llx %s\n",
                        fullscreen_probe_index, fullscreen_probe_ok ? 1u : 0u,
                        fullscreen_nonzero ? 1u : 0u,
-                       static_cast<unsigned long long>(pixel_shader.ucode_data_hash()),
+                       static_cast<unsigned long long>(pixel_shader_hash),
                        fullscreen_probe_ok ? "" : fullscreen_probe_error.c_str());
           std::fflush(stderr);
         }
@@ -10104,7 +10726,7 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
         if (fullscreen_pipeline_index <= 8 || (fullscreen_pipeline_index & 0x3F) == 0) {
           std::fprintf(stderr, "[metal] fullscreen PS pipeline failed#%u ps=%016llx: %s\n",
                        fullscreen_pipeline_index,
-                       static_cast<unsigned long long>(pixel_shader.ucode_data_hash()),
+                       static_cast<unsigned long long>(pixel_shader_hash),
                        fullscreen_pipeline_error.c_str());
           std::fflush(stderr);
         }
@@ -10132,9 +10754,10 @@ void MetalCommandProcessor::TryRenderPipelineProbe(
     std::fprintf(stderr, "[metal] guest pipeline probe ok#%u nonzero=%u vs=%016llx ps=%016llx\n",
                  pipeline_probe_success_count_, nonzero ? 1u : 0u,
                  static_cast<unsigned long long>(vertex_shader.ucode_data_hash()),
-                 static_cast<unsigned long long>(pixel_shader.ucode_data_hash()));
+                 static_cast<unsigned long long>(pixel_shader_hash));
     std::fflush(stderr);
   }
+  return true;
 }
 
 bool MetalCommandProcessor::RetainTextureCandidateIfUseful(const std::vector<uint8_t>& bgra,

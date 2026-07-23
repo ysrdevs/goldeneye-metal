@@ -70,6 +70,11 @@ static_assert(ge::testing::detail::FindCheat(Tool::kVaselineVision)->cheat_id ==
 static_assert(ge::testing::detail::FindCheat(Tool::kFrescoMode)->cheat_id == 79);
 static_assert(!ge::testing::detail::IsToggle(Tool::kRestartMission));
 static_assert(!ge::testing::detail::IsToggle(Tool::kOriginalRemastered));
+static_assert(ge::testing::detail::IsAction(Tool::kOriginalRemastered));
+static_assert(ge::testing::detail::IsAction(Tool::kUnlockOneLevel));
+static_assert(ge::testing::detail::IsAction(Tool::kUnlockAllLevels));
+static_assert(!ge::testing::detail::IsAction(Tool::kGodMode));
+static_assert(!ge::testing::detail::IsAction(Tool::kRestartMission));
 
 MutationConditions ReadyMission() {
   return {
@@ -185,13 +190,41 @@ void TestRequestValidationAndActions() {
   CHECK_TRUE(!queue.QueueToggle(Tool::kBigHeads, true, 0));
   CHECK_TRUE(!queue.QueueToggle(Tool::kBigHeads, true, RequestQueue::kMaximumToken + 1));
 
-  CHECK_TRUE(queue.QueueAction(Tool::kOriginalRemastered, 12));
-  CHECK_TRUE(!queue.TakeAction(Tool::kOriginalRemastered, 13));
-  CHECK_TRUE(!queue.TakeAction(Tool::kOriginalRemastered, 12));
-  CHECK_TRUE(queue.QueueAction(Tool::kOriginalRemastered, 13));
-  CHECK_TRUE(queue.TakeAction(Tool::kOriginalRemastered, 13));
-  CHECK_TRUE(!queue.TakeAction(Tool::kOriginalRemastered, 13));
   CHECK_TRUE(!queue.QueueAction(Tool::kGodMode, 13));
+  CHECK_TRUE(!queue.QueueAction(Tool::kRestartMission, 13));
+  CHECK_TRUE(!queue.QueueAction(Tool::kUnlockOneLevel, 0));
+  CHECK_TRUE(!queue.QueueAction(Tool::kUnlockAllLevels,
+                                RequestQueue::kMaximumToken + 1));
+
+  constexpr std::array<Tool, 3> kActions = {
+      Tool::kOriginalRemastered,
+      Tool::kUnlockOneLevel,
+      Tool::kUnlockAllLevels,
+  };
+  for (Tool action : kActions) {
+    CHECK_TRUE(queue.QueueAction(action, 12));
+    CHECK_TRUE(queue.TakeAction(action, 12));
+    CHECK_TRUE(!queue.TakeAction(action, 12));
+  }
+
+  // Action slots are independent: queuing one action must not overwrite a
+  // different same-frame action.
+  CHECK_TRUE(queue.QueueAction(Tool::kOriginalRemastered, 20));
+  CHECK_TRUE(queue.QueueAction(Tool::kUnlockOneLevel, 20));
+  CHECK_TRUE(queue.QueueAction(Tool::kUnlockAllLevels, 20));
+  CHECK_TRUE(queue.TakeAction(Tool::kUnlockOneLevel, 20));
+  CHECK_TRUE(queue.TakeAction(Tool::kOriginalRemastered, 20));
+  CHECK_TRUE(queue.TakeAction(Tool::kUnlockAllLevels, 20));
+
+  // A stale action is consumed and can never run in a later pause/mission
+  // epoch, matching the toggle safety contract.
+  CHECK_TRUE(queue.QueueAction(Tool::kUnlockOneLevel, 30));
+  CHECK_TRUE(!queue.TakeAction(Tool::kUnlockOneLevel, 31));
+  CHECK_TRUE(!queue.TakeAction(Tool::kUnlockOneLevel, 30));
+
+  CHECK_TRUE(queue.QueueAction(Tool::kUnlockAllLevels, 31));
+  queue.DiscardAll();
+  CHECK_TRUE(!queue.TakeAction(Tool::kUnlockAllLevels, 31));
 }
 
 std::string ReadFile(const std::filesystem::path& path) {
@@ -212,6 +245,8 @@ void TestRuntimeSourceContract() {
   CHECK_TRUE(source.contains("sub_82137968(context, base)"));
   CHECK_TRUE(source.contains("sub_8211E008(context, base)"));
   CHECK_TRUE(source.contains("0x82003264u"));
+  CHECK_TRUE(source.contains("sub_82091D18(context, base)"));
+  CHECK_TRUE(source.contains("sub_82091CA8(context, base)"));
 
   std::string generated_cheat_source;
   for (const auto& entry : std::filesystem::directory_iterator(GOLDENEYE_GENERATED_DIRECTORY)) {
@@ -244,6 +279,46 @@ void TestRuntimeSourceContract() {
     CHECK_TRUE(enable.contains("ctx.cr6.compare<uint32_t>(ctx.r11.u32, 73"));
     CHECK_TRUE(enable.contains("REX_STORE_U8(ctx.r11.u32 + ctx.r31.u32"));
     CHECK_TRUE(enable.contains("sub_823ED380(ctx, base)"));
+  }
+
+  std::string generated_unlock_source;
+  for (const auto& entry : std::filesystem::directory_iterator(GOLDENEYE_GENERATED_DIRECTORY)) {
+    const std::string filename = entry.path().filename().string();
+    if (!entry.is_regular_file() || !filename.starts_with("ge_recomp.") ||
+        entry.path().extension() != ".cpp") {
+      continue;
+    }
+    const std::string candidate = ReadFile(entry.path());
+    if (candidate.contains("DEFINE_REX_FUNC(sub_82091CA8)") &&
+        candidate.contains("DEFINE_REX_FUNC(sub_82091D18)")) {
+      generated_unlock_source = candidate;
+      break;
+    }
+  }
+  CHECK_TRUE(!generated_unlock_source.empty());
+  const size_t unlock_all_start =
+      generated_unlock_source.find("DEFINE_REX_FUNC(sub_82091CA8)");
+  const size_t unlock_one_start =
+      generated_unlock_source.find("DEFINE_REX_FUNC(sub_82091D18)");
+  const size_t unlock_one_end =
+      generated_unlock_source.find("DEFINE_REX_FUNC(sub_82091D90)");
+  CHECK_TRUE(unlock_all_start != std::string::npos);
+  CHECK_TRUE(unlock_one_start != std::string::npos);
+  CHECK_TRUE(unlock_one_end != std::string::npos);
+  if (unlock_all_start != std::string::npos && unlock_one_start != std::string::npos &&
+      unlock_one_end != std::string::npos) {
+    const std::string unlock_all =
+        generated_unlock_source.substr(unlock_all_start, unlock_one_start - unlock_all_start);
+    const std::string unlock_one =
+        generated_unlock_source.substr(unlock_one_start, unlock_one_end - unlock_one_start);
+    CHECK_TRUE(unlock_all.contains("sub_820EA630(ctx, base)"));
+    CHECK_TRUE(unlock_all.contains("sub_820E96C8(ctx, base)"));
+    CHECK_TRUE(unlock_all.contains("sub_820E9910(ctx, base)"));
+    CHECK_TRUE(unlock_all.contains("ctx.cr6.compare<int32_t>(ctx.r31.s32, 20"));
+    CHECK_TRUE(unlock_one.contains("sub_820EA630(ctx, base)"));
+    CHECK_TRUE(unlock_one.contains("sub_820E96C8(ctx, base)"));
+    CHECK_TRUE(unlock_one.contains("sub_820E9910(ctx, base)"));
+    CHECK_TRUE(unlock_one.contains("ctx.r5.s64 = 2"));
   }
 #else
   CHECK_TRUE(false);

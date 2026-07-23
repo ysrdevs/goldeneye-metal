@@ -1732,6 +1732,76 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
           ImGui::Spacing();
         }
 
+        ImGui::TextColored(ImColor(kTitle), "UNLOCKABLES");
+        TextWrappedColored(
+            kReticle,
+            "These permanently change progression on the current profile. Back up your save "
+            "with the launcher Save Manager first if you may want to undo them.");
+        const ge::testing::ToolState unlock_one_state =
+            ge::testing::GetToolState(ge::testing::Tool::kUnlockOneLevel);
+        const ge::testing::ToolState unlock_all_state =
+            ge::testing::GetToolState(ge::testing::Tool::kUnlockAllLevels);
+        const bool unlock_one_usable = unlock_one_state.supported && unlock_one_state.available;
+        const bool unlock_all_usable = unlock_all_state.supported && unlock_all_state.available;
+        ImGui::BeginDisabled(!unlock_one_usable || testing_unlock_action_submitted_);
+        if (ImGui::Button("UNLOCK NEXT LEVEL", ImVec2(content_w * 0.85f, 0.0f))) {
+          testing_unlock_confirm_action_ =
+              static_cast<int>(ge::testing::Tool::kUnlockOneLevel);
+          ImGui::OpenPopup("CONFIRM PROFILE UNLOCK");
+        }
+        ImGui::EndDisabled();
+        ImGui::BeginDisabled(!unlock_all_usable || testing_unlock_action_submitted_);
+        if (ImGui::Button("UNLOCK ALL LEVELS", ImVec2(content_w * 0.85f, 0.0f))) {
+          testing_unlock_confirm_action_ =
+              static_cast<int>(ge::testing::Tool::kUnlockAllLevels);
+          ImGui::OpenPopup("CONFIRM PROFILE UNLOCK");
+        }
+        ImGui::EndDisabled();
+        if (testing_unlock_action_submitted_) {
+          TextWrappedColored(kInkDim,
+                             "Unlock request sent. Reopen settings to run another unlock.");
+        } else if (!unlock_one_usable || !unlock_all_usable) {
+          TextWrappedColored(kInkDim, !unlock_one_usable ? unlock_one_state.unavailable_reason
+                                                        : unlock_all_state.unavailable_reason);
+        }
+
+        if (ImGui::BeginPopupModal("CONFIRM PROFILE UNLOCK", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+          const ge::testing::Tool selected_action =
+              static_cast<ge::testing::Tool>(testing_unlock_confirm_action_);
+          const bool unlock_all = selected_action == ge::testing::Tool::kUnlockAllLevels;
+          ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 360.0f * ui_scale);
+          ImGui::TextWrapped("%s will permanently change the current profile's progression.",
+                             unlock_all ? "Unlock All Levels" : "Unlock Next Level");
+          ImGui::Spacing();
+          ImGui::TextWrapped(
+              "This uses the retail game's own Unlockables action. It cannot be undone here. "
+              "Use the launcher Save Manager first if you want a backup.");
+          ImGui::PopTextWrapPos();
+          ImGui::Spacing();
+          if (ImGui::Button("CANCEL", ImVec2(150.0f * ui_scale, 0.0f))) {
+            testing_unlock_confirm_action_ = -1;
+            ImGui::CloseCurrentPopup();
+          }
+          ImGui::SameLine();
+          const bool action_available = unlock_all ? unlock_all_usable : unlock_one_usable;
+          ImGui::BeginDisabled(!action_available);
+          if (ImGui::Button(unlock_all ? "UNLOCK ALL" : "UNLOCK NEXT",
+                            ImVec2(180.0f * ui_scale, 0.0f))) {
+            if (ge::testing::RequestAction(selected_action)) {
+              testing_unlock_action_submitted_ = true;
+              testing_unlock_confirm_action_ = -1;
+              ge::testing::RequestRefresh();
+              ImGui::CloseCurrentPopup();
+            }
+          }
+          ImGui::EndDisabled();
+          ImGui::EndPopup();
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
         ImGui::TextColored(ImColor(kTitle), "GRAPHICS MODE");
         const ge::testing::ToolState graphics_state =
             ge::testing::GetToolState(ge::testing::Tool::kOriginalRemastered);
@@ -1747,9 +1817,10 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
             graphics_state.active ? "SWITCH TO REMASTERED" : "SWITCH TO ORIGINAL";
         ImGui::BeginDisabled(!graphics_usable || testing_pending_graphics_mode_ >= 0);
         if (ImGui::Button(graphics_button, ImVec2(content_w * 0.85f, 0.0f))) {
-          testing_pending_graphics_mode_ = graphics_state.active ? 0 : 1;
-          ge::testing::RequestAction(ge::testing::Tool::kOriginalRemastered);
-          ge::testing::RequestRefresh();
+          if (ge::testing::RequestAction(ge::testing::Tool::kOriginalRemastered)) {
+            testing_pending_graphics_mode_ = graphics_state.active ? 0 : 1;
+            ge::testing::RequestRefresh();
+          }
         }
         ImGui::EndDisabled();
         if (testing_pending_graphics_mode_ >= 0) {

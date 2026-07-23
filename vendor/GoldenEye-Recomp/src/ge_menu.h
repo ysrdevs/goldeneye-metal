@@ -91,6 +91,8 @@ class GeMenuDialog : public rex::ui::ImGuiDialog {
   // -1 means idle; 0/1 means a game-thread update is still being applied.
   std::array<int, kTestingToggleCount> testing_pending_toggles_{};
   int testing_pending_graphics_mode_ = -1;
+  int testing_unlock_confirm_action_ = -1;
+  bool testing_unlock_action_submitted_ = false;
   bool performance_report_pending_ = false;
 
   // ONLINE tab edit state, loaded from the cvars the first time the tab shows

@@ -32,6 +32,8 @@ enum class Tool : uint8_t {
   kFrescoMode,
   kRestartMission,
   kOriginalRemastered,
+  kUnlockOneLevel,
+  kUnlockAllLevels,
   kCount,
 };
 
@@ -65,7 +67,9 @@ ToolState GetToolState(Tool tool) noexcept;
 // Returns false if the request could not be queued in the current mission and
 // pause epoch. The UI must not show a pending state for an unqueued request.
 bool RequestSetEnabled(Tool tool, bool enabled) noexcept;
-void RequestAction(Tool tool) noexcept;
+// Returns false if the action could not be queued in the current mission and
+// pause epoch.
+bool RequestAction(Tool tool) noexcept;
 void RequestRefresh() noexcept;
 
 // Game-thread bridge. Called by ge_inject_keyboard; not for UI code.
@@ -136,6 +140,11 @@ constexpr const CheatDefinition* FindCheat(Tool tool) noexcept {
 
 constexpr bool IsToggle(Tool tool) noexcept {
   return FindCheat(tool) != nullptr;
+}
+
+constexpr bool IsAction(Tool tool) noexcept {
+  return tool == Tool::kOriginalRemastered || tool == Tool::kUnlockOneLevel ||
+         tool == Tool::kUnlockAllLevels;
 }
 
 enum class AvailabilityBlock : uint8_t {
@@ -219,30 +228,32 @@ class RequestQueue {
   }
 
   bool QueueAction(Tool tool, uint64_t token) noexcept {
-    if (tool != Tool::kOriginalRemastered || token == 0 || token > kMaximumToken) {
+    if (!IsAction(tool) || token == 0 || token > kMaximumToken) {
       return false;
     }
-    action_.store(token, std::memory_order_release);
+    actions_[ToolIndex(tool)].store(token, std::memory_order_release);
     return true;
   }
 
   bool TakeAction(Tool tool, uint64_t expected_token) noexcept {
-    if (tool != Tool::kOriginalRemastered || expected_token == 0) {
+    if (!IsAction(tool) || expected_token == 0) {
       return false;
     }
-    return action_.exchange(0, std::memory_order_acq_rel) == expected_token;
+    return actions_[ToolIndex(tool)].exchange(0, std::memory_order_acq_rel) == expected_token;
   }
 
   void DiscardAll() noexcept {
     for (std::atomic<uint64_t>& toggle : toggles_) {
       toggle.store(0, std::memory_order_release);
     }
-    action_.store(0, std::memory_order_release);
+    for (std::atomic<uint64_t>& action : actions_) {
+      action.store(0, std::memory_order_release);
+    }
   }
 
  private:
   std::array<std::atomic<uint64_t>, kToolCount> toggles_{};
-  std::atomic<uint64_t> action_{0};
+  std::array<std::atomic<uint64_t>, kToolCount> actions_{};
 };
 
 }  // namespace detail

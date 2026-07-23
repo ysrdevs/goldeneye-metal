@@ -33,6 +33,7 @@ using rex::graphics::metal::CreateMslLibrary;
 using rex::graphics::metal::CreatePipelineProbeContext;
 using rex::graphics::metal::CreatePipelineProbeSnapshotTexture;
 using rex::graphics::metal::CreateRenderPipelineState;
+using rex::graphics::metal::GetPipelineProbeContextMultisampleResolveCount;
 using rex::graphics::metal::GetPipelineProbeContextPendingSubmissionCount;
 using rex::graphics::metal::GetPipelineProbeContextUploadStats;
 using rex::graphics::metal::PipelineProbeUploadStats;
@@ -45,6 +46,7 @@ using rex::graphics::metal::ProbeSamplerSlot;
 using rex::graphics::metal::ProbeTextureSlot;
 using rex::graphics::metal::ProbeTiledResolveTarget;
 using rex::graphics::metal::QueuePipelineProbeContextClearRect;
+using rex::graphics::metal::QueuePipelineProbeContextDepthStencilClearRect;
 using rex::graphics::metal::QueuePipelineProbeSnapshotCopy;
 using rex::graphics::metal::ReadPipelineProbeContext;
 using rex::graphics::metal::ReadPipelineProbeContextRect;
@@ -53,12 +55,13 @@ using rex::graphics::metal::ReleaseMslLibrary;
 using rex::graphics::metal::ReleasePipelineProbeContext;
 using rex::graphics::metal::ReleasePipelineProbeSnapshotTexture;
 using rex::graphics::metal::ReleaseRenderPipelineState;
-using rex::graphics::metal::RenderPipelineProbeToContext;
 using rex::graphics::metal::RenderPipelineCacheTelemetry;
+using rex::graphics::metal::RenderPipelineProbeToContext;
 using rex::graphics::metal::ResetPipelineProbeContext;
 using rex::graphics::metal::ResolvePipelineProbeContextToXenosTiled;
-using rex::graphics::metal::SharePipelineProbeDepthStencilTarget;
 using rex::graphics::metal::SerializeMetalPipelineBinaryArchive;
+using rex::graphics::metal::SetPipelineProbeContextSampleCount;
+using rex::graphics::metal::SharePipelineProbeDepthStencilTarget;
 using rex::graphics::metal::WaitPipelineProbeContext;
 
 constexpr uint32_t kWidth = 40;
@@ -114,6 +117,30 @@ vertex VertexOutput main0(device const packed_float3* positions [[buffer(3)]],
   output.position = float4(position, 1.0);
   output.uv = position.xy * 0.5 + 0.5;
   return output;
+}
+)MSL";
+
+constexpr char kDiscardFragmentMsl[] = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+
+struct FragmentInput {
+  float2 uv [[user(locn0)]];
+};
+
+fragment void main0(FragmentInput input [[stage_in]]) {
+  if (input.uv.x < 0.5f) {
+    discard_fragment();
+  }
+}
+)MSL";
+
+constexpr char kFragmentSharedWriteMsl[] = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+
+fragment void main0(device atomic_uint* shared_words [[buffer(7)]]) {
+  atomic_store_explicit(shared_words, 0x4750534Du, memory_order_relaxed);
 }
 )MSL";
 
@@ -176,8 +203,8 @@ bool TestPipelineArchiveRoundTrip(id<MTLDevice> device, void* vertex_library,
 
   bool loaded_existing = false;
   std::string archive_message;
-  void* write_archive = CreateMetalPipelineBinaryArchive(
-      device, archive_path, &loaded_existing, &archive_message);
+  void* write_archive =
+      CreateMetalPipelineBinaryArchive(device, archive_path, &loaded_existing, &archive_message);
   if (!write_archive || loaded_existing) {
     error_out = write_archive ? "new archive unexpectedly reported an existing file"
                               : "could not create archive: " + archive_message;
@@ -186,9 +213,9 @@ bool TestPipelineArchiveRoundTrip(id<MTLDevice> device, void* vertex_library,
   }
 
   RenderPipelineCacheTelemetry miss_telemetry;
-  void* miss_pipeline = CreateRenderPipelineState(device, vertex_library, fragment_library,
-                                                   &error_out, nullptr, write_archive,
-                                                   &miss_telemetry);
+  void* miss_pipeline =
+      CreateRenderPipelineState(device, vertex_library, fragment_library, &error_out, nullptr,
+                                write_archive, &miss_telemetry);
   if (!miss_pipeline || !miss_telemetry.archive_miss || !miss_telemetry.archive_updated) {
     if (error_out.empty()) {
       error_out = "empty archive did not take the compile-and-add miss path";
@@ -198,10 +225,28 @@ bool TestPipelineArchiveRoundTrip(id<MTLDevice> device, void* vertex_library,
     std::filesystem::remove_all(cache_directory, filesystem_error);
     return false;
   }
+  const bool supports_4x = [device supportsTextureSampleCount:4];
+  RenderPipelineCacheTelemetry msaa_miss_telemetry;
+  void* msaa_miss_pipeline =
+      supports_4x ? CreateRenderPipelineState(device, vertex_library, fragment_library, &error_out,
+                                              nullptr, write_archive, &msaa_miss_telemetry, 4)
+                  : nullptr;
+  if (supports_4x && (!msaa_miss_pipeline || !msaa_miss_telemetry.archive_miss ||
+                      !msaa_miss_telemetry.archive_updated)) {
+    if (error_out.empty()) {
+      error_out = "4x MSAA descriptor did not take a distinct archive miss path";
+    }
+    ReleaseRenderPipelineState(msaa_miss_pipeline);
+    ReleaseRenderPipelineState(miss_pipeline);
+    ReleaseMetalPipelineBinaryArchive(write_archive);
+    std::filesystem::remove_all(cache_directory, filesystem_error);
+    return false;
+  }
 
   uint64_t serialized_size = 0;
-  bool serialized = SerializeMetalPipelineBinaryArchive(
-      write_archive, archive_path, &serialized_size, &error_out);
+  bool serialized = SerializeMetalPipelineBinaryArchive(write_archive, archive_path,
+                                                        &serialized_size, &error_out);
+  ReleaseRenderPipelineState(msaa_miss_pipeline);
   ReleaseRenderPipelineState(miss_pipeline);
   ReleaseMetalPipelineBinaryArchive(write_archive);
   if (!serialized || !serialized_size) {
@@ -209,8 +254,8 @@ bool TestPipelineArchiveRoundTrip(id<MTLDevice> device, void* vertex_library,
     return false;
   }
 
-  void* read_archive = CreateMetalPipelineBinaryArchive(
-      device, archive_path, &loaded_existing, &archive_message);
+  void* read_archive =
+      CreateMetalPipelineBinaryArchive(device, archive_path, &loaded_existing, &archive_message);
   if (!read_archive || !loaded_existing) {
     error_out = read_archive ? "serialized archive was not loaded"
                              : "could not reopen archive: " + archive_message;
@@ -221,30 +266,36 @@ bool TestPipelineArchiveRoundTrip(id<MTLDevice> device, void* vertex_library,
 
   RenderPipelineCacheTelemetry hit_telemetry;
   void* hit_pipeline = CreateRenderPipelineState(device, vertex_library, fragment_library,
-                                                  &error_out, nullptr, read_archive,
-                                                  &hit_telemetry);
-  bool hit_succeeded = hit_pipeline && hit_telemetry.archive_hit &&
-                       !hit_telemetry.archive_miss && !hit_telemetry.archive_updated;
+                                                 &error_out, nullptr, read_archive, &hit_telemetry);
+  RenderPipelineCacheTelemetry msaa_hit_telemetry;
+  void* msaa_hit_pipeline =
+      supports_4x ? CreateRenderPipelineState(device, vertex_library, fragment_library, &error_out,
+                                              nullptr, read_archive, &msaa_hit_telemetry, 4)
+                  : nullptr;
+  bool hit_succeeded =
+      hit_pipeline && hit_telemetry.archive_hit && !hit_telemetry.archive_miss &&
+      !hit_telemetry.archive_updated &&
+      (!supports_4x || (msaa_hit_pipeline && msaa_hit_telemetry.archive_hit &&
+                        !msaa_hit_telemetry.archive_miss && !msaa_hit_telemetry.archive_updated));
   if (!hit_succeeded && error_out.empty()) {
     error_out = "reopened archive did not satisfy the fail-on-miss pipeline lookup";
   }
+  ReleaseRenderPipelineState(msaa_hit_pipeline);
   ReleaseRenderPipelineState(hit_pipeline);
   ReleaseMetalPipelineBinaryArchive(read_archive);
 
   if (hit_succeeded) {
     // A truncated/corrupt cache must be ignored without disabling normal Metal
     // pipeline creation. The next save will atomically replace this file.
-    const std::array<uint8_t, 8> corrupt_archive = {0x4D, 0x54, 0x4C, 0x00,
-                                                    0xBA, 0xD0, 0xCA, 0xFE};
-    std::ofstream corrupt_output(archive_path,
-                                 std::ios::binary | std::ios::out | std::ios::trunc);
+    const std::array<uint8_t, 8> corrupt_archive = {0x4D, 0x54, 0x4C, 0x00, 0xBA, 0xD0, 0xCA, 0xFE};
+    std::ofstream corrupt_output(archive_path, std::ios::binary | std::ios::out | std::ios::trunc);
     corrupt_output.write(reinterpret_cast<const char*>(corrupt_archive.data()),
                          std::streamsize(corrupt_archive.size()));
     corrupt_output.close();
     loaded_existing = true;
     archive_message.clear();
-    void* recovered_archive = CreateMetalPipelineBinaryArchive(
-        device, archive_path, &loaded_existing, &archive_message);
+    void* recovered_archive =
+        CreateMetalPipelineBinaryArchive(device, archive_path, &loaded_existing, &archive_message);
     const bool corruption_recovered =
         recovered_archive && !loaded_existing && !archive_message.empty();
     ReleaseMetalPipelineBinaryArchive(recovered_archive);
@@ -305,9 +356,8 @@ int RunPipelineProbeTest() {
       ReleaseMslLibrary(fragment_library);
       return 1;
     }
-    std::fprintf(stdout,
-                 "[metal_pipeline_probe_test] pipeline archive round trip and corruption "
-                 "recovery: PASS\n");
+    std::fprintf(stdout, "[metal_pipeline_probe_test] pipeline archive round trip and corruption "
+                         "recovery: PASS\n");
     void* pipeline_state =
         CreateRenderPipelineState(device, vertex_library, fragment_library, &error);
     ProbeColorTargetState alpha_blend_target_state;
@@ -335,17 +385,52 @@ int RunPipelineProbeTest() {
         depth_vertex_library
             ? CreateRenderPipelineState(device, depth_vertex_library, fragment_library, &error)
             : nullptr;
+    ProbeColorTargetState depth_only_color_state;
+    depth_only_color_state.write_mask = 0;
+    void* depth_only_pipeline_state =
+        depth_pipeline_state
+            ? CreateRenderPipelineState(device, depth_vertex_library, fragment_library, &error,
+                                        &depth_only_color_state)
+            : nullptr;
+    void* fragment_shared_write_library =
+        depth_only_pipeline_state ? CreateMslLibrary(device, kFragmentSharedWriteMsl, &error)
+                                  : nullptr;
+    void* fragment_shared_write_pipeline_state =
+        fragment_shared_write_library
+            ? CreateRenderPipelineState(device, vertex_library, fragment_shared_write_library,
+                                        &error, &depth_only_color_state)
+            : nullptr;
+    void* discard_fragment_library =
+        depth_only_pipeline_state ? CreateMslLibrary(device, kDiscardFragmentMsl, &error) : nullptr;
+    void* discard_depth_only_pipeline_state =
+        discard_fragment_library
+            ? CreateRenderPipelineState(device, depth_vertex_library, discard_fragment_library,
+                                        &error, &depth_only_color_state)
+            : nullptr;
+    void* msaa_pipeline_state =
+        [device supportsTextureSampleCount:4]
+            ? CreateRenderPipelineState(device, vertex_library, fragment_library, &error, nullptr,
+                                        nullptr, nullptr, 4)
+            : nullptr;
     ReleaseMslLibrary(depth_vertex_library);
+    ReleaseMslLibrary(discard_fragment_library);
+    ReleaseMslLibrary(fragment_shared_write_library);
     ReleaseMslLibrary(vertex_library);
     ReleaseMslLibrary(fragment_library);
     auto release_pipeline_states = [&]() {
+      ReleaseRenderPipelineState(msaa_pipeline_state);
+      ReleaseRenderPipelineState(fragment_shared_write_pipeline_state);
+      ReleaseRenderPipelineState(discard_depth_only_pipeline_state);
+      ReleaseRenderPipelineState(depth_only_pipeline_state);
       ReleaseRenderPipelineState(depth_pipeline_state);
       ReleaseRenderPipelineState(partial_write_pipeline_state);
       ReleaseRenderPipelineState(alpha_blend_pipeline_state);
       ReleaseRenderPipelineState(pipeline_state);
     };
     if (!pipeline_state || !alpha_blend_pipeline_state || !partial_write_pipeline_state ||
-        !depth_pipeline_state) {
+        !depth_pipeline_state || !depth_only_pipeline_state || !discard_depth_only_pipeline_state ||
+        !fragment_shared_write_pipeline_state ||
+        ([device supportsTextureSampleCount:4] && !msaa_pipeline_state)) {
       std::fprintf(stderr, "[metal_pipeline_probe_test] FAIL: render pipeline: %s\n",
                    error.c_str());
       release_pipeline_states();
@@ -441,6 +526,69 @@ int RunPipelineProbeTest() {
     if (bgra.size() != size_t(kWidth) * kHeight * 4) {
       std::fprintf(stderr, "[metal_pipeline_probe_test] FAIL: readback size %zu, expected %zu\n",
                    bgra.size(), size_t(kWidth) * kHeight * 4);
+      ReleasePipelineProbeContext(context);
+      release_pipeline_states();
+      return 1;
+    }
+
+    // Pixel-shader memexport uses the same resident shared-memory allocation as
+    // vertex memexport, but Metal requires a separate fragment-stage binding.
+    // Write a sentinel from a void fragment shader and fence the context before
+    // inspecting it on the CPU. This catches both a missing buffer binding and
+    // a missing fragment-side completion fence.
+    constexpr uint32_t kFragmentSharedSentinel = 0x4750534D;
+    id<MTLBuffer> fragment_shared_buffer =
+        [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    if (fragment_shared_buffer) {
+      *static_cast<uint32_t*>([fragment_shared_buffer contents]) = 0;
+    }
+    std::string fragment_shared_error;
+    void* fragment_shared_context =
+        fragment_shared_buffer ? CreateHostRenderTargetContext(device, &fragment_shared_error)
+                               : nullptr;
+    bool fragment_shared_rendered =
+        fragment_shared_context &&
+        RenderPipelineProbeToContext(
+            fragment_shared_context, fragment_shared_write_pipeline_state,
+            kUnusedSystemConstants.data(), sizeof(kUnusedSystemConstants), nullptr, 0, nullptr, 0,
+            nullptr, 0, fragment_shared_buffer, nullptr, 0, 0, nullptr, 0, 0,
+            /*primitive_type=TriangleList=*/4, /*vertex_count=*/3, kWidth, kHeight,
+            &fragment_shared_error,
+            /*vertex_shared_memory_buffer_index=*/UINT32_MAX,
+            /*vertex_float_constants_buffer_index=*/UINT32_MAX,
+            /*vertex_fetch_constants_buffer_index=*/UINT32_MAX,
+            /*fragment_float_constants=*/nullptr, /*fragment_float_constants_size=*/0,
+            /*fragment_float_constants_buffer_index=*/UINT32_MAX,
+            /*fragment_fetch_constants_buffer_index=*/UINT32_MAX,
+            /*vertex_samplers=*/nullptr, /*fragment_samplers=*/nullptr, kPositions.data(),
+            sizeof(kPositions), /*vertex_data_buffer_index=*/3,
+            /*bool_loop_constants=*/nullptr, /*bool_loop_constants_size=*/0,
+            /*vertex_bool_loop_constants_buffer_index=*/UINT32_MAX,
+            /*fragment_bool_loop_constants_buffer_index=*/UINT32_MAX,
+            /*index_buffer=*/nullptr, /*rasterization_state=*/nullptr,
+            /*depth_stencil_state=*/nullptr,
+            /*fragment_shared_memory_buffer_index=*/7);
+    uint32_t fragment_shared_waited_count = 0;
+    bool fragment_shared_waited =
+        fragment_shared_rendered &&
+        WaitPipelineProbeContext(fragment_shared_context, &fragment_shared_error,
+                                 &fragment_shared_waited_count);
+    uint32_t fragment_shared_value =
+        fragment_shared_buffer ? *static_cast<const uint32_t*>([fragment_shared_buffer contents])
+                               : 0;
+    bool fragment_shared_ok = fragment_shared_waited && fragment_shared_waited_count == 1 &&
+                              fragment_shared_value == kFragmentSharedSentinel;
+    ReleasePipelineProbeContext(fragment_shared_context);
+    if (fragment_shared_buffer) {
+      [fragment_shared_buffer release];
+    }
+    if (!fragment_shared_ok) {
+      std::fprintf(stderr,
+                   "[metal_pipeline_probe_test] FAIL: fragment shared-memory write: %s "
+                   "rendered=%d waited=%d submissions=%u value=%08X\n",
+                   fragment_shared_error.c_str(), int(fragment_shared_rendered),
+                   int(fragment_shared_waited), fragment_shared_waited_count,
+                   fragment_shared_value);
       ReleasePipelineProbeContext(context);
       release_pipeline_states();
       return 1;
@@ -699,18 +847,24 @@ int RunPipelineProbeTest() {
     depth_rasterization_state.viewport_height = kHeight;
     depth_rasterization_state.scissor_width = kWidth;
     depth_rasterization_state.scissor_height = kHeight;
-    auto render_depth_quad = [&](const std::array<float, 12>& positions,
-                                 const ProbeTextureSlot& draw_texture,
-                                 const ProbeDepthStencilState& depth_stencil_state) {
+    auto render_depth_quad_with_pipeline = [&](void* draw_pipeline,
+                                               const std::array<float, 12>& positions,
+                                               const ProbeTextureSlot& draw_texture,
+                                               const ProbeDepthStencilState& depth_stencil_state) {
       return RenderPipelineProbeToContext(
-          context, depth_pipeline_state, kUnusedSystemConstants.data(),
-          sizeof(kUnusedSystemConstants), nullptr, 0, nullptr, 0, nullptr, 0, nullptr, nullptr, 0,
-          0, &draw_texture, 1, 1,
+          context, draw_pipeline, kUnusedSystemConstants.data(), sizeof(kUnusedSystemConstants),
+          nullptr, 0, nullptr, 0, nullptr, 0, nullptr, nullptr, 0, 0, &draw_texture, 1, 1,
           /*primitive_type=TriangleList=*/4, uint32_t(kFanIndices.size()), kWidth, kHeight, &error,
           /*vertex_shared_memory_buffer_index=*/UINT32_MAX, UINT32_MAX, UINT32_MAX, nullptr, 0,
           UINT32_MAX, UINT32_MAX, nullptr, &sampler, positions.data(), sizeof(positions),
           /*vertex_data_buffer_index=*/3, nullptr, 0, UINT32_MAX, UINT32_MAX, &fan_index_buffer,
           &depth_rasterization_state, &depth_stencil_state);
+    };
+    auto render_depth_quad = [&](const std::array<float, 12>& positions,
+                                 const ProbeTextureSlot& draw_texture,
+                                 const ProbeDepthStencilState& depth_stencil_state) {
+      return render_depth_quad_with_pipeline(depth_pipeline_state, positions, draw_texture,
+                                             depth_stencil_state);
     };
     auto read_center = [&](std::vector<uint8_t>& output) {
       bool read_ok = ReadPipelineProbeContext(context, kWidth, kHeight, output, &error);
@@ -775,6 +929,73 @@ int RunPipelineProbeTest() {
     const uint8_t* stencil_center = stencil_rejected ? read_center(stencil_bgra) : nullptr;
     bool stencil_persistence_ok = stencil_center && PixelNear(stencil_center, kRedBgra);
     bool depth_stencil_ok = depth_persistence_ok && depth_write_mask_ok && stencil_persistence_ok;
+
+    // A depth-only pipeline must update depth without touching color. Then a
+    // rectangular resolve-time depth/stencil clear should affect only its half
+    // of the target and preserve the other half's depth and clear color.
+    bool depth_only_cleared =
+        depth_stencil_ok &&
+        ClearPipelineProbeContext(context, kWidth, kHeight, 0.0, 0.0, 0.0, 1.0, &error);
+    bool depth_only_rendered =
+        depth_only_cleared &&
+        render_depth_quad_with_pipeline(depth_only_pipeline_state, kNearDepthPositions,
+                                        green_texture, depth_less_write);
+    bool depth_rect_cleared = depth_only_rendered && QueuePipelineProbeContextDepthStencilClearRect(
+                                                         context, kWidth, kHeight, 0, 0, kWidth / 2,
+                                                         kHeight, 1.0f, 0x5A, &error);
+    ProbeDepthStencilState depth_and_stencil_equal = depth_less_write;
+    depth_and_stencil_equal.stencil_test_enabled = true;
+    depth_and_stencil_equal.front.compare_function = 2;  // CompareFunction::kEqual.
+    depth_and_stencil_equal.front.read_mask = 0xFF;
+    depth_and_stencil_equal.front.write_mask = 0;
+    depth_and_stencil_equal.front.reference = 0x5A;
+    depth_and_stencil_equal.back = depth_and_stencil_equal.front;
+    bool depth_after_rect_rendered =
+        depth_rect_cleared &&
+        render_depth_quad(kFarDepthPositions, red_texture, depth_and_stencil_equal);
+    std::vector<uint8_t> depth_only_bgra;
+    bool depth_only_read =
+        depth_after_rect_rendered &&
+        ReadPipelineProbeContext(context, kWidth, kHeight, depth_only_bgra, &error);
+    const uint8_t* depth_only_left =
+        depth_only_read ? depth_only_bgra.data() + (size_t(kHeight / 2) * kWidth + kWidth / 4) * 4
+                        : nullptr;
+    const uint8_t* depth_only_right =
+        depth_only_read
+            ? depth_only_bgra.data() + (size_t(kHeight / 2) * kWidth + (kWidth * 3) / 4) * 4
+            : nullptr;
+    bool depth_only_ok = depth_only_left && depth_only_right &&
+                         PixelNear(depth_only_left, kRedBgra) &&
+                         PixelNear(depth_only_right, std::array<uint8_t, 4>{0, 0, 0, 255});
+
+    // A void fragment shader is still semantically active when it discards.
+    // The zero-color pipeline must execute it so depth is written only on the
+    // surviving half; the later far red draw then appears only where discarded.
+    bool discard_depth_cleared =
+        depth_only_ok &&
+        ClearPipelineProbeContext(context, kWidth, kHeight, 0.0, 0.0, 0.0, 1.0, &error);
+    bool discard_depth_near_rendered =
+        discard_depth_cleared &&
+        render_depth_quad_with_pipeline(discard_depth_only_pipeline_state, kNearDepthPositions,
+                                        green_texture, depth_less_write);
+    bool discard_depth_far_rendered =
+        discard_depth_near_rendered &&
+        render_depth_quad(kFarDepthPositions, red_texture, depth_less_write);
+    std::vector<uint8_t> discard_depth_bgra;
+    bool discard_depth_read =
+        discard_depth_far_rendered &&
+        ReadPipelineProbeContext(context, kWidth, kHeight, discard_depth_bgra, &error);
+    const uint8_t* discard_depth_left =
+        discard_depth_read
+            ? discard_depth_bgra.data() + (size_t(kHeight / 2) * kWidth + kWidth / 4) * 4
+            : nullptr;
+    const uint8_t* discard_depth_right =
+        discard_depth_read
+            ? discard_depth_bgra.data() + (size_t(kHeight / 2) * kWidth + (kWidth * 3) / 4) * 4
+            : nullptr;
+    bool discard_depth_ok = discard_depth_left && discard_depth_right &&
+                            PixelNear(discard_depth_left, kRedBgra) &&
+                            PixelNear(discard_depth_right, std::array<uint8_t, 4>{0, 0, 0, 255});
 
     // Separate color targets may alias one compatible depth target. Leave the
     // first context's near-depth draw in an open batch, then immediately draw
@@ -853,18 +1074,141 @@ int RunPipelineProbeTest() {
                                               shared_depth_context_a,
                                               &incompatible_dimensions_error) &&
         !incompatible_dimensions_error.empty();
+    std::string incompatible_samples_error;
+    void* incompatible_samples_context =
+        [device supportsTextureSampleCount:4] && shared_depth_queue
+            ? CreateHostRenderTargetContext(device, shared_depth_queue, &incompatible_samples_error)
+            : nullptr;
+    bool incompatible_samples_rejected =
+        ![device supportsTextureSampleCount:4] ||
+        (incompatible_samples_context &&
+         SetPipelineProbeContextSampleCount(incompatible_samples_context, 4,
+                                            &incompatible_samples_error) &&
+         !SharePipelineProbeDepthStencilTarget(incompatible_samples_context, shared_depth_context_a,
+                                               &incompatible_samples_error) &&
+         !incompatible_samples_error.empty());
+    void* rebound_depth_context =
+        shared_depth_queue
+            ? CreateHostRenderTargetContext(device, shared_depth_queue, &shared_depth_error)
+            : nullptr;
+    bool rebound_depth_initialized =
+        rebound_depth_context && ClearPipelineProbeContext(rebound_depth_context, kWidth, kHeight,
+                                                           0.0, 0.0, 0.0, 1.0, &shared_depth_error);
+    bool color_depth_rebound =
+        rebound_depth_initialized &&
+        SharePipelineProbeDepthStencilTarget(shared_depth_context_a, rebound_depth_context,
+                                             &shared_depth_error);
+    std::vector<uint8_t> rebound_color_bgra;
+    bool rebound_color_read =
+        color_depth_rebound && ReadPipelineProbeContext(shared_depth_context_a, kWidth, kHeight,
+                                                        rebound_color_bgra, &shared_depth_error);
+    const uint8_t* rebound_color_center =
+        rebound_color_read && rebound_color_bgra.size() == size_t(kWidth) * kHeight * 4
+            ? rebound_color_bgra.data() + (size_t(kHeight / 2) * kWidth + kWidth / 2) * 4
+            : nullptr;
     bool shared_depth_ok = shared_depth_center &&
                            PixelNear(shared_depth_center, std::array<uint8_t, 4>{0, 0, 0, 255}) &&
                            shared_depth_a_pending_before_handoff == 1 &&
                            shared_depth_a_pending_after_handoff == 1 &&
-                           incompatible_queue_rejected && incompatible_dimensions_rejected;
+                           incompatible_queue_rejected && incompatible_dimensions_rejected &&
+                           incompatible_samples_rejected && rebound_color_center &&
+                           PixelNear(rebound_color_center, kGreenBgra);
+    ReleasePipelineProbeContext(incompatible_samples_context);
     ReleasePipelineProbeContext(incompatible_dimensions_context);
     ReleasePipelineProbeContext(incompatible_depth_context);
     ReleasePipelineProbeContext(shared_depth_context_b);
     ReleasePipelineProbeContext(shared_depth_context_a);
+    ReleasePipelineProbeContext(rebound_depth_context);
     if (shared_depth_queue) {
       [shared_depth_queue release];
     }
+
+    // Exercise the real 4x render attachment, matching 4x pipeline descriptor,
+    // hardware resolve into the single-sample backing, and private readback.
+    std::string msaa_error;
+    void* msaa_context = [device supportsTextureSampleCount:4]
+                             ? CreateHostRenderTargetContext(device, &msaa_error)
+                             : nullptr;
+    bool msaa_configured =
+        ![device supportsTextureSampleCount:4] ||
+        (msaa_context && SetPipelineProbeContextSampleCount(msaa_context, 4, &msaa_error));
+
+    // A depth/stencil clear may be the first operation on an MSAA context.
+    // Its pass also deterministically initializes the otherwise undefined
+    // color attachment, so an immediate consumer must perform one resolve and
+    // observe the clear color rather than stale single-sample memory.
+    void* msaa_depth_clear_context = [device supportsTextureSampleCount:4]
+                                         ? CreateHostRenderTargetContext(device, &msaa_error)
+                                         : nullptr;
+    bool msaa_depth_clear_configured =
+        ![device supportsTextureSampleCount:4] ||
+        (msaa_depth_clear_context &&
+         SetPipelineProbeContextSampleCount(msaa_depth_clear_context, 4, &msaa_error));
+    bool msaa_depth_cleared =
+        ![device supportsTextureSampleCount:4] ||
+        (msaa_depth_clear_configured && QueuePipelineProbeContextDepthStencilClearRect(
+                                            msaa_depth_clear_context, kWidth, kHeight, 4, 4,
+                                            kWidth - 8, kHeight - 8, 0.25f, 0x5A, &msaa_error));
+    uint64_t msaa_depth_resolves_before_read =
+        GetPipelineProbeContextMultisampleResolveCount(msaa_depth_clear_context);
+    std::vector<uint8_t> msaa_depth_clear_bgra;
+    bool msaa_depth_clear_read =
+        ![device supportsTextureSampleCount:4] ||
+        (msaa_depth_cleared && ReadPipelineProbeContext(msaa_depth_clear_context, kWidth, kHeight,
+                                                        msaa_depth_clear_bgra, &msaa_error));
+    uint64_t msaa_depth_resolves_after_read =
+        GetPipelineProbeContextMultisampleResolveCount(msaa_depth_clear_context);
+    const uint8_t* msaa_depth_clear_center =
+        [device supportsTextureSampleCount:4] && msaa_depth_clear_read
+            ? msaa_depth_clear_bgra.data() + (size_t(kHeight / 2) * kWidth + kWidth / 2) * 4
+            : nullptr;
+    bool msaa_depth_clear_ok =
+        ![device supportsTextureSampleCount:4] ||
+        (msaa_depth_clear_center &&
+         PixelNear(msaa_depth_clear_center, std::array<uint8_t, 4>{0, 0, 0, 255}) &&
+         msaa_depth_resolves_before_read == 0 && msaa_depth_resolves_after_read == 1);
+    bool msaa_rendered = ![device supportsTextureSampleCount:4] || msaa_configured;
+    for (uint32_t draw = 0; draw < 65 && msaa_rendered && [device supportsTextureSampleCount:4];
+         ++draw) {
+      msaa_rendered = render_indexed_fan_to_context(msaa_context, msaa_pipeline_state, &texture,
+                                                    kWidth, kHeight);
+    }
+    uint64_t msaa_resolves_before_read =
+        GetPipelineProbeContextMultisampleResolveCount(msaa_context);
+    std::vector<uint8_t> msaa_bgra;
+    bool msaa_read = ![device supportsTextureSampleCount:4] ||
+                     (msaa_rendered && ReadPipelineProbeContext(msaa_context, kWidth, kHeight,
+                                                                msaa_bgra, &msaa_error));
+    uint64_t msaa_resolves_after_read =
+        GetPipelineProbeContextMultisampleResolveCount(msaa_context);
+    std::vector<uint8_t> msaa_second_bgra;
+    bool msaa_clean_read = ![device supportsTextureSampleCount:4] ||
+                           (msaa_read && ReadPipelineProbeContext(msaa_context, kWidth, kHeight,
+                                                                  msaa_second_bgra, &msaa_error));
+    uint64_t msaa_resolves_after_clean_read =
+        GetPipelineProbeContextMultisampleResolveCount(msaa_context);
+    bool msaa_rendered_after_read =
+        ![device supportsTextureSampleCount:4] ||
+        (msaa_clean_read && render_indexed_fan_to_context(msaa_context, msaa_pipeline_state,
+                                                          &texture, kWidth, kHeight));
+    std::vector<uint8_t> msaa_redrawn_bgra;
+    bool msaa_redrawn_read =
+        ![device supportsTextureSampleCount:4] ||
+        (msaa_rendered_after_read &&
+         ReadPipelineProbeContext(msaa_context, kWidth, kHeight, msaa_redrawn_bgra, &msaa_error));
+    uint64_t msaa_resolves_after_redrawn_read =
+        GetPipelineProbeContextMultisampleResolveCount(msaa_context);
+    const uint8_t* msaa_center =
+        [device supportsTextureSampleCount:4] && msaa_read
+            ? msaa_bgra.data() + (size_t(kHeight / 2) * kWidth + kWidth / 2) * 4
+            : nullptr;
+    bool msaa_ok = ![device supportsTextureSampleCount:4] ||
+                   (msaa_depth_clear_ok && msaa_center && PixelNear(msaa_center, kExpectedBgra) &&
+                    msaa_clean_read && msaa_redrawn_read && msaa_resolves_before_read == 0 &&
+                    msaa_resolves_after_read == 1 && msaa_resolves_after_clean_read == 1 &&
+                    msaa_resolves_after_redrawn_read == 2);
+    ReleasePipelineProbeContext(msaa_depth_clear_context);
+    ReleasePipelineProbeContext(msaa_context);
 
     // Host render targets use private Metal storage. Their regional readback
     // must enqueue the blit behind pending draws and fence both with one wait.
@@ -1354,20 +1698,76 @@ int RunPipelineProbeTest() {
           stencil_center ? stencil_center[2] : 0, stencil_center ? stencil_center[3] : 0);
       return 1;
     }
+    if (!depth_only_ok || !discard_depth_ok) {
+      std::fprintf(
+          stderr,
+          "[metal_pipeline_probe_test] FAIL: depth-only/resolve clear: %s "
+          "clear=%d depth_only=%d rect_clear=%d after=%d read=%d "
+          "left=%u,%u,%u,%u right=%u,%u,%u,%u "
+          "discard=(%d,%d,%d,%d left=%u,%u,%u,%u right=%u,%u,%u,%u)\n",
+          error.c_str(), int(depth_only_cleared), int(depth_only_rendered), int(depth_rect_cleared),
+          int(depth_after_rect_rendered), int(depth_only_read),
+          depth_only_left ? depth_only_left[0] : 0, depth_only_left ? depth_only_left[1] : 0,
+          depth_only_left ? depth_only_left[2] : 0, depth_only_left ? depth_only_left[3] : 0,
+          depth_only_right ? depth_only_right[0] : 0, depth_only_right ? depth_only_right[1] : 0,
+          depth_only_right ? depth_only_right[2] : 0, depth_only_right ? depth_only_right[3] : 0,
+          int(discard_depth_cleared), int(discard_depth_near_rendered),
+          int(discard_depth_far_rendered), int(discard_depth_read),
+          discard_depth_left ? discard_depth_left[0] : 0,
+          discard_depth_left ? discard_depth_left[1] : 0,
+          discard_depth_left ? discard_depth_left[2] : 0,
+          discard_depth_left ? discard_depth_left[3] : 0,
+          discard_depth_right ? discard_depth_right[0] : 0,
+          discard_depth_right ? discard_depth_right[1] : 0,
+          discard_depth_right ? discard_depth_right[2] : 0,
+          discard_depth_right ? discard_depth_right[3] : 0);
+      return 1;
+    }
     if (!shared_depth_ok) {
+      std::fprintf(
+          stderr,
+          "[metal_pipeline_probe_test] FAIL: shared depth/stencil ownership: %s "
+          "attach=%d clear=%d near=%d far=%d read=%d reject_queue=%d "
+          "reject_dimensions=%d reject_samples=%d rebind=(%d,%d,%d) pending_a=(%u,%u) "
+          "center=%u,%u,%u,%u rebound=%u,%u,%u,%u\n",
+          shared_depth_error.c_str(), int(shared_depth_attached), int(shared_depth_cleared),
+          int(shared_depth_near_rendered), int(shared_depth_far_rendered), int(shared_depth_read),
+          int(incompatible_queue_rejected), int(incompatible_dimensions_rejected),
+          int(incompatible_samples_rejected), int(rebound_depth_initialized),
+          int(color_depth_rebound), int(rebound_color_read), shared_depth_a_pending_before_handoff,
+          shared_depth_a_pending_after_handoff, shared_depth_center ? shared_depth_center[0] : 0,
+          shared_depth_center ? shared_depth_center[1] : 0,
+          shared_depth_center ? shared_depth_center[2] : 0,
+          shared_depth_center ? shared_depth_center[3] : 0,
+          rebound_color_center ? rebound_color_center[0] : 0,
+          rebound_color_center ? rebound_color_center[1] : 0,
+          rebound_color_center ? rebound_color_center[2] : 0,
+          rebound_color_center ? rebound_color_center[3] : 0);
+      return 1;
+    }
+    if (!msaa_ok) {
       std::fprintf(stderr,
-                   "[metal_pipeline_probe_test] FAIL: shared depth/stencil ownership: %s "
-                   "attach=%d clear=%d near=%d far=%d read=%d reject_queue=%d "
-                   "reject_dimensions=%d pending_a=(%u,%u) center=%u,%u,%u,%u\n",
-                   shared_depth_error.c_str(), int(shared_depth_attached),
-                   int(shared_depth_cleared), int(shared_depth_near_rendered),
-                   int(shared_depth_far_rendered), int(shared_depth_read),
-                   int(incompatible_queue_rejected), int(incompatible_dimensions_rejected),
-                   shared_depth_a_pending_before_handoff, shared_depth_a_pending_after_handoff,
-                   shared_depth_center ? shared_depth_center[0] : 0,
-                   shared_depth_center ? shared_depth_center[1] : 0,
-                   shared_depth_center ? shared_depth_center[2] : 0,
-                   shared_depth_center ? shared_depth_center[3] : 0);
+                   "[metal_pipeline_probe_test] FAIL: 4x MSAA target/resolve: %s "
+                   "configured=%d rendered=%d read=%d clean_read=%d redraw_read=%d "
+                   "resolve_counts=%llu,%llu,%llu,%llu center=%u,%u,%u,%u "
+                   "fresh_depth=(configured=%d clear=%d read=%d resolves=%llu,%llu "
+                   "center=%u,%u,%u,%u)\n",
+                   msaa_error.c_str(), int(msaa_configured), int(msaa_rendered), int(msaa_read),
+                   int(msaa_clean_read), int(msaa_redrawn_read),
+                   static_cast<unsigned long long>(msaa_resolves_before_read),
+                   static_cast<unsigned long long>(msaa_resolves_after_read),
+                   static_cast<unsigned long long>(msaa_resolves_after_clean_read),
+                   static_cast<unsigned long long>(msaa_resolves_after_redrawn_read),
+                   msaa_center ? msaa_center[0] : 0, msaa_center ? msaa_center[1] : 0,
+                   msaa_center ? msaa_center[2] : 0, msaa_center ? msaa_center[3] : 0,
+                   int(msaa_depth_clear_configured), int(msaa_depth_cleared),
+                   int(msaa_depth_clear_read),
+                   static_cast<unsigned long long>(msaa_depth_resolves_before_read),
+                   static_cast<unsigned long long>(msaa_depth_resolves_after_read),
+                   msaa_depth_clear_center ? msaa_depth_clear_center[0] : 0,
+                   msaa_depth_clear_center ? msaa_depth_clear_center[1] : 0,
+                   msaa_depth_clear_center ? msaa_depth_clear_center[2] : 0,
+                   msaa_depth_clear_center ? msaa_depth_clear_center[3] : 0);
       return 1;
     }
     if (!blend_ok) {
@@ -1425,7 +1825,9 @@ int RunPipelineProbeTest() {
                  "[metal_pipeline_probe_test] PASS: external MTLBuffer rasterized %zu sentinel "
                  "pixels; indexed fan remap rasterized %zu; scissor clipped its right half "
                  "(%zu clear); all four cull/winding combinations plus persistent and shared "
-                 "cross-color-target depth, depth write masking, and stencil "
+                 "cross-color-target depth, depth-only writes, rectangular resolve clears, "
+                 "void-fragment discard depth, 4x MSAA target defers resolves across 64-draw "
+                 "batches, depth write masking, and stencil "
                  "replace/equal/reject matched; ordered multi-draw "
                  "batch, R/B color write mask, 64-draw command buffers, 256-draw oldest-buffer "
                  "retirement, four upload-arena lifetimes, %llu reusable buffers for %llu "

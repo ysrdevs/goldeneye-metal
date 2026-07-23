@@ -36,7 +36,7 @@ std::atomic<uint64_t> g_mutation_token{0};
 std::atomic<AvailabilityBlock> g_availability_block{AvailabilityBlock::kNoMission};
 
 constexpr bool IsSupported(Tool tool) noexcept {
-  return detail::IsToggle(tool) || tool == Tool::kOriginalRemastered;
+  return detail::IsToggle(tool) || detail::IsAction(tool);
 }
 
 const char* UnavailableReason(AvailabilityBlock block) noexcept {
@@ -323,13 +323,19 @@ bool RequestSetEnabled(Tool tool, bool enabled) noexcept {
   return queued;
 }
 
-void RequestAction(Tool tool) noexcept {
-  if (tool != Tool::kOriginalRemastered ||
-      !g_states[ToolIndex(tool)].available.load(std::memory_order_acquire)) {
-    return;
+bool RequestAction(Tool tool) noexcept {
+  if (!detail::IsAction(tool)) {
+    return false;
+  }
+  const size_t index = ToolIndex(tool);
+  if (!g_states[index].available.load(std::memory_order_acquire)) {
+    return false;
   }
   const uint64_t token = g_mutation_token.load(std::memory_order_acquire);
-  g_requests.QueueAction(tool, token);
+  if (token == 0) {
+    return false;
+  }
+  return g_requests.QueueAction(tool, token);
 }
 
 void RequestRefresh() noexcept {
@@ -401,6 +407,24 @@ void ProcessTestingToolRequests(PPCContext& context, uint8_t* base) noexcept {
       sub_82099778(context, base);
       state_changed = true;
       REXLOG_INFO("[ge] GETOOLS action=toggle_original_remastered");
+    }
+
+    // These are the exact retail Debug Menu > Unlockables callbacks. Both use
+    // the current retail profile and its normal progression setter. Consume
+    // both requests before choosing so an accidental same-frame pair can only
+    // run the comprehensive action once.
+    const bool unlock_all_levels =
+        g_requests.TakeAction(Tool::kUnlockAllLevels, mutation_token);
+    const bool unlock_one_level =
+        g_requests.TakeAction(Tool::kUnlockOneLevel, mutation_token);
+    if (unlock_all_levels) {
+      sub_82091CA8(context, base);
+      state_changed = true;
+      REXLOG_INFO("[ge] GETOOLS action=unlock_all_levels");
+    } else if (unlock_one_level) {
+      sub_82091D18(context, base);
+      state_changed = true;
+      REXLOG_INFO("[ge] GETOOLS action=unlock_one_level");
     }
   }
 

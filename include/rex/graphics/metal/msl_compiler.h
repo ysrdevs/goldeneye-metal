@@ -164,8 +164,7 @@ struct RenderPipelineCacheTelemetry {
 // and the fallback pipeline build.
 constexpr uint64_t GetRenderPipelineCacheMissDurationNs(
     const RenderPipelineCacheTelemetry& telemetry) {
-  return telemetry.archive_lookup_ns + telemetry.archive_add_ns +
-         telemetry.pipeline_build_ns;
+  return telemetry.archive_lookup_ns + telemetry.archive_add_ns + telemetry.pipeline_build_ns;
 }
 
 // MTLBinaryArchive is device-specific. GetMetalDeviceCacheKey returns a stable
@@ -175,7 +174,8 @@ constexpr uint64_t GetRenderPipelineCacheMissDurationNs(
 uint64_t GetMetalDeviceCacheKey(void* metal_device);
 void* CreateMetalPipelineBinaryArchive(void* metal_device,
                                        const std::filesystem::path& archive_path,
-                                       bool* loaded_existing_out, std::string* warning_or_error_out);
+                                       bool* loaded_existing_out,
+                                       std::string* warning_or_error_out);
 bool SerializeMetalPipelineBinaryArchive(void* binary_archive,
                                          const std::filesystem::path& archive_path,
                                          uint64_t* serialized_size_out, std::string* error_out);
@@ -188,7 +188,8 @@ void* CreateRenderPipelineState(void* metal_device, void* vertex_library, void* 
                                 std::string* error_out,
                                 const ProbeColorTargetState* color_target_state = nullptr,
                                 void* binary_archive = nullptr,
-                                RenderPipelineCacheTelemetry* cache_telemetry_out = nullptr);
+                                RenderPipelineCacheTelemetry* cache_telemetry_out = nullptr,
+                                uint32_t sample_count = 1);
 void ReleaseRenderPipelineState(void* pipeline_state);
 void* CreatePipelineProbeContext(void* metal_device, std::string* error_out);
 void* CreatePipelineProbeContext(void* metal_device, void* metal_command_queue,
@@ -203,6 +204,11 @@ void* CreateHostRenderTargetContext(void* metal_device, void* metal_command_queu
 // open draw batch so shared depth/stencil accesses stay in guest draw order.
 bool SharePipelineProbeDepthStencilTarget(void* destination_context, void* source_context,
                                           std::string* error_out);
+// Selects the raster sample count for a persistent context. The count must be
+// 1, 2, or 4 and supported by the device. Set this before sharing depth/stencil
+// targets; shared contexts are required to use the same count.
+bool SetPipelineProbeContextSampleCount(void* context, uint32_t sample_count,
+                                        std::string* error_out);
 void* CreatePipelineProbeSnapshotTexture(void* metal_device, uint32_t width, uint32_t height,
                                          std::string* error_out);
 void ReleasePipelineProbeSnapshotTexture(void* snapshot_texture);
@@ -230,6 +236,9 @@ uint32_t GetPipelineProbeContextPendingSubmissionCount(void* context);
 // Returns cumulative statistics for the reusable per-command-buffer upload
 // arenas used by persistent draws. Primarily useful for diagnostics and tests.
 bool GetPipelineProbeContextUploadStats(void* context, PipelineProbeUploadStats* stats_out);
+// Counts full-surface hardware resolves submitted for a multisampled context.
+// Draw command-buffer boundaries must not increment this; only consumers do.
+uint64_t GetPipelineProbeContextMultisampleResolveCount(void* context);
 bool ClearPipelineProbeContext(void* context, uint32_t width, uint32_t height, double red,
                                double green, double blue, double alpha, std::string* error_out);
 bool ClearPipelineProbeContextRect(void* context, uint32_t width, uint32_t height, uint32_t x,
@@ -242,6 +251,12 @@ bool QueuePipelineProbeContextClearRect(void* context, uint32_t width, uint32_t 
                                         uint32_t y, uint32_t clear_width, uint32_t clear_height,
                                         double red, double green, double blue, double alpha,
                                         std::string* error_out);
+// Clears depth and stencil in a rectangle without touching color. This mirrors
+// the resolve-time Xenos depth clear, which always writes both components.
+bool QueuePipelineProbeContextDepthStencilClearRect(void* context, uint32_t width, uint32_t height,
+                                                    uint32_t x, uint32_t y, uint32_t clear_width,
+                                                    uint32_t clear_height, float depth,
+                                                    uint8_t stencil, std::string* error_out);
 bool RenderPipelineProbeToContext(
     void* context, void* pipeline_state, const void* system_constants, size_t system_constants_size,
     const void* float_constants, size_t float_constants_size, const void* fetch_constants,
@@ -264,7 +279,8 @@ bool RenderPipelineProbeToContext(
     uint32_t fragment_bool_loop_constants_buffer_index = UINT32_MAX,
     const ProbeIndexBuffer* index_buffer = nullptr,
     const ProbeRasterizationState* rasterization_state = nullptr,
-    const ProbeDepthStencilState* depth_stencil_state = nullptr);
+    const ProbeDepthStencilState* depth_stencil_state = nullptr,
+    uint32_t fragment_shared_memory_buffer_index = UINT32_MAX);
 bool ReadPipelineProbeContext(void* context, uint32_t width, uint32_t height,
                               std::vector<uint8_t>& bgra_out, std::string* error_out);
 // Reads a tightly packed BGRA rectangle. Like the full read, this is a fence:

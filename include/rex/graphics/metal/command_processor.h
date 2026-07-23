@@ -80,13 +80,14 @@ class MetalCommandProcessor final : public CommandProcessor {
   MetalShader::MetalTranslation* GetTranslatedShader(MetalShader& shader);
   bool EnsureShaderTranslated(MetalShader& shader, uint64_t modification);
   bool EnsureShaderTranslated(MetalShader& shader);
-  void* CreateCachedRenderPipelineState(
-      void* vertex_library, void* fragment_library, std::string* error_out,
-      const ProbeColorTargetState* color_target_state = nullptr);
+  void* CreateCachedRenderPipelineState(void* vertex_library, void* fragment_library,
+                                        std::string* error_out,
+                                        const ProbeColorTargetState* color_target_state = nullptr,
+                                        uint32_t sample_count = 1);
   void FinalizePipelineArchiveSerializationLocked();
-  void HandlePipelineArchiveSerializationResultLocked(
-      bool succeeded, uint64_t archive_size, uint64_t elapsed_ns,
-      std::string serialize_error);
+  void HandlePipelineArchiveSerializationResultLocked(bool succeeded, uint64_t archive_size,
+                                                      uint64_t elapsed_ns,
+                                                      std::string serialize_error);
   void SerializePipelineArchiveIfNeeded(bool force);
   void ShutdownPipelineArchive();
   void* EnsureRenderPipeline(MetalShader& vertex_shader, MetalShader& pixel_shader,
@@ -97,11 +98,12 @@ class MetalCommandProcessor final : public CommandProcessor {
   void TrackPositionRegisterWrite(uint32_t index);
   void BeginPositionRegisterSnapshot();
   bool EnsureVertexFetchRangesResident(const MetalShader& vertex_shader);
-  void TryRenderPipelineProbe(
-      MetalShader& vertex_shader, MetalShader& pixel_shader, void* pipeline_state,
+  bool TryRenderPipelineProbe(
+      MetalShader& vertex_shader, MetalShader* pixel_shader, void* pipeline_state,
       xenos::PrimitiveType prim_type, uint32_t index_count, bool host_render_target_debug = false,
       const PrimitiveProcessor::ProcessingResult* primitive_processing_result = nullptr);
   struct HostRenderTarget;
+  struct HostDepthStencilTarget;
   // Drains every persistent context except ordered_context. Work on the
   // excluded context may be followed by a same-queue operation that provides
   // the required ordering and completion fence itself.
@@ -128,12 +130,14 @@ class MetalCommandProcessor final : public CommandProcessor {
                                                    uint32_t color_format,
                                                    uint32_t min_surface_pitch,
                                                    xenos::MsaaSamples msaa_samples);
+  HostDepthStencilTarget* EnsureHostDepthStencilTarget(uint32_t depth_info, uint32_t surface_info);
   HostRenderTarget* EnsureHostRenderTarget(uint32_t rt_index);
-  void* EnsureFullscreenPixelPipeline(MetalShader& pixel_shader);
-  void* EnsureHostPixelPipeline(MetalShader& pixel_shader);
-  void* EnsureHostFallbackPixelPipeline();
-  void* EnsureHostVertexColorPixelPipeline();
-  void* EnsureSolidColorPipeline(MetalShader& vertex_shader);
+  void* EnsureFullscreenPixelPipeline(MetalShader& pixel_shader, uint32_t sample_count = 1);
+  void* EnsureHostPixelPipeline(MetalShader& pixel_shader, uint32_t sample_count = 1);
+  void* EnsureHostFallbackPixelPipeline(uint32_t sample_count = 1);
+  void* EnsureHostVertexColorPixelPipeline(uint32_t sample_count = 1);
+  void* EnsureSolidColorPipeline(MetalShader& vertex_shader, uint32_t sample_count = 1);
+  void* EnsureDepthOnlyPipeline(MetalShader& vertex_shader, MetalShader* pixel_shader);
   bool RenderFullscreenPixelShader(MetalShader& pixel_shader, uint32_t width, uint32_t height,
                                    std::vector<uint8_t>& bgra_out,
                                    bool host_render_target_context = false);
@@ -223,9 +227,7 @@ class MetalCommandProcessor final : public CommandProcessor {
   void* fullscreen_vertex_library_ = nullptr;
   void* host_pixel_vertex_library_ = nullptr;
   void* host_fallback_pixel_fragment_library_ = nullptr;
-  void* host_fallback_pixel_pipeline_state_ = nullptr;
   void* host_vertex_color_pixel_fragment_library_ = nullptr;
-  void* host_vertex_color_pixel_pipeline_state_ = nullptr;
   void* dummy_fragment_library_ = nullptr;
   void* solid_fragment_library_ = nullptr;
   void* pipeline_probe_context_ = nullptr;
@@ -237,6 +239,8 @@ class MetalCommandProcessor final : public CommandProcessor {
   std::unordered_map<uint64_t, void*> render_pipeline_states_;
   std::unordered_map<uint64_t, void*> fullscreen_pixel_pipeline_states_;
   std::unordered_map<uint64_t, void*> host_pixel_pipeline_states_;
+  std::unordered_map<uint32_t, void*> host_fallback_pixel_pipeline_states_;
+  std::unordered_map<uint32_t, void*> host_vertex_color_pixel_pipeline_states_;
   std::unordered_map<uint64_t, void*> solid_color_pipeline_states_;
   std::unordered_map<uint64_t, void*> memexport_pipeline_states_;
   void* pipeline_binary_archive_ = nullptr;
@@ -345,6 +349,13 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint32_t height = 0;
     uint32_t rt_index = 0;
     uint32_t color_info = 0;
+    uint32_t depth_info = 0;
+    uint32_t surface_info = 0;
+    uint64_t depth_stencil_key = 0;
+  };
+  struct HostDepthStencilTarget {
+    void* context = nullptr;
+    uint32_t depth_info = 0;
     uint32_t surface_info = 0;
   };
   struct PendingReadbackResolveSlice {
@@ -371,6 +382,7 @@ class MetalCommandProcessor final : public CommandProcessor {
   ExactResolvedSurface exact_resolved_surface_;
   SharedMemory::GlobalWatchHandle exact_resolved_surface_watch_ = nullptr;
   std::unordered_map<uint64_t, HostRenderTarget> host_render_targets_;
+  std::unordered_map<uint64_t, HostDepthStencilTarget> host_depth_stencil_targets_;
   std::vector<PendingReadbackResolveSlice> pending_readback_resolve_slices_;
   // GPU tiled resolves stay resident until the next guest-visible completion
   // event. All ranges before that event are coalesced into one Metal blit
@@ -412,6 +424,7 @@ class MetalCommandProcessor final : public CommandProcessor {
   uint32_t translated_shader_count_ = 0;
   uint32_t failed_shader_translation_count_ = 0;
   uint32_t draw_count_ = 0;
+  bool collect_draw_route_summary_ = true;
   uint32_t draw_calls_this_swap_ = 0;
   uint32_t color_depth_draws_this_swap_ = 0;
   uint32_t color_target_candidate_draws_this_swap_ = 0;

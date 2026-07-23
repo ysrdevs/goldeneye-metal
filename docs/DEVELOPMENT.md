@@ -57,6 +57,7 @@ Use a complete extracted game-data folder containing `default.xex`, `files/`, an
 audio data:
 
 ```sh
+DYLD_LIBRARY_PATH="$PWD/out/macos-arm64" \
 REX_INPUT_BACKEND=sdl REX_MNK_MODE=true \
 ./vendor/GoldenEye-Recomp/out/build/macos-arm64-release/GoldenEye \
   --game_data_root /absolute/path/to/game-data \
@@ -121,8 +122,11 @@ measures complete 64-frame windows:
 ./tools/benchmark-dam.sh
 ```
 
-Results are written under `out/benchmarks/<timestamp>/`. They include the raw log, CSV windows,
-summary files, build identity, hardware, macOS version, and test environment.
+Results are written to a unique directory under `out/benchmarks/`. They include the raw log, CSV
+windows, frame-pacing/wait summaries, build identity, hardware, macOS version, and effective test
+environment. Runs use private logs, config, and saves. A separate `out/benchmarks/cache` is reused
+so the result never touches the player's cache; set `GOLDENEYE_BENCH_RESET_CACHE=1` for an
+explicitly cold run.
 
 Override the data path or sample size only when needed:
 
@@ -133,8 +137,35 @@ GOLDENEYE_BENCH_MEASURE_WINDOWS=48 \
 ./tools/benchmark-dam.sh
 ```
 
-Do not report transition-heavy samples as steady-state performance. Always include the Mac model,
-warm-up count, measured-window count, and whether any fallback or Metal error occurred.
+The benchmark refuses stale runtime or game builds, accepts only complete 64-frame windows, and
+distinguishes its own deliberate shutdown from an early exit or crash. Do not report
+transition-heavy samples as steady-state performance. Always include the Mac model, warm-up count,
+measured-window count, and whether any fallback or Metal error occurred.
+
+## Automated stability and rendering checks
+
+Run repeatable boot-to-Dam and native-quit cycles without using the player's saves or settings:
+
+```sh
+./tools/stability-cycle.py --cycles 3 --mode dam
+```
+
+Dam captures are useful as raw evidence, but gameplay is not synchronized closely enough for a
+pixel reference. Use the deterministic menu route for image regression:
+
+```sh
+./tools/stability-cycle.py --cycles 1 --mode menu --capture
+./tools/render_regression.py accept \
+  out/stability/.../cycle-001/menu.png out/render-references/menu.png
+./tools/stability-cycle.py --cycles 3 --mode menu --capture \
+  --reference out/render-references/menu.png
+```
+
+For Dam screenshots, run `./tools/stability-cycle.py --cycles 3 --mode dam --capture` without a
+reference. Reports, logs, captures, and diff images remain under `out/`. Capturing requires macOS
+Screen Recording permission. A cycle fails on crashes, renderer failures, incomplete final profile
+data, or orphaned child processes. References may contain game assets and must not be committed or
+shared.
 
 ## Common diagnostics
 

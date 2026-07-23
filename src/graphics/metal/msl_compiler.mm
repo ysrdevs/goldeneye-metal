@@ -468,12 +468,11 @@ void* CreateMetalPipelineBinaryArchive(void* metal_device,
       load_existing = false;
       if (warning_or_error_out) {
         *warning_or_error_out =
-            filesystem_error
-                ? "could not inspect existing Metal pipeline archive"
-                : archive_size == 0
-                      ? "existing Metal pipeline archive is empty; creating a fresh archive"
-                      : "existing Metal pipeline archive exceeds the 128 MiB safety limit; "
-                        "creating a fresh archive";
+            filesystem_error ? "could not inspect existing Metal pipeline archive"
+            : archive_size == 0
+                ? "existing Metal pipeline archive is empty; creating a fresh archive"
+                : "existing Metal pipeline archive exceeds the 128 MiB safety limit; "
+                  "creating a fresh archive";
       }
     }
   }
@@ -518,8 +517,7 @@ void* CreateMetalPipelineBinaryArchive(void* metal_device,
 
 bool SerializeMetalPipelineBinaryArchive(void* binary_archive,
                                          const std::filesystem::path& archive_path,
-                                         uint64_t* serialized_size_out,
-                                         std::string* error_out) {
+                                         uint64_t* serialized_size_out, std::string* error_out) {
   if (serialized_size_out) {
     *serialized_size_out = 0;
   }
@@ -537,8 +535,7 @@ bool SerializeMetalPipelineBinaryArchive(void* binary_archive,
   std::filesystem::create_directories(archive_path.parent_path(), filesystem_error);
   if (filesystem_error) {
     if (error_out) {
-      *error_out = "could not create Metal pipeline cache directory: " +
-                   filesystem_error.message();
+      *error_out = "could not create Metal pipeline cache directory: " + filesystem_error.message();
     }
     return false;
   }
@@ -578,14 +575,12 @@ bool SerializeMetalPipelineBinaryArchive(void* binary_archive,
   }
 
   uintmax_t temporary_size = std::filesystem::file_size(temporary_path, filesystem_error);
-  if (filesystem_error || temporary_size == 0 ||
-      temporary_size > kMaximumPipelineArchiveBytes) {
+  if (filesystem_error || temporary_size == 0 || temporary_size > kMaximumPipelineArchiveBytes) {
     if (error_out) {
-      *error_out = filesystem_error
-                       ? "could not inspect serialized Metal pipeline archive"
-                       : temporary_size == 0
-                             ? "Metal serialized an empty pipeline archive"
-                             : "serialized Metal pipeline archive exceeds the 128 MiB safety limit";
+      *error_out = filesystem_error ? "could not inspect serialized Metal pipeline archive"
+                   : temporary_size == 0
+                       ? "Metal serialized an empty pipeline archive"
+                       : "serialized Metal pipeline archive exceeds the 128 MiB safety limit";
     }
     std::filesystem::remove(temporary_path, filesystem_error);
     return false;
@@ -601,8 +596,8 @@ bool SerializeMetalPipelineBinaryArchive(void* binary_archive,
   // never a partially serialized destination.
   if (rename(temporary_path.c_str(), archive_path.c_str()) != 0) {
     if (error_out) {
-      *error_out = "atomic Metal pipeline archive replacement failed: " +
-                   std::string(std::strerror(errno));
+      *error_out =
+          "atomic Metal pipeline archive replacement failed: " + std::string(std::strerror(errno));
     }
     std::filesystem::remove(temporary_path, filesystem_error);
     return false;
@@ -670,14 +665,19 @@ void* CreateRenderPipelineState(void* metal_device, void* vertex_library, void* 
                                 std::string* error_out,
                                 const ProbeColorTargetState* color_target_state,
                                 void* binary_archive,
-                                RenderPipelineCacheTelemetry* cache_telemetry_out) {
+                                RenderPipelineCacheTelemetry* cache_telemetry_out,
+                                uint32_t sample_count) {
   RenderPipelineCacheTelemetry cache_telemetry;
   if (cache_telemetry_out) {
     *cache_telemetry_out = {};
   }
-  if (!metal_device || !vertex_library || !fragment_library) {
+  if (!metal_device || !vertex_library || !fragment_library ||
+      (sample_count != 1 && sample_count != 2 && sample_count != 4) ||
+      ![(id<MTLDevice>)metal_device supportsTextureSampleCount:sample_count]) {
     if (error_out) {
-      *error_out = "missing Metal device or shader library";
+      *error_out = !metal_device || !vertex_library || !fragment_library
+                       ? "missing Metal device or shader library"
+                       : "unsupported Metal render-pipeline sample count";
     }
     return nullptr;
   }
@@ -701,6 +701,7 @@ void* CreateRenderPipelineState(void* metal_device, void* vertex_library, void* 
   MTLRenderPipelineDescriptor* descriptor = [[MTLRenderPipelineDescriptor alloc] init];
   descriptor.vertexFunction = vertex_function;
   descriptor.fragmentFunction = fragment_function;
+  descriptor.rasterSampleCount = sample_count;
   descriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
   descriptor.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
   MTLRenderPipelineColorAttachmentDescriptor* color_attachment = descriptor.colorAttachments[0];
@@ -744,7 +745,7 @@ void* CreateRenderPipelineState(void* metal_device, void* vertex_library, void* 
   id<MTLRenderPipelineState> pipeline_state = nil;
   if (binary_archive) {
     cache_telemetry.archive_enabled = true;
-    descriptor.binaryArchives = @[(id<MTLBinaryArchive>)binary_archive];
+    descriptor.binaryArchives = @[ (id<MTLBinaryArchive>)binary_archive ];
 
     uint64_t lookup_start_ns = PipelineCacheNowNs();
     pipeline_state = [(id<MTLDevice>)metal_device
@@ -775,18 +776,18 @@ void* CreateRenderPipelineState(void* metal_device, void* vertex_library, void* 
       // successfully added above can be reused immediately.
       error = nil;
       uint64_t build_start_ns = PipelineCacheNowNs();
-      pipeline_state = [(id<MTLDevice>)metal_device
-          newRenderPipelineStateWithDescriptor:descriptor
-                                       options:MTLPipelineOptionNone
-                                    reflection:nil
-                                         error:&error];
+      pipeline_state =
+          [(id<MTLDevice>)metal_device newRenderPipelineStateWithDescriptor:descriptor
+                                                                    options:MTLPipelineOptionNone
+                                                                 reflection:nil
+                                                                      error:&error];
       cache_telemetry.pipeline_build_ns = PipelineCacheNowNs() - build_start_ns;
       cache_telemetry.archive_updated = archive_add_succeeded && pipeline_state;
     }
   } else {
     uint64_t build_start_ns = PipelineCacheNowNs();
-    pipeline_state =
-        [(id<MTLDevice>)metal_device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+    pipeline_state = [(id<MTLDevice>)metal_device newRenderPipelineStateWithDescriptor:descriptor
+                                                                                 error:&error];
     cache_telemetry.pipeline_build_ns = PipelineCacheNowNs() - build_start_ns;
   }
   [descriptor release];
@@ -875,6 +876,7 @@ struct ProbeDepthStencilTarget {
   id<MTLTexture> texture = nil;
   uint32_t width = 0;
   uint32_t height = 0;
+  uint32_t sample_count = 1;
   bool initialized = false;
   // An open render encoder retains exclusive logical ownership. Before a
   // different color context uses this target, the previous owner's command
@@ -887,6 +889,10 @@ struct PipelineProbeContext {
   id<MTLDevice> device = nil;
   id<MTLCommandQueue> command_queue = nil;
   id<MTLTexture> render_texture = nil;
+  // For multisampled contexts, drawing targets this texture. Consumers resolve
+  // it into render_texture only when a read, guest copy, or presentation needs
+  // single-sample color data.
+  id<MTLTexture> multisample_render_texture = nil;
   ProbeDepthStencilTarget* depth_stencil_target = nullptr;
   id<MTLBuffer> private_readback_buffer = nil;
   size_t private_readback_capacity = 0;
@@ -895,11 +901,15 @@ struct PipelineProbeContext {
   std::unordered_map<uint64_t, id<MTLSamplerState>> sampler_cache;
   std::unordered_map<uint64_t, id<MTLDepthStencilState>> depth_stencil_state_cache;
   id<MTLRenderPipelineState> clear_pipeline_state = nil;
+  id<MTLRenderPipelineState> depth_clear_pipeline_state = nil;
   id<MTLComputePipelineState> tiled_resolve_pipeline_state = nil;
   MTLStorageMode storage_mode = MTLStorageModeShared;
   uint32_t width = 0;
   uint32_t height = 0;
+  uint32_t sample_count = 1;
   bool initialized = false;
+  bool color_resolve_dirty = false;
+  uint64_t multisample_resolve_count = 0;
   // commandBuffer and renderCommandEncoderWithDescriptor return autoreleased
   // objects. The open objects each have an explicit +1 retain so they remain
   // valid across RenderPipelineProbeToContext's per-call autorelease pools.
@@ -981,6 +991,7 @@ void InvalidateProbeContextTargets(PipelineProbeContext* context) {
     return;
   }
   context->initialized = false;
+  context->color_resolve_dirty = false;
   if (context->depth_stencil_target) {
     context->depth_stencil_target->initialized = false;
   }
@@ -998,16 +1009,32 @@ struct TiledResolveConstants {
 };
 
 void ConfigureProbeDepthStencilPass(MTLRenderPassDescriptor* pass,
-                                    id<MTLTexture> depth_stencil_texture,
-                                    MTLLoadAction load_action) {
+                                    id<MTLTexture> depth_stencil_texture, MTLLoadAction load_action,
+                                    double clear_depth = 1.0, uint32_t clear_stencil = 0) {
   pass.depthAttachment.texture = depth_stencil_texture;
   pass.depthAttachment.loadAction = load_action;
   pass.depthAttachment.storeAction = MTLStoreActionStore;
-  pass.depthAttachment.clearDepth = 1.0;
+  pass.depthAttachment.clearDepth = clear_depth;
   pass.stencilAttachment.texture = depth_stencil_texture;
   pass.stencilAttachment.loadAction = load_action;
   pass.stencilAttachment.storeAction = MTLStoreActionStore;
-  pass.stencilAttachment.clearStencil = 0;
+  pass.stencilAttachment.clearStencil = clear_stencil;
+}
+
+void ConfigureProbeColorPass(MTLRenderPassDescriptor* pass, PipelineProbeContext* context,
+                             MTLLoadAction load_action, MTLClearColor clear_color) {
+  MTLRenderPassColorAttachmentDescriptor* color = pass.colorAttachments[0];
+  color.texture =
+      context->sample_count > 1 ? context->multisample_render_texture : context->render_texture;
+  color.loadAction = load_action;
+  color.clearColor = clear_color;
+  if (context->sample_count > 1) {
+    color.resolveTexture = nil;
+    color.storeAction = MTLStoreActionStore;
+  } else {
+    color.resolveTexture = nil;
+    color.storeAction = MTLStoreActionStore;
+  }
 }
 
 void ResetProbeUploadArena(ProbeUploadArena& arena) {
@@ -1427,6 +1454,61 @@ bool FinalizeOpenPipelineProbeCommandBuffer(PipelineProbeContext* context, std::
   return true;
 }
 
+bool FinalizeProbeColorForConsumer(PipelineProbeContext* context, std::string* error_out) {
+  if (!context) {
+    if (error_out) {
+      *error_out = "missing probe context";
+    }
+    return false;
+  }
+  if (!FinalizeOpenPipelineProbeCommandBuffer(context, error_out)) {
+    return false;
+  }
+  if (context->sample_count == 1 || !context->color_resolve_dirty) {
+    return true;
+  }
+  if (!context->initialized || !context->multisample_render_texture || !context->render_texture) {
+    InvalidateProbeContextTargets(context);
+    if (error_out) {
+      *error_out = "multisample probe color target is unavailable for resolve";
+    }
+    return false;
+  }
+
+  id<MTLCommandBuffer> command_buffer = [context->command_queue commandBuffer];
+  if (!command_buffer) {
+    if (error_out) {
+      *error_out = "failed to create multisample color resolve command buffer";
+    }
+    return false;
+  }
+  MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+  MTLRenderPassColorAttachmentDescriptor* color = pass.colorAttachments[0];
+  color.texture = context->multisample_render_texture;
+  color.loadAction = MTLLoadActionLoad;
+  color.resolveTexture = context->render_texture;
+  // Preserve the multisample attachment because later render passes continue
+  // it with Load until another consumer needs an updated single-sample image.
+  color.storeAction = MTLStoreActionStoreAndMultisampleResolve;
+  id<MTLRenderCommandEncoder> encoder = [command_buffer renderCommandEncoderWithDescriptor:pass];
+  if (!encoder) {
+    if (error_out) {
+      *error_out = "failed to create multisample color resolve encoder";
+    }
+    return false;
+  }
+  [encoder endEncoding];
+
+  CommittedProbeCommandBuffer committed;
+  committed.command_buffer = [command_buffer retain];
+  committed.auxiliary_submission_count = 1;
+  context->committed_command_buffers.push_back(committed);
+  [command_buffer commit];
+  context->color_resolve_dirty = false;
+  ++context->multisample_resolve_count;
+  return true;
+}
+
 bool ConsumeCompletedPipelineProbeCommands(PipelineProbeContext* context, std::string* error_out) {
   std::string first_error;
   for (const CommittedProbeCommandBuffer& committed : context->committed_command_buffers) {
@@ -1591,6 +1673,10 @@ bool EnsureProbeDepthStencilTexture(PipelineProbeContext* context, uint32_t widt
                                                          width:width
                                                         height:height
                                                      mipmapped:NO];
+  if (target->sample_count > 1) {
+    descriptor.textureType = MTLTextureType2DMultisample;
+    descriptor.sampleCount = target->sample_count;
+  }
   descriptor.usage = MTLTextureUsageRenderTarget;
   descriptor.storageMode = MTLStorageModePrivate;
   target->texture = [target->device newTextureWithDescriptor:descriptor];
@@ -1658,11 +1744,9 @@ bool EnsureOpenPipelineProbeEncoder(PipelineProbeContext* context, std::string* 
     return false;
   }
   MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-  pass.colorAttachments[0].texture = context->render_texture;
-  pass.colorAttachments[0].loadAction =
-      context->initialized ? MTLLoadActionLoad : MTLLoadActionClear;
-  pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-  pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+  ConfigureProbeColorPass(pass, context,
+                          context->initialized ? MTLLoadActionLoad : MTLLoadActionClear,
+                          MTLClearColorMake(0.0, 0.0, 0.0, 1.0));
   ProbeDepthStencilTarget* depth_stencil_target = context->depth_stencil_target;
   ConfigureProbeDepthStencilPass(
       pass, depth_stencil_target->texture,
@@ -1731,7 +1815,9 @@ bool EnsureProbeContextTexture(PipelineProbeContext* context, uint32_t width, ui
   if (!EnsureProbeDepthStencilTexture(context, width, height, error_out)) {
     return false;
   }
-  if (context->render_texture && context->width == width && context->height == height) {
+  if (context->render_texture &&
+      (context->sample_count == 1 || context->multisample_render_texture) &&
+      context->width == width && context->height == height) {
     return true;
   }
   if (!WaitPendingPipelineProbeCommands(context, error_out, nullptr)) {
@@ -1741,18 +1827,41 @@ bool EnsureProbeContextTexture(PipelineProbeContext* context, uint32_t width, ui
     [context->render_texture release];
     context->render_texture = nil;
   }
+  if (context->multisample_render_texture) {
+    [context->multisample_render_texture release];
+    context->multisample_render_texture = nil;
+  }
   MTLTextureDescriptor* texture_descriptor =
       [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                          width:width
                                                         height:height
                                                      mipmapped:NO];
-  texture_descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+  texture_descriptor.usage =
+      MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
   texture_descriptor.storageMode = context->storage_mode;
   context->render_texture = [context->device newTextureWithDescriptor:texture_descriptor];
-  if (!context->render_texture) {
+  if (context->render_texture && context->sample_count > 1) {
+    MTLTextureDescriptor* multisample_descriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                           width:width
+                                                          height:height
+                                                       mipmapped:NO];
+    multisample_descriptor.textureType = MTLTextureType2DMultisample;
+    multisample_descriptor.sampleCount = context->sample_count;
+    multisample_descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    multisample_descriptor.storageMode = MTLStorageModePrivate;
+    context->multisample_render_texture =
+        [context->device newTextureWithDescriptor:multisample_descriptor];
+  }
+  if (!context->render_texture ||
+      (context->sample_count > 1 && !context->multisample_render_texture)) {
     if (context->render_texture) {
       [context->render_texture release];
       context->render_texture = nil;
+    }
+    if (context->multisample_render_texture) {
+      [context->multisample_render_texture release];
+      context->multisample_render_texture = nil;
     }
     context->width = 0;
     context->height = 0;
@@ -1765,6 +1874,7 @@ bool EnsureProbeContextTexture(PipelineProbeContext* context, uint32_t width, ui
   context->width = width;
   context->height = height;
   context->initialized = false;
+  context->color_resolve_dirty = false;
   return true;
 }
 
@@ -1828,6 +1938,7 @@ fragment float4 rex_clear_fragment(constant ClearConstants& constants [[buffer(0
   MTLRenderPipelineDescriptor* descriptor = [[MTLRenderPipelineDescriptor alloc] init];
   descriptor.vertexFunction = vertex_function;
   descriptor.fragmentFunction = fragment_function;
+  descriptor.rasterSampleCount = context->sample_count;
   descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
   descriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
   descriptor.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
@@ -1840,6 +1951,81 @@ fragment float4 rex_clear_fragment(constant ClearConstants& constants [[buffer(0
   if (!context->clear_pipeline_state) {
     if (error_out) {
       *error_out = error ? [[error localizedDescription] UTF8String] : "clear pipeline failed";
+    }
+    return false;
+  }
+  return true;
+}
+
+bool EnsureDepthClearPipelineState(PipelineProbeContext* context, std::string* error_out) {
+  if (!context || !context->device) {
+    if (error_out) {
+      *error_out = "missing probe context or Metal device";
+    }
+    return false;
+  }
+  if (context->depth_clear_pipeline_state) {
+    return true;
+  }
+  static constexpr char kDepthClearMsl[] = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct DepthClearConstants {
+  float depth;
+};
+
+vertex float4 rex_depth_clear_vertex(uint vertex_id [[vertex_id]],
+                                     constant DepthClearConstants& constants [[buffer(0)]]) {
+  constexpr float2 positions[3] = {
+    float2(-1.0, -1.0),
+    float2( 3.0, -1.0),
+    float2(-1.0,  3.0),
+  };
+  return float4(positions[vertex_id], constants.depth, 1.0);
+}
+
+fragment float4 rex_depth_clear_fragment() {
+  return float4(0.0);
+}
+)";
+  NSError* error = nil;
+  id<MTLLibrary> library =
+      [context->device newLibraryWithSource:[NSString stringWithUTF8String:kDepthClearMsl]
+                                    options:nil
+                                      error:&error];
+  if (!library) {
+    if (error_out) {
+      *error_out = error ? [[error localizedDescription] UTF8String] : "depth clear library failed";
+    }
+    return false;
+  }
+  id<MTLFunction> vertex_function = [library newFunctionWithName:@"rex_depth_clear_vertex"];
+  id<MTLFunction> fragment_function = [library newFunctionWithName:@"rex_depth_clear_fragment"];
+  MTLRenderPipelineDescriptor* descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+  descriptor.vertexFunction = vertex_function;
+  descriptor.fragmentFunction = fragment_function;
+  descriptor.rasterSampleCount = context->sample_count;
+  descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+  descriptor.colorAttachments[0].writeMask = MTLColorWriteMaskNone;
+  descriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+  descriptor.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+  if (vertex_function && fragment_function) {
+    context->depth_clear_pipeline_state =
+        [context->device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+  }
+  [descriptor release];
+  if (vertex_function) {
+    [vertex_function release];
+  }
+  if (fragment_function) {
+    [fragment_function release];
+  }
+  [library release];
+  if (!context->depth_clear_pipeline_state) {
+    if (error_out) {
+      *error_out =
+          error ? [[error localizedDescription] UTF8String] : "depth clear pipeline failed";
     }
     return false;
   }
@@ -1941,6 +2127,13 @@ bool SharePipelineProbeDepthStencilTarget(void* opaque_destination_context,
     }
     return false;
   }
+  if (destination_context->sample_count != source_context->sample_count ||
+      source_context->depth_stencil_target->sample_count != source_context->sample_count) {
+    if (error_out) {
+      *error_out = "shared depth/stencil contexts must use the same sample count";
+    }
+    return false;
+  }
   ProbeDepthStencilTarget* source_target = source_context->depth_stencil_target;
   ProbeDepthStencilTarget* destination_target = destination_context->depth_stencil_target;
   if (source_target->texture && ((destination_context->render_texture &&
@@ -1959,6 +2152,69 @@ bool SharePipelineProbeDepthStencilTarget(void* opaque_destination_context,
   }
   AttachProbeDepthStencilTarget(destination_context, source_target);
   return true;
+}
+
+bool SetPipelineProbeContextSampleCount(void* opaque_context, uint32_t sample_count,
+                                        std::string* error_out) {
+  @autoreleasepool {
+    auto* context = static_cast<PipelineProbeContext*>(opaque_context);
+    if (!context || !context->device || !context->depth_stencil_target) {
+      if (error_out) {
+        *error_out = "missing persistent probe context";
+      }
+      return false;
+    }
+    if ((sample_count != 1 && sample_count != 2 && sample_count != 4) ||
+        ![context->device supportsTextureSampleCount:sample_count]) {
+      if (error_out) {
+        *error_out = "unsupported persistent probe sample count";
+      }
+      return false;
+    }
+    if (context->sample_count == sample_count) {
+      return true;
+    }
+    ProbeDepthStencilTarget* target = context->depth_stencil_target;
+    if (target->attached_contexts.size() != 1 || target->attached_contexts.front() != context) {
+      if (error_out) {
+        *error_out = "cannot change the sample count of an already shared depth/stencil target";
+      }
+      return false;
+    }
+    if (!WaitPendingPipelineProbeCommands(context, error_out, nullptr)) {
+      return false;
+    }
+    if (context->render_texture) {
+      [context->render_texture release];
+      context->render_texture = nil;
+    }
+    if (context->multisample_render_texture) {
+      [context->multisample_render_texture release];
+      context->multisample_render_texture = nil;
+    }
+    if (context->clear_pipeline_state) {
+      [context->clear_pipeline_state release];
+      context->clear_pipeline_state = nil;
+    }
+    if (context->depth_clear_pipeline_state) {
+      [context->depth_clear_pipeline_state release];
+      context->depth_clear_pipeline_state = nil;
+    }
+    if (target->texture) {
+      [target->texture release];
+      target->texture = nil;
+    }
+    context->sample_count = sample_count;
+    context->width = 0;
+    context->height = 0;
+    context->initialized = false;
+    context->color_resolve_dirty = false;
+    target->sample_count = sample_count;
+    target->width = 0;
+    target->height = 0;
+    target->initialized = false;
+    return true;
+  }
 }
 
 void* CreatePipelineProbeSnapshotTexture(void* metal_device, uint32_t width, uint32_t height,
@@ -2069,6 +2325,11 @@ bool GetPipelineProbeContextUploadStats(void* opaque_context, PipelineProbeUploa
   return true;
 }
 
+uint64_t GetPipelineProbeContextMultisampleResolveCount(void* opaque_context) {
+  auto* context = static_cast<PipelineProbeContext*>(opaque_context);
+  return context ? context->multisample_resolve_count : 0;
+}
+
 void ResetPipelineProbeContext(void* opaque_context) {
   auto* context = static_cast<PipelineProbeContext*>(opaque_context);
   if (context) {
@@ -2102,11 +2363,17 @@ void ReleasePipelineProbeContext(void* opaque_context) {
   if (context->clear_pipeline_state) {
     [context->clear_pipeline_state release];
   }
+  if (context->depth_clear_pipeline_state) {
+    [context->depth_clear_pipeline_state release];
+  }
   if (context->tiled_resolve_pipeline_state) {
     [context->tiled_resolve_pipeline_state release];
   }
   if (context->render_texture) {
     [context->render_texture release];
+  }
+  if (context->multisample_render_texture) {
+    [context->multisample_render_texture release];
   }
   DetachProbeDepthStencilTarget(context);
   if (context->private_readback_buffer) {
@@ -2164,10 +2431,8 @@ bool ClearPipelineProbeContext(void* opaque_context, uint32_t width, uint32_t he
       return false;
     }
     MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-    pass.colorAttachments[0].texture = context->render_texture;
-    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
-    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-    pass.colorAttachments[0].clearColor = MTLClearColorMake(red, green, blue, alpha);
+    ConfigureProbeColorPass(pass, context, MTLLoadActionClear,
+                            MTLClearColorMake(red, green, blue, alpha));
     ConfigureProbeDepthStencilPass(pass, context->depth_stencil_target->texture,
                                    MTLLoadActionClear);
 
@@ -2185,6 +2450,7 @@ bool ClearPipelineProbeContext(void* opaque_context, uint32_t width, uint32_t he
     bool succeeded = [command_buffer status] == MTLCommandBufferStatusCompleted;
     if (succeeded) {
       context->initialized = true;
+      context->color_resolve_dirty = context->sample_count > 1;
       context->depth_stencil_target->initialized = true;
     } else if (error_out) {
       NSError* error = [command_buffer error];
@@ -2246,11 +2512,9 @@ bool ClearPipelineProbeContextRect(void* opaque_context, uint32_t width, uint32_
       return false;
     }
     MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-    pass.colorAttachments[0].texture = context->render_texture;
-    pass.colorAttachments[0].loadAction =
-        context->initialized ? MTLLoadActionLoad : MTLLoadActionClear;
-    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-    pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+    ConfigureProbeColorPass(pass, context,
+                            context->initialized ? MTLLoadActionLoad : MTLLoadActionClear,
+                            MTLClearColorMake(0.0, 0.0, 0.0, 0.0));
     ConfigureProbeDepthStencilPass(
         pass, context->depth_stencil_target->texture,
         context->depth_stencil_target->initialized ? MTLLoadActionLoad : MTLLoadActionClear);
@@ -2276,6 +2540,7 @@ bool ClearPipelineProbeContextRect(void* opaque_context, uint32_t width, uint32_
     bool succeeded = [command_buffer status] == MTLCommandBufferStatusCompleted;
     if (succeeded) {
       context->initialized = true;
+      context->color_resolve_dirty = context->sample_count > 1;
       context->depth_stencil_target->initialized = true;
     } else if (error_out) {
       NSError* error = [command_buffer error];
@@ -2348,6 +2613,93 @@ bool QueuePipelineProbeContextClearRect(void* opaque_context, uint32_t width, ui
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     ++context->open_draw_submission_count;
     context->initialized = true;
+    context->color_resolve_dirty = context->sample_count > 1;
+    context->depth_stencil_target->initialized = true;
+
+    if (context->open_draw_submission_count >= kMaxProbeDrawsPerCommandBuffer &&
+        !FinalizeOpenPipelineProbeCommandBuffer(context, error_out)) {
+      return false;
+    }
+    if (GetCommittedProbeDrawCommandBufferCount(context) >= kMaxCommittedProbeCommandBuffers) {
+      return WaitOldestPipelineProbeCommand(context, error_out);
+    }
+    return true;
+  }
+}
+
+bool QueuePipelineProbeContextDepthStencilClearRect(void* opaque_context, uint32_t width,
+                                                    uint32_t height, uint32_t x, uint32_t y,
+                                                    uint32_t clear_width, uint32_t clear_height,
+                                                    float depth, uint8_t stencil,
+                                                    std::string* error_out) {
+  @autoreleasepool {
+    auto* context = static_cast<PipelineProbeContext*>(opaque_context);
+    if (!context || !std::isfinite(depth)) {
+      if (error_out) {
+        *error_out = "missing probe context or invalid depth clear value";
+      }
+      return false;
+    }
+    if (!clear_width || !clear_height || x >= width || y >= height) {
+      return true;
+    }
+    clear_width = std::min(clear_width, width - x);
+    clear_height = std::min(clear_height, height - y);
+    if (!EnsureProbeContextTexture(context, width, height, error_out) ||
+        !EnsureDepthClearPipelineState(context, error_out)) {
+      return false;
+    }
+
+    ProbeDepthStencilState clear_state;
+    clear_state.depth_test_enabled = true;
+    clear_state.depth_write_enabled = true;
+    clear_state.depth_compare_function = uint8_t(MTLCompareFunctionAlways);
+    clear_state.stencil_test_enabled = true;
+    clear_state.front.compare_function = uint8_t(MTLCompareFunctionAlways);
+    clear_state.front.depth_stencil_pass_operation = uint8_t(MTLStencilOperationReplace);
+    clear_state.front.read_mask = 0xFF;
+    clear_state.front.write_mask = 0xFF;
+    clear_state.front.reference = stencil;
+    clear_state.back = clear_state.front;
+    id<MTLDepthStencilState> metal_clear_state = nil;
+    if (!GetCachedProbeDepthStencilState(context, &clear_state, metal_clear_state, error_out) ||
+        !EnsureOpenPipelineProbeEncoder(context, error_out)) {
+      return false;
+    }
+
+    depth = std::clamp(depth, 0.0f, 1.0f);
+    ProbeUploadAllocation constants =
+        UploadProbeDrawData(context, &depth, sizeof(depth), error_out);
+    if (!constants.buffer) {
+      DiscardEmptyOpenPipelineProbeCommandBuffer(context);
+      if (error_out && error_out->empty()) {
+        *error_out = "failed to upload depth clear constants";
+      }
+      return false;
+    }
+
+    id<MTLRenderCommandEncoder> encoder = context->open_render_encoder;
+    ClearTrackedOpenProbeBindings(context);
+    MTLViewport viewport = {0.0, 0.0, double(width), double(height), 0.0, 1.0};
+    MTLScissorRect scissor = {x, y, clear_width, clear_height};
+    [encoder setViewport:viewport];
+    [encoder setScissorRect:scissor];
+    [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+    [encoder setCullMode:MTLCullModeNone];
+    [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
+    [encoder setDepthClipMode:MTLDepthClipModeClip];
+    [encoder setRenderPipelineState:context->depth_clear_pipeline_state];
+    [encoder setDepthStencilState:metal_clear_state];
+    [encoder setStencilFrontReferenceValue:stencil backReferenceValue:stencil];
+    [encoder setVertexBuffer:constants.buffer offset:constants.offset atIndex:0];
+    TrackOpenProbeBufferBinding(context, true, 0);
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    ++context->open_draw_submission_count;
+    context->initialized = true;
+    // A first depth-only operation initializes the multisample color
+    // attachment through the render pass clear. Make that deterministic black
+    // initialization visible to any immediate single-sample read or resolve.
+    context->color_resolve_dirty = context->sample_count > 1;
     context->depth_stencil_target->initialized = true;
 
     if (context->open_draw_submission_count >= kMaxProbeDrawsPerCommandBuffer &&
@@ -2379,7 +2731,8 @@ bool RenderPipelineProbeToContext(
     size_t bool_loop_constants_size, uint32_t vertex_bool_loop_constants_buffer_index,
     uint32_t fragment_bool_loop_constants_buffer_index, const ProbeIndexBuffer* index_buffer,
     const ProbeRasterizationState* rasterization_state,
-    const ProbeDepthStencilState* depth_stencil_state) {
+    const ProbeDepthStencilState* depth_stencil_state,
+    uint32_t fragment_shared_memory_buffer_index) {
   @autoreleasepool {
     auto* context = static_cast<PipelineProbeContext*>(opaque_context);
     if (!context || !pipeline_state || !system_constants || !system_constants_size || !width ||
@@ -2465,7 +2818,9 @@ bool RenderPipelineProbeToContext(
     }
     bool missing_argument_buffer =
         !system_buffer.buffer ||
-        (vertex_shared_memory_buffer_index != UINT32_MAX && !shared_memory_buffer) ||
+        ((vertex_shared_memory_buffer_index != UINT32_MAX ||
+          fragment_shared_memory_buffer_index != UINT32_MAX) &&
+         !shared_memory_buffer) ||
         (float_constants && float_constants_size && !float_buffer.buffer) ||
         (fragment_float_constants && fragment_float_constants_size &&
          !fragment_float_buffer.buffer) ||
@@ -2483,12 +2838,13 @@ bool RenderPipelineProbeToContext(
       }
       if (error_out) {
         if (error_out->empty()) {
-          *error_out =
-              index_buffer && !index_buffer_object
-                  ? "failed to upload persistent probe index data"
-                  : (vertex_shared_memory_buffer_index != UINT32_MAX && !shared_memory_buffer
-                         ? "required persistent shared-memory buffer is unavailable"
-                         : "failed to upload persistent probe argument data");
+          *error_out = index_buffer && !index_buffer_object
+                           ? "failed to upload persistent probe index data"
+                           : ((vertex_shared_memory_buffer_index != UINT32_MAX ||
+                               fragment_shared_memory_buffer_index != UINT32_MAX) &&
+                                      !shared_memory_buffer
+                                  ? "required persistent shared-memory buffer is unavailable"
+                                  : "failed to upload persistent probe argument data");
         }
       }
       DiscardEmptyOpenPipelineProbeCommandBuffer(context);
@@ -2605,6 +2961,12 @@ bool RenderPipelineProbeToContext(
                        atIndex:vertex_shared_memory_buffer_index];
       TrackOpenProbeBufferBinding(context, true, vertex_shared_memory_buffer_index);
     }
+    if (fragment_shared_memory_buffer_index != UINT32_MAX) {
+      [encoder setFragmentBuffer:shared_memory_buffer
+                          offset:0
+                         atIndex:fragment_shared_memory_buffer_index];
+      TrackOpenProbeBufferBinding(context, false, fragment_shared_memory_buffer_index);
+    }
     if (vertex_data_buffer_index != UINT32_MAX) {
       [encoder setVertexBuffer:vertex_data_buffer.buffer
                         offset:vertex_data_buffer.offset
@@ -2633,6 +2995,7 @@ bool RenderPipelineProbeToContext(
     }
     ++context->open_draw_submission_count;
     context->initialized = true;
+    context->color_resolve_dirty = context->sample_count > 1;
     context->depth_stencil_target->initialized = true;
 
     // Normal command buffers retain every encoded resource. Balance all local
@@ -2644,7 +3007,8 @@ bool RenderPipelineProbeToContext(
     // Preserve the old synchronous contract whenever that buffer is actually
     // bound to the vertex stage. The resident MTLBuffer path remains asynchronous.
     bool raw_nocopy_buffer_bound = !shared_memory_metal_buffer && shared_memory &&
-                                   vertex_shared_memory_buffer_index != UINT32_MAX;
+                                   (vertex_shared_memory_buffer_index != UINT32_MAX ||
+                                    fragment_shared_memory_buffer_index != UINT32_MAX);
     if (context->open_draw_submission_count >= kMaxProbeDrawsPerCommandBuffer &&
         !FinalizeOpenPipelineProbeCommandBuffer(context, error_out)) {
       return false;
@@ -2700,7 +3064,7 @@ bool ReadPipelineProbeContextRect(void* opaque_context, uint32_t width, uint32_t
       // The readback blit is submitted to the same queue as the render work.
       // Commit pending draws without a separate CPU wait; waiting for the blit
       // completes all earlier work in queue order.
-      if (!FinalizeOpenPipelineProbeCommandBuffer(context, error_out)) {
+      if (!FinalizeProbeColorForConsumer(context, error_out)) {
         return false;
       }
       size_t row_pitch = (size_t(read_width) * 4 + 255) & ~size_t(255);
@@ -2763,7 +3127,8 @@ bool ReadPipelineProbeContextRect(void* opaque_context, uint32_t width, uint32_t
       }
       return true;
     }
-    if (!WaitPendingPipelineProbeCommands(context, error_out, nullptr)) {
+    if (!FinalizeProbeColorForConsumer(context, error_out) ||
+        !WaitPendingPipelineProbeCommands(context, error_out, nullptr)) {
       return false;
     }
     MTLRegion region = MTLRegionMake2D(x, y, read_width, read_height);
@@ -2879,7 +3244,7 @@ bool ResolvePipelineProbeContextToXenosTiled(void* opaque_context, uint32_t widt
     // Commit render work without waiting. The blit and compute command buffer is
     // on the same queue, so waiting for it completes every earlier submission.
     std::string finalize_error;
-    if (!FinalizeOpenPipelineProbeCommandBuffer(context, &finalize_error)) {
+    if (!FinalizeProbeColorForConsumer(context, &finalize_error)) {
       return reject_and_drain(finalize_error.empty()
                                   ? "failed to finalize pending render work for tiled resolve"
                                   : finalize_error);
